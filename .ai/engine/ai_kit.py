@@ -5157,16 +5157,23 @@ def _git_capture(*args: str) -> str | None:
         # can contend with the test runner when many routing fingerprints run
         # in one process.
         with tempfile.TemporaryFile(mode="w+b") as output:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 ["git", *args], cwd=ROOT, stdout=output,
-                stderr=subprocess.DEVNULL, check=False, timeout=5,
+                stderr=subprocess.DEVNULL,
             )
-            if completed.returncode == 0:
+            deadline = time.monotonic() + 5
+            while process.poll() is None:
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    process.poll()
+                    return None
+                time.sleep(0.01)
+            if process.returncode == 0:
                 output.seek(0)
                 value = output.read().decode("utf-8", errors="replace")
             else:
                 value = None
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError:
         if cache_head:
             _GIT_CAPTURE_HEAD_CACHE[cache_key] = None
         return None
