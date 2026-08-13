@@ -2,26 +2,30 @@
 
 `workflow.json` contains `version`, `title`, `workflow`, `tasks`, `phases`,
 `events`, and (for a materialized collaborative draft) `source_plan`. New
-workflow states use schema version `4`; version `4` adds an immutable
-`workflow_id` namespace and per-task claim lease fields. A task has
+workflow states use schema version `5`; version `5` adds control-plane
+assignment, task kind/capability requirements, contract references, and a
+governance baseline. A task has
 `id`, `title`, `owner`, `phase`, `needs`, `status`,
 `acceptance`, `files`, `tags`, `attempts`, `evidence`, `blocked_reason`,
 `claimed_by`, `claim_id`, `claim_expires_at`, `context`, `epic`, `base_commit`, `context_revision`,
-`epic_revision`, `depends_on`, and `contract_hashes`.
+`epic_revision`, `depends_on`, `contract_hashes`, `task_kind`,
+`required_capabilities`, `contract_refs`, `assignment`, and
+`governance_baseline`.
 Phase state is derived: `planned`,
 `open`, or `complete`. `claimed_by` records the actor who started the task —
 optionally suffixed `role#agent_id` (see Parallel agents below) — and QA and
 review actors must differ from the *role* portion of `claimed_by` to enforce
 independent verification. The
-`verify` command is read-only: it runs configured checks, emits a report
+`verify` command remains read-only: it runs configured checks, emits a report
 dict (`task`, `checks`, `passed`), and never mutates task status, phase
-state, or any lifecycle field — QA and review transitions remain the only
-legal path from `implementation-complete`.
+state, or any lifecycle field. `qa run` is the deterministic QA authority;
+`review submit` stores a recommendation and `review apply` is the review
+authority; `delivery close` is the only governed path to `done`.
 
 Legal task statuses are `todo`, `in-progress`, `implementation-complete`,
 `qa-passed`, `review-approved`, `done`, and `blocked`.
 
-Legal actions are `start`, `complete`, `qa-pass`, `review-approve`, `close`,
+Legal internal actions are `start`, `complete`, `qa-pass`, `review-approve`, `close`,
 `block`, `unblock`, and `reject`. `reject` moves an `implementation-complete`
 or `qa-passed` task back to `todo` and requires both a detail (reason) and an
 actor different from `claimed_by` — use it instead of `block`/`unblock` when
@@ -29,7 +33,8 @@ QA or review finds work that must be redone, since `block` is for external
 impediments (missing dependency, waiting on another team) rather than
 rejected work. `blocked_reason` is set by `block`, surfaced in
 `tasks.md`, and is cleared by `unblock` or `start`.
-A task is runnable only when it is `todo` and every dependency is `done`.
+A task is runnable only when it is `todo`, every dependency is satisfied, and
+every implementation/integration contract ref is `approved` or `active`.
 IDs must be unique and the dependency graph must be a DAG. Events are
 append-only and include timestamp, actor, action, task, old status, new
 status, and detail.
@@ -71,7 +76,7 @@ source-code vector store.
 ## Collaborative plan draft schema
 
 Chat/planning state lives separately at
-`.ai-work/requirements/plans/<plan-id>.json` (schema version `1`). It has
+`.ai-work/requirements/plans/<plan-id>.json` (schema version `2`). It has
 `id`, `title`, `workflow`, `status` (`drafting`, `ready`, or
 `materialized`), an optimistic `revision`, a structured `brief`, proposed
 `tasks`, append-only `history`, and optional `materialization` metadata. The
@@ -96,15 +101,21 @@ to bypass G1/G2/G3 lifecycle gates.
 
 `add-task` and `plan` write `.ai-work/tasks/<task-id>.json` alongside the
 task's entry in `workflow.json` -- a self-contained snapshot of the task's
-*definitional* fields: `schema_version` (currently `1`,
+*definitional* fields: `schema_version` (currently `2`,
 `TASK_CONTRACT_SCHEMA_VERSION`), `task_id`, `revision` (starts at `1`),
 `title`, `owner`, `phase`, `needs`, `depends_on`, `acceptance`, `files`,
-`tags`, `context`, `epic`, `base_commit`, `created_at`, `updated_at`.
+`tags`, `context`, `epic`, `base_commit`, `task_kind`,
+`required_capabilities`, `contract_refs`, `governance_baseline`, `created_at`, `updated_at`.
 *Lifecycle* fields (`status`, `attempts`, `claimed_by`, `evidence`,
 `blocked_reason`, `contract_hashes`) stay exclusively in `workflow.json` --
 the contract file is not a second lifecycle source, only a stable
 description of what the task is, independent of `workflow.json`'s size and
 lifecycle churn.
+
+Executor handoffs under `.ai-work/handoffs/<task-id>.json` use
+`schema_version: 2`. Their prompt carries the handoff's absolute canonical
+path because the runner executes inside a linked worktree while `.ai-work`
+remains outside that worktree as gitignored control-plane state.
 
 Every task also carries `contract_revision` and `contract_hash` on its
 `workflow.json` entry -- the revision and SHA-256 content hash of the
@@ -305,7 +316,10 @@ it is never an independent source of lifecycle truth.
 
 `.ai-config/runners.yaml` is the versioned runner registry. A canonical CLI/provider
 entry has a `command` template containing `{prompt}` and `{model}`, a
-`models` allowlist, and optional `provider`/`description`. Model-less entries
+`models` allowlist, and optional `provider`/`description`. Version-5 profiles
+also declare `capabilities`, `roles`, `task_kinds`, `priority`, and
+`max_parallel`; selection filters in that order and sorts by descending
+priority then runner name. Model-less entries
 may omit `models` and `{model}`. Top-level `default_executor` and
 `default_model` identify the automatic dispatch pair. `runner_aliases` maps
 legacy profile names to `runner:model` references. Legacy scalar `model`
@@ -326,6 +340,33 @@ raised before claiming any task, pointing at explicit `dispatch` as the
 alternative. A missing or misconfigured default pair, unknown model, or
 ambiguous multi-model runner also fails before claiming any task.
 
+Every governed assignment records the runner/model/agent identity, selected
+capabilities, canonical state path, branch, linked worktree, base commit,
+claim/lease, and timestamp. A retry reuses the worktree and audits its diff;
+cleanup is attempted only after valid delivery evidence closes the task.
+
+## Design, contract, and delivery machine contracts
+
+The normalized core/project design policy is schema version 1. Assessments
+and task-scoped exceptions live under `.ai-work/evidence/design/`; core-rule
+overrides require a rationale, `MUST` exceptions require an independent
+reviewer, and `FORBIDDEN` exceptions additionally require explicit user
+confirmation plus a decision record.
+
+Project-owned `contracts.json` is schema version 1. A contract version moves
+`draft -> proposed -> approved -> active -> deprecated -> removed`; approved
+content is immutable, breaking versions require a major bump and migration,
+and configured generators/verifiers remain tool-agnostic shell commands.
+Task refs use `defines|implements|consumes|verifies` and are emitted in
+`.ai-work/artifacts/project/contracts.json` alongside `represents` edges.
+
+Project-owned `delivery.json` defines the integration branch and optional
+pre-integration commands. `delivery attest` verifies commit reachability,
+scope, current QA/review/design/contract evidence, dependencies, conflicts,
+and optional push status. `delivery close` is the governed transition from
+`review-approved` to `done`; control-plane-only/no-code tasks receive a
+machine-verifiable `not-applicable` attestation.
+
 ## Project Analyzer / Knowledge Graph Builder
 
 `ai-kit analyze` is read-only and takes no task/workflow input: it combines
@@ -343,20 +384,58 @@ or `refreshed`. The "knowledge graph" here is exactly what `contexts.yaml`
 declares -- not a parser for arbitrary source languages; see AGENTS.md's
 Platform Capability Map for the scope boundary.
 
-## Visualizer artifact versioning
+## Artifact-first project projection
 
-`ai-kit visualizer generate` writes `.visualizer/artifacts.json` alongside
-`board.json`, `architecture.json`, `impact.json`, `events.json`, and
-`dag.json`: `{"schema_version": 1, "generated_at": ..., "artifacts": {
-"board.json": 1, "architecture.json": 1, "impact.json": 1, "events.json": 1,
-"dag.json": 1}}`. It is the one file a consumer checks for compatibility
-before parsing the rest -- the individual payloads are keyed by task id,
-context name, or a fixed field set (read directly by `app.js`/`dag.html`,
-pinned in `tests/test_visualizer_contract.py`) and never carry the version
-field themselves. `_validate_visualizer_manifest` rejects a manifest missing
-or mistyping `schema_version` or `artifacts`. See AGENTS.md's "Artifact
-Schema Versioning" for how this relates to `workflow.json`'s own `version`
-and the task handoff's `schema_version`.
+`ai-kit artifact generate` is the sole generator for
+`workspace(state)/artifacts/project`. The directory has exactly one atomic
+commit marker, `manifest.json`, and 12 payloads:
+
+```text
+project.json architecture.json modules.json dependencies.json
+contracts.json tasks.json dag.json ownership.json risks.json
+git.json evidence.json events.json
+```
+
+Every payload uses the envelope `schema_version`, `artifact`,
+`generation_id`, `generated_at`, `workflow_id`, and `data`. The manifest uses
+schema version 1 and artifact-set version 1, records the source fingerprint,
+workflow ID, state revision, and SHA-256 of each required payload. Publication
+stages and validates the complete set, atomically replaces payloads, and
+atomically replaces `manifest.json` last. Consumers reject a payload whose
+generation differs from the manifest and keep the previously rendered set.
+
+This bundle is a derived canonical projection, not workflow, QA, review,
+design, contract, or delivery authority. Its sources remain workflow state,
+project configuration and registries, evidence, Git, and source discovery.
+`artifact validate` checks integrity, schema, cross-artifact references,
+evidence freshness, and observation rules without changing lifecycle state.
+A custom `--state /path/workflow.json` owns `/path/artifacts/project`.
+
+Module, dependency, and architecture relationships include an `observation`:
+
+```json
+{
+  "classification": "observed | inferred | proposed",
+  "source_kind": "config | source | import | convention | assessment | decision",
+  "source_refs": [],
+  "confidence": 1.0,
+  "rationale": null
+}
+```
+
+Observed facts require a direct source and confidence 1.0. Inferred facts
+require confidence below 1.0 and a rationale. Proposed facts require a
+proposer, decision/assessment source, and rationale; they are excluded from
+active impact, ownership, DAG, and gate computations. Promotion happens only
+by changing an authoritative source and regenerating.
+
+`events.json` projects at most the latest 200 `workflow.json.events` entries,
+with total/truncation/range metadata at the same state revision. It is not an
+audit log. `.ai-work/logs/events.jsonl` remains append-only archival history;
+the generator reports `event_history_divergence` instead of merging divergent
+sources. Legacy `.visualizer/*.json` files are generated only as an adapter
+from the published canonical bundle. `ai-kit visualizer generate` remains a
+deprecated alias for `artifact generate`.
 
 `dispatch`'s prompt to the runner references the tasks file and instructs
 the completion command using the *resolved* workspace for the `--state`

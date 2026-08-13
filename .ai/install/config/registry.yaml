@@ -16,7 +16,7 @@ core_skills:
   path: .ai/skills/core
   source: v1-adapted
   contract: SKILL.md plus v2 adapter documents
-  names: [accessibility, api-contract, architecture-decisions, code-review, contract-testing, data-migration, debugging, dependency-management, deployment-infra, documentation-maintenance, e2e-testing, frontend-core, github-actions-ci, integration-contracts, nodejs-api-core, observability, performance-profiling, refactoring, release-management, requirement-decomposer, requirements-intake, security-review, skill-router, system-designer, test-and-validation, threat-modeling, webhooks-and-retries, workflow-orchestration]
+  names: [accessibility, api-contract, architecture-decisions, code-review, contract-testing, data-migration, debugging, dependency-management, deployment-infra, design-governance, documentation-maintenance, e2e-testing, frontend-core, github-actions-ci, integration-contracts, nodejs-api-core, observability, performance-profiling, refactoring, release-management, requirement-decomposer, requirements-intake, security-review, skill-router, system-designer, test-and-validation, threat-modeling, webhooks-and-retries, workflow-orchestration]
 
 stack_skills:
   nestjs-core: {path: .ai/skills/backend/nestjs-core, stack: [nestjs]}

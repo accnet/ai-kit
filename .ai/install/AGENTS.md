@@ -115,12 +115,13 @@ the engine actually writes.
 | Project Analyzer | Detects stack, tooling, and container/database runtime from the repo | `ai-kit onboard [--apply]` |
 | Project Analyzer / Knowledge Graph Builder | Combines onboard's detection with contexts.yaml's module + ownership graph and static-analysis risk signals (unowned context, dangling dependency, no verification command); reuses a valid versioned project-context snapshot | `ai-kit analyze [--refresh]` -> `.ai-work/analysis/project-summary.json` |
 | Impact Analyzer | Direct/transitive dependents and affected tasks for a module | `ai-kit context impact <name>` |
-| Task DAG Builder | Task graph with waves, ready set, and critical path | `ai-kit visualizer generate` -> `.visualizer/dag.json`, rendered at `.visualizer/dag.html` |
+| Task DAG Builder | Task graph with waves, ready set, and critical path | `ai-kit artifact generate` -> `.ai-work/artifacts/project/dag.json`, rendered at `.visualizer/dag.html` |
 | Execution Contract Builder | Self-contained JSON handoff for a dispatched task (owner, acceptance, routing, instructions) | written by `ai-kit dispatch` / `dispatch-ready` / `pipeline` to `.ai-work/handoffs/<task-id>.json` |
-| Runtime Observer | Append-only audit trail of every state transition | `.ai-work/logs/events.jsonl`, surfaced as `.visualizer/events.json` by `ai-kit visualizer generate` |
+| Runtime Observer | Append-only audit history plus a bounded replay projection | `.ai-work/logs/events.jsonl`; `ai-kit artifact generate` -> `.ai-work/artifacts/project/events.json` |
 | Scheduler Advisor | What can run now vs. what is blocked and why | `ai-kit ready`, `ai-kit blocked`, `ai-kit dispatch-ready` |
-| Architecture / Module Graph | Module ownership and dependency graph from declared contexts | `ai-kit context list` -> `.visualizer/architecture.json` |
-| Architecture Discovery | Read-only scan of the source tree for feature modules (NestJS/React/Python/generic) and internal import-based dependency edges, layered under declared contexts as parent/child, never mutating `contexts.yaml` | `ai-kit architecture discover` -> `.visualizer/discovered-architecture.json` |
+| Architecture / Module Graph | Versioned projection of contexts, modules, ownership, provenance, and dependency edges | `ai-kit artifact generate` -> `.ai-work/artifacts/project/architecture.json` |
+| Architecture Discovery | Read-only scan of the source tree for feature modules (NestJS/React/Python/generic) and internal import-based dependency edges, never mutating or publishing project state | `ai-kit architecture discover` |
+| Artifact Validator | Integrity, schema, cross-reference, freshness, and observation checks without lifecycle authority | `ai-kit artifact validate` |
 
 This map only lists capabilities with a working command behind them today. A
 role above this table without a row here (Planner, Reviewer, QA, Memory
@@ -138,14 +139,14 @@ source tree; widening this into real code analysis is a new, separately
 tested capability (`ai-kit architecture discover`, below), not a quiet
 extension of `cmd_analyze`.
 
-`architecture discover` is that separate, read-only capability. It scans the
+`architecture discover` is that separate, read-only query capability. It scans the
 configured source tree (`project.source_dirs` in `.ai-config/kit.yaml`, or
 the repo root) for feature-level modules using framework conventions
 (NestJS `*.module.ts`, React `src/{pages,components,features,services,
 contexts}`, Python packages with `__init__.py`, and a generic first/second
--level fallback), attempts to detect internal dependency edges from
-same-language relative imports, and writes the result to its own
-`.visualizer/discovered-architecture.json` artifact. Contexts declared in
+-level fallback), and attempts to detect internal dependency edges from
+same-language relative imports. It returns discovery data but never publishes
+it. Contexts declared in
 `.ai-config/contexts.yaml` remain the authoritative bounded contexts and are
 never edited by discovery; a discovered module whose path falls inside a
 declared context's glob is linked to it as a child (`parent` field) instead
@@ -153,14 +154,14 @@ of being treated as an unrelated top-level module. Anything discovery cannot
 determine with confidence (unowned modules, dependencies pointing at a
 module that does not exist, duplicate module paths, an unreachable source
 root, a module with no owner or no related task) is recorded as a warning in
-the artifact rather than guessed at or silently dropped. The command only
+the result rather than guessed at or silently dropped. The command only
 raises a hard error (non-zero exit) for a structurally invalid `contexts.yaml`
 entry (for example a non-string `path`); everything else degrades to a
-partial result with warnings. `.visualizer/app.js` fetches this artifact
-independently of `architecture.json` and falls back to the declared-only
-view when the file is absent, so existing consumers of `architecture.json`,
-`ai-kit context list`, `context impact`, `visualizer generate`, `route`, and
-`pipeline` are unaffected.
+partial result with warnings. `artifact generate` is the only publisher: it
+normalizes declared and discovered facts into the canonical project bundle,
+then derives the compatibility `.visualizer/*.json` mirror from that bundle.
+Visualizer code may filter, group, and lay out this data, but must not discover
+or infer architecture facts itself.
 
 ### Artifact Schema Versioning
 
@@ -168,30 +169,28 @@ Every artifact a worker or external tool consumes carries an explicit
 version, so a consumer can detect a shape change instead of silently
 misreading a renamed or retyped field:
 
-- `.ai-work/state/workflow.json` has a top-level `version` (currently `4`) and an immutable `workflow_id`; tasks claimed after this version carry an opaque lease identifier;
+- `.ai-work/state/workflow.json` has a top-level `version` (currently `5`) and an immutable `workflow_id`; governed tasks carry assignment, contract refs, and a governance baseline;
   `.ai/engine/state-schema.md` documents its fields.
 - `.ai-work/handoffs/<task-id>.json` (the Execution Contract Builder output)
-  has `schema_version: 1`.
-- `.visualizer/artifacts.json` is a manifest written alongside the other
-  `.visualizer/*.json` payloads on every `ai-kit visualizer generate`: it
-  has its own `schema_version` plus a per-file `artifacts: {filename:
-  version}` map (`VISUALIZER_ARTIFACT_VERSIONS` in `ai_kit.py`). The
-  payloads it describes (`board.json`, `architecture.json`, `impact.json`,
-  `events.json`, `dag.json`) do not carry the version field themselves --
-  they are keyed by task id, context name, or a fixed field set that
-  `.visualizer/app.js` and `.visualizer/dag.html` read directly (pinned by
-  `tests/test_visualizer_contract.py`), and mixing a `schema_version` key
-  into one of those dicts would be misread as a task, module, or column.
-- `.visualizer/discovered-architecture.json` is the one exception: it is a
-  new, self-contained artifact (not keyed by task/module/context id), so it
-  carries its own top-level `schema_version` field the same way the
-  handoff JSON does, in addition to being listed in
-  `VISUALIZER_ARTIFACT_VERSIONS`/`artifacts.json` like every other payload.
+  has `schema_version: 2` and includes canonical state/worktree/branch/lease assignment data.
+- `.ai-work/artifacts/project/manifest.json` is the atomic commit marker for
+  one 12-payload project projection. Every payload has a schema-version-1
+  envelope and the same `generation_id`; the manifest records its SHA-256,
+  required flag, source fingerprint, workflow ID, and state revision. It is
+  replaced last, after all payloads pass schema and cross-reference checks.
+- The exact payload set is `project`, `architecture`, `modules`,
+  `dependencies`, `contracts`, `tasks`, `dag`, `ownership`, `risks`, `git`,
+  `evidence`, and `events`. Do not add a payload without changing the
+  artifact-set contract. `.visualizer/*.json` is a compatibility projection,
+  never another source of truth.
 
-Bump the relevant version only when a payload's top-level shape changes in
-a way a consumer must know about (a field added, removed, or retyped) --
-not on every content change. `ai_kit._validate_visualizer_manifest` rejects
-a malformed manifest (missing/mistyped `schema_version` or `artifacts`).
+Architecture modules, dependencies, and relationships carry an `observation`
+classified as `observed`, `inferred`, or `proposed`. Observed facts cite a
+direct source with confidence 1.0; inferred facts have lower confidence and
+a rationale; proposed facts cite a proposer/decision and never participate in
+impact, ownership, QA, or dependency gates. Promotion requires changing a
+canonical source and regenerating. `artifact validate` checks these rules but
+cannot create evidence or advance lifecycle state.
 
 ### Required Runtime Evidence
 
@@ -311,7 +310,9 @@ above; this section is that documentation, not a new command:
    assigned role, core skills, and stack-relevant technology knowledge for
    each task the previous stage created.
 5. **Execute one task** (mechanical once dispatched):
-   `ai-kit pipeline T<n>` runs dispatch -> verify -> QA -> review -> close
+   `ai-kit pipeline T<n>` runs isolated dispatch -> `qa run` -> independent
+   recommendation -> `review apply`, then parks at `review-approved` until an
+   integration commit is supplied to `delivery attest` / `delivery close`
    for that task, refusing to auto-approve when verification is
    inconclusive (G2) or when QA/review would run under the executor's own
    runner/model.
@@ -348,8 +349,8 @@ hidden capability to build.
   verifiable acceptance criteria. Database or migration work never uses a
   trivial fast path.
 - **G2 - Task completion:** every acceptance criterion has evidence and the
-  relevant configured checks pass before marking a task done. `qa-pass` and
-  `review-approve` require at least one existing `--evidence` path.
+  relevant configured checks pass. Workers cannot create QA/review verdicts;
+  `qa run` and `review apply` own those transitions.
 - **G3 - Review:** a reviewer records `approve` with no unresolved blockers
   before delivery.
 - **G4 - Hygiene:** never commit secrets, credentials, or transient
@@ -362,6 +363,12 @@ hidden capability to build.
 - **G5 - Destructive operations:** require explicit user approval for the
   specific operation, including destructive data changes, force pushes, and
   production deployment.
+- **G8 - Design policy:** governed contract/implementation/integration tasks
+  carry the normalized design-policy hash and a current assessment; AI
+  assessors create evidence only, while `qa run` applies the gate.
+- **G9 - Contract convergence:** contract refs, generated outputs, and
+  configured producer/consumer verifiers must converge on the baseline hash.
+  Architecture discovery never substitutes for an executable verifier.
 
 ### Configurable Gates
 
@@ -372,6 +379,8 @@ loads this file on every `validate()` call and applies the flags below:
 |---|---|---|---|
 | `planning_first` | `true` | G1 | Allows tasks past `todo` in non-plan phases without completed plan dependencies |
 | `review_required` | `true` | G3 | Allows tasks at `done` status without review evidence |
+| `design_policy_required` | `true` | G8 | Skips design assessment validation during QA |
+| `contract_convergence_required` | `true` | G9 | Skips contract convergence validation during QA |
 
 When a rule file is missing or malformed, the engine falls back to the safe
 defaults shown above. See `.ai-config/rules.yaml` for the full list of supported

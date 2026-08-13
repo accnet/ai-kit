@@ -20,9 +20,41 @@ python .ai/engine/ai_kit.py route T1
 python .ai/engine/ai_kit.py route T1 --explain
 ```
 
-Move a task through `start`, `complete`, `qa-pass`, `review-approve`, and
-`close`; the engine rejects illegal transitions. All transitions are persisted
+For a contract-aware implementation:
+
+```bash
+python .ai/engine/ai_kit.py contract add order-api 1.0.0 --owner architect --kind api --represents ordering --path contracts/order-api.json
+python .ai/engine/ai_kit.py contract transition order-api 1.0.0 propose --actor architect
+python .ai/engine/ai_kit.py contract transition order-api 1.0.0 approve --actor reviewer --evidence contract-review.json
+python .ai/engine/ai_kit.py add-task T3 --title "Implement order API" --owner backend --phase build --task-kind implementation --required-capability implementation --contract-ref implements:order-api@1.0.0 --acceptance "Contract verifier passes" --files src/orders tests/orders
+python .ai/engine/ai_kit.py design rules --task T3
+python .ai/engine/ai_kit.py qa run T3
+python .ai/engine/ai_kit.py review submit T3 --input recommendation.json
+python .ai/engine/ai_kit.py review apply T3
+python .ai/engine/ai_kit.py delivery attest T3 --commit <integration-sha>
+python .ai/engine/ai_kit.py delivery close T3
+```
+
+Move a governed task through worker `start`/`complete`, authoritative
+`qa run`, `review submit`/`review apply`, and `delivery attest`/`delivery close`;
+the engine rejects illegal transitions. All transitions are persisted
 to `.ai-work/state/workflow.json` and audit events to `.ai-work/logs/events.jsonl`.
+
+Generate and inspect the read-only project architecture projection with:
+
+```bash
+python .ai/engine/ai_kit.py artifact generate
+python .ai/engine/ai_kit.py artifact validate
+python .ai/engine/ai_kit.py artifact show architecture
+python .ai/engine/ai_kit.py visualizer serve --host 127.0.0.1 --port 8080
+```
+
+The exact 13-file bundle lives at `.ai-work/artifacts/project/`: one
+manifest-last atomic commit marker plus 12 versioned payloads for project,
+architecture, modules, dependencies, contracts, tasks, DAG, ownership, risks,
+Git, evidence, and replay events. It is a derived canonical projection, never
+lifecycle authority. `.visualizer/*.json` remains a generated compatibility
+mirror during this phase.
 
 The kit is tool-agnostic. `AGENTS.md` is the authoritative instruction file.
 
@@ -71,6 +103,8 @@ on every validation and applies the settings without requiring a restart.
 planning_first: true           # G1: enforce plan-phase dependencies
 minimal_context: true          # load only minimal task context
 review_required: true          # G3: require review evidence before done
+design_policy_required: true   # G8: require current design assessment
+contract_convergence_required: true # G9: enforce contract/hash/codegen convergence
 db_changes_require_plan: true  # db/migration work always needs a plan
 no_secrets_in_commits: true    # G4: prevent secret commits
 destructive_operations_require_approval: true  # G5: require explicit approval
@@ -129,7 +163,11 @@ Both installers stop before replacing a different managed file. Use
 - `.ai-config/`: generated project-owned configuration; it is intentionally
   not tracked in the AI-Kit source repository and is never overwritten by
   re-installs.
-- `.ai-work/`: current plan, tasks, and ephemeral state.
+- `.ai-work/`: current plan, tasks, evidence, audit log, and ephemeral state.
+  `.ai-work/artifacts/project/` is the state-specific derived project
+  projection consumed by Visualizer and external readers.
+- `.visualizer/`: read-only dashboard source; architecture facts come only
+  from the published artifact bundle.
 
 ## Skill Validation Modes
 

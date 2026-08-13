@@ -1,5 +1,5 @@
 """Unit tests for the Architecture Discovery capability
-(`ai-kit architecture discover`, `.visualizer/discovered-architecture.json`).
+(`ai-kit architecture discover`, projected by `ai-kit artifact generate`).
 
 Like tests/test_ai_kit.py, every test runs against a throwaway temp
 directory with ai_kit's module-level path constants monkeypatched onto it,
@@ -299,13 +299,12 @@ class SchemaAndArtifactTests(ArchitectureDiscoveryTestCase):
         with self.assertRaises(ai_kit.EngineError):
             self.discover()
 
-    def test_written_to_visualizer_dir_when_it_exists(self) -> None:
+    def test_discover_never_publishes_even_when_visualizer_exists(self) -> None:
         ai_kit.VISUALIZER_DIR = self.root / ".visualizer"
         ai_kit.VISUALIZER_DIR.mkdir(parents=True, exist_ok=True)
         self.write_kit_yaml(["src"])
         self.discover()
-        written = json.loads((ai_kit.VISUALIZER_DIR / "discovered-architecture.json").read_text(encoding="utf-8"))
-        self.assertEqual(written["schema_version"], ai_kit.ARCHITECTURE_DISCOVERY_SCHEMA_VERSION)
+        self.assertFalse((ai_kit.VISUALIZER_DIR / "discovered-architecture.json").exists())
 
     def test_not_written_when_visualizer_dir_absent(self) -> None:
         self.write_kit_yaml(["src"])
@@ -331,7 +330,7 @@ class VisualizerGenerateIntegrationTests(ArchitectureDiscoveryTestCase):
         payloads = ai_kit._generate_visualizer_data(str(self.root / ".ai-work" / "state" / "workflow.json"))
         self.assertEqual(
             set(payloads),
-            {"board.json", "architecture.json", "impact.json", "events.json", "dag.json",
+            {"board.json", "architecture.json", "impact.json", "events.json", "dag.json", "contracts.json",
              "discovered-architecture.json", "artifacts.json"},
         )
         for filename in payloads:
@@ -351,15 +350,11 @@ class VisualizerAppJsContractTests(unittest.TestCase):
     def test_fetches_discovered_architecture_json(self) -> None:
         self.assertIn("discovered-architecture.json", self.APP_JS)
 
-    def test_discovered_architecture_fetch_has_fallback(self) -> None:
-        # The discovered-architecture fetch must be guarded so a missing
-        # artifact (an older project that hasn't run discovery) doesn't
-        # break the page -- i.e. it's inside a try/catch, not a bare await
-        # in the same Promise.all as the required payloads.
-        self.assertIn("catch", self.APP_JS)
-        idx = self.APP_JS.index("discovered-architecture.json")
-        surrounding = self.APP_JS[max(0, idx - 400): idx + 400]
-        self.assertTrue("try" in surrounding or ".catch" in surrounding)
+    def test_manifest_first_loader_has_legacy_fallback(self) -> None:
+        self.assertIn("/artifacts/project/manifest.json", self.APP_JS)
+        self.assertIn("loadCanonicalArtifacts", self.APP_JS)
+        self.assertIn("loadLegacyArtifacts", self.APP_JS)
+        self.assertIn("fetch('discovered-architecture.json').catch", self.APP_JS)
 
     def test_no_hardcoded_module_names(self) -> None:
         for banned in ("'downloads'", '"downloads"', "'crawler'", '"crawler"'):

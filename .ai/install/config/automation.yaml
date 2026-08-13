@@ -12,7 +12,7 @@ roles:
     backup_model: gpt-5.4-mini
 
 post_completion:
-  enabled: true
+  enabled: false
   retry_on_rejection: true
   max_retries: 2
   backup_after_retries: 1

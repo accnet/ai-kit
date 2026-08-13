@@ -5,3 +5,5 @@ db_changes_require_plan: true
 no_secrets_in_commits: true
 destructive_operations_require_approval: true
 module_boundary: false
+design_policy_required: true
+contract_convergence_required: true

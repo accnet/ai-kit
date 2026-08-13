@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "integration_branch": "main",
+  "push_required": false,
+  "pre_integration_commands": []
+}

@@ -55,17 +55,18 @@ class EngineTestCase(unittest.TestCase):
 
         self._patched = {
             name: getattr(ai_kit, name)
-            for name in ("ROOT", "WORK", "STATE", "CURRENT", "EVENT_LOG", "VISUALIZER_DIR")
+            for name in ("ROOT", "WORK", "STATE", "CURRENT", "EVENT_LOG", "VISUALIZER_DIR", "AUTO_ARTIFACT_GENERATION")
         }
         ai_kit.ROOT = self.root
         ai_kit.WORK = self.root / ".ai-work-unused"
         ai_kit.STATE = ai_kit.WORK / "state" / "workflow.json"
         ai_kit.CURRENT = ai_kit.WORK / "state" / "current.json"
         ai_kit.EVENT_LOG = ai_kit.WORK / "logs" / "events.jsonl"
-        # Nonexistent by construction: _generate_visualizer_data() no-ops
-        # whenever VISUALIZER_DIR doesn't exist, which keeps tests from
-        # writing into this repo's real .visualizer/.
+        # Artifact publication has focused integration tests. Disable automatic
+        # regeneration in the lifecycle fixture so the broad engine suite stays
+        # fast and never writes into this repository's real runtime workspace.
         ai_kit.VISUALIZER_DIR = self.root / ".visualizer-unused"
+        ai_kit.AUTO_ARTIFACT_GENERATION = False
 
         self.state_file = self.root / "work" / "state" / "workflow.json"
 
@@ -167,6 +168,270 @@ class StateMachineTests(EngineTestCase):
         self.transition("T1", "start", actor="backend")
         ready_ids = {item["id"] for item in ai_kit.cmd_ready(ns(state=str(self.state_file)))}
         self.assertEqual(ready_ids, set())
+
+
+class GovernedControlPlaneTests(EngineTestCase):
+    """Version-5 authority, design/contract gates, and delivery semantics."""
+
+    def _quality_command(self, command: str = "exit 0") -> None:
+        (self.root / ".ai-config" / "kit.yaml").write_text(
+            f"project:\n  stack: []\nverification:\n  test_command: {command}\n",
+            encoding="utf-8",
+        )
+
+    def _implementation_complete(self, task_id: str = "T1") -> dict:
+        self.transition(task_id, "start", actor="backend")
+        return self.transition(task_id, "complete", actor="backend")
+
+    def test_schema_v5_new_task_and_old_task_safe_default(self) -> None:
+        self.init_workflow(); task = self.add_task("T1")
+        self.assertEqual(ai_kit.load(self.state_file)["version"], 5)
+        self.assertEqual(task["task_kind"], "general")
+        self.assertIsNotNone(task["governance_baseline"])
+        legacy = ai_kit.new_state("legacy", "feature")
+        legacy["version"] = 4
+        legacy["tasks"] = [{key: value for key, value in task.items() if key not in {"task_kind", "required_capabilities", "contract_refs", "assignment", "governance_baseline"}}]
+        ai_kit.validate(legacy)
+        self.assertEqual(legacy["version"], 5)
+        self.assertIsNone(legacy["tasks"][0]["governance_baseline"])
+
+    def test_design_missing_hard_evidence_rejects_implementation(self) -> None:
+        self._quality_command(); self.init_workflow()
+        self.add_task("T1", task_kind="implementation")
+        self._implementation_complete()
+        result = ai_kit.cmd_qa_run(ns(state=str(self.state_file), id="T1"))
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(ai_kit.task_map(ai_kit.load(self.state_file))["T1"]["status"], "todo")
+
+    def test_governed_qa_review_and_not_applicable_delivery(self) -> None:
+        self._quality_command(); self.init_workflow(); self.add_task("T1")
+        self._implementation_complete()
+        state = ai_kit.load(self.state_file); task = ai_kit.task_map(state)["T1"]
+        task["assignment"] = {"runner": "executor", "model": "m1", "agent_id": "exec-1", "worktree": str(self.root), "base_commit": None}
+        ai_kit.save(state, self.state_file, state["revision"])
+        qa = ai_kit.cmd_qa_run(ns(state=str(self.state_file), id="T1"))
+        self.assertEqual(qa["lifecycle"], "qa-passed")
+        recommendation_input = self.root / "recommendation.json"
+        recommendation_input.write_text(json.dumps({"task": "T1", "decision": "approve", "findings": [], "evidence": [], "runner": "reviewer", "model": "m2", "agent_id": "review-1"}), encoding="utf-8")
+        ai_kit.cmd_review_submit(ns(state=str(self.state_file), id="T1", input=str(recommendation_input)))
+        reviewed = ai_kit.cmd_review_apply(ns(state=str(self.state_file), id="T1", evidence=None))
+        self.assertEqual(reviewed["lifecycle"], "review-approved")
+        closed = ai_kit.cmd_delivery_close(ns(state=str(self.state_file), id="T1", evidence=None))
+        self.assertEqual(closed["status"], "done")
+
+    def test_worker_cannot_take_privileged_transition_after_assignment(self) -> None:
+        self.init_workflow(); self.add_task("T1"); self._implementation_complete()
+        state = ai_kit.load(self.state_file); ai_kit.task_map(state)["T1"]["assignment"] = {"runner": "executor", "model": "m", "agent_id": "a"}
+        ai_kit.save(state, self.state_file, state["revision"])
+        with self.assertRaises(ai_kit.EngineError):
+            self.transition("T1", "qa-pass", actor="qa", evidence=[self.qa_evidence("T1")])
+
+    def test_contract_approval_unlocks_implementation(self) -> None:
+        contract_file = self.root / "order-api.json"; contract_file.write_text('{"type":"order"}\n', encoding="utf-8")
+        ai_kit.cmd_contract_add(ns(id="order-api", version="1.0.0", owner="architect", kind="api", represents="ordering", path=str(contract_file), compatibility="backward-compatible", supersedes=None, actor="architect"))
+        self.init_workflow()
+        self.add_task("T1", task_kind="implementation", contract_ref=["implements:order-api@1.0.0"])
+        task = ai_kit.task_map(ai_kit.load(self.state_file))["T1"]
+        self.assertFalse(ai_kit.runnable(task, {"T1": task}))
+        ai_kit.cmd_contract_transition(ns(id="order-api", version="1.0.0", action="propose", actor="architect", evidence=None, migration=None, confirmed_by_user=False))
+        evidence = self.root / "approval.json"; evidence.write_text("{}", encoding="utf-8")
+        ai_kit.cmd_contract_transition(ns(id="order-api", version="1.0.0", action="approve", actor="reviewer", evidence=str(evidence), migration=None, confirmed_by_user=False))
+        self.assertTrue(ai_kit.runnable(task, {"T1": task}))
+
+    def test_contract_registration_rejects_a_missing_source_file(self) -> None:
+        missing = self.root / "contracts" / "missing.json"
+        with self.assertRaisesRegex(ai_kit.EngineError, "file not found"):
+            ai_kit.cmd_contract_add(ns(
+                id="missing-api", version="1.0.0", owner="architect", kind="api",
+                represents="missing", path=str(missing), compatibility="backward-compatible",
+                supersedes=None, actor="architect",
+            ))
+
+    def test_runner_selection_is_capability_priority_and_capacity_aware(self) -> None:
+        (self.root / ".ai-config" / "runners.yaml").write_text(
+            "runners:\n"
+            "  low:\n    command: \"true {prompt}\"\n    capabilities: [implementation]\n    roles: [backend]\n    task_kinds: [implementation]\n    priority: 10\n    max_parallel: 1\n"
+            "  high:\n    command: \"true {prompt}\"\n    capabilities: [implementation, testing]\n    roles: [backend]\n    task_kinds: [implementation]\n    priority: 100\n    max_parallel: 1\n",
+            encoding="utf-8",
+        )
+        self.init_workflow(); self.add_task("T1", task_kind="implementation", required_capability=["testing"])
+        state = ai_kit.load(self.state_file); task = ai_kit.task_map(state)["T1"]
+        name, _entry, _model = ai_kit._select_runner_for_task(task, state, None, None)
+        self.assertEqual(name, "high")
+        task["status"] = "in-progress"; task["assignment"] = {"runner": "high"}
+        self.add_task("T2", task_kind="implementation", required_capability=["testing"])
+        state = ai_kit.load(self.state_file)
+        ai_kit.task_map(state)["T1"].update(task)
+        with self.assertRaises(ai_kit.EngineError):
+            ai_kit._select_runner_for_task(ai_kit.task_map(state)["T2"], state, "high", None)
+
+    def test_design_core_override_requires_rationale(self) -> None:
+        (self.root / ".ai-config" / "design-policy.json").write_text(
+            json.dumps({"schema_version": 1, "project_identity": {}, "rules": [], "overrides": [{"id": "DG-MINIMAL-CHANGE", "level": "SHOULD"}]}),
+            encoding="utf-8",
+        )
+        with self.assertRaises(ai_kit.EngineError) as ctx:
+            ai_kit._merged_design_policy()
+        self.assertIn("requires rationale", str(ctx.exception))
+
+    def test_evidence_fingerprint_changes_when_diff_content_changes(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Test"], check=True)
+        source = self.root / "app.py"; source.write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "base"], check=True)
+        base = subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        task = {"id": "T1", "base_commit": base, "contract_hash": "contract", "assignment": {"worktree": str(self.root), "base_commit": base}}
+        source.write_text("value = 2\n", encoding="utf-8")
+        first = ai_kit._evidence_fingerprint(task, self.root)
+        source.write_text("value = 3\n", encoding="utf-8")
+        second = ai_kit._evidence_fingerprint(task, self.root)
+        self.assertEqual(first["changed_paths_hash"], second["changed_paths_hash"])
+        self.assertNotEqual(first["worktree_diff_hash"], second["worktree_diff_hash"])
+
+    def test_committing_the_verified_bytes_does_not_stale_qa_fingerprint(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Test"], check=True)
+        source = self.root / "app.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "app.py"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "base"], check=True)
+        base = subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        task = {"id": "T1", "base_commit": base, "contract_hash": "contract", "assignment": {"worktree": str(self.root), "base_commit": base}}
+        source.write_text("value = 2\n", encoding="utf-8")
+        before_commit = ai_kit._evidence_fingerprint(task, self.root)
+        subprocess.run(["git", "-C", str(self.root), "add", "app.py"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "implementation"], check=True)
+        after_commit = ai_kit._evidence_fingerprint(task, self.root)
+        self.assertEqual(before_commit, after_commit)
+
+    def test_python_cache_created_by_qa_is_not_a_task_change(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Test"], check=True)
+        source = self.root / "backend" / "orders.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "backend/orders.py"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "base"], check=True)
+        base = subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        source.write_text("value = 2\n", encoding="utf-8")
+        cache = self.root / "backend" / "__pycache__" / "orders.cpython-39.pyc"
+        cache.parent.mkdir()
+        cache.write_bytes(b"compiled")
+        task = {"id": "T1", "base_commit": base, "assignment": {"worktree": str(self.root), "base_commit": base}}
+        self.assertEqual(ai_kit._task_changed_paths(task, self.root), ["backend/orders.py"])
+
+    def test_delivery_cleanup_removes_worktree_with_only_python_cache(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Test"], check=True)
+        source = self.root / "app.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "app.py"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "base"], check=True)
+        linked = self.root.parent / f"{self.root.name}-linked"
+        subprocess.run(["git", "-C", str(self.root), "worktree", "add", "-qb", "agent/test", str(linked)], check=True)
+        cache = linked / "__pycache__" / "app.cpython-39.pyc"
+        cache.parent.mkdir()
+        cache.write_bytes(b"compiled")
+
+        result = ai_kit._cleanup_task_worktree({"assignment": {"worktree": str(linked)}})
+
+        self.assertTrue(result["removed"])
+        self.assertFalse(linked.exists())
+
+    def test_delivery_cleanup_preserves_worktree_with_source_changes(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Test"], check=True)
+        source = self.root / "app.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "app.py"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "base"], check=True)
+        linked = self.root.parent / f"{self.root.name}-linked"
+        subprocess.run(["git", "-C", str(self.root), "worktree", "add", "-qb", "agent/test", str(linked)], check=True)
+        (linked / "notes.txt").write_text("keep me\n", encoding="utf-8")
+
+        result = ai_kit._cleanup_task_worktree({"assignment": {"worktree": str(linked)}})
+
+        self.assertFalse(result["removed"])
+        self.assertIn("notes.txt", result["dirty_paths"])
+        self.assertTrue(linked.exists())
+        subprocess.run(["git", "-C", str(self.root), "worktree", "remove", "--force", str(linked)], check=True)
+
+    def test_public_contract_activation_is_rejected(self) -> None:
+        with self.assertRaises(ai_kit.EngineError) as ctx:
+            ai_kit.cmd_contract_transition(ns(id="x", version="1.0.0", action="activate", actor="architect", evidence=None, migration=None, confirmed_by_user=False))
+        self.assertIn("integration", str(ctx.exception))
+
+    def test_isolated_dispatch_uses_absolute_schema_v2_handoff(self) -> None:
+        self.init_workflow()
+        self.add_task("T1")
+        isolated = self.root / "linked-worktree"
+        isolated.mkdir()
+        runner = {
+            "command": "runner {prompt}", "input": "json-file",
+            "capabilities": ["implementation"], "roles": ["backend"],
+            "task_kinds": ["general"],
+        }
+        assignment = {
+            "runner": "test-runner", "model": None, "agent_id": "worker-1",
+            "capabilities": ["implementation"], "branch": "agent/test/T1",
+            "worktree": str(isolated), "base_commit": None,
+            "assigned_at": ai_kit.now(), "state_path": str(self.state_file.resolve()),
+            "claim_id": None, "lease_expires_at": None,
+        }
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            captured["cwd"] = kwargs.get("cwd")
+            return subprocess.CompletedProcess(command, 0)
+
+        with (
+            mock.patch.object(ai_kit, "_select_runner_for_task", return_value=("test-runner", runner, None)),
+            mock.patch.object(ai_kit, "_ensure_task_worktree", return_value=assignment),
+            mock.patch.object(ai_kit, "cmd_route", return_value={"skills": [], "skill_details": [], "loading_instructions": []}),
+            mock.patch("subprocess.run", side_effect=fake_run),
+        ):
+            ai_kit.cmd_dispatch(ns(state=str(self.state_file), id="T1", runner="test-runner", model=None, agent_id="worker-1"))
+
+        handoff = ai_kit.workspace(self.state_file) / "handoffs" / "T1.json"
+        self.assertEqual(json.loads(handoff.read_text(encoding="utf-8"))["schema_version"], 2)
+        self.assertIn(str(handoff.resolve()), captured["command"])
+        self.assertEqual(captured["cwd"], str(isolated))
+
+    def test_new_assignment_uses_current_head_not_planning_provenance(self) -> None:
+        ai_kit.ROOT = self.root / "repo"
+        ai_kit.ROOT.mkdir()
+        planning_base = "a" * 40
+        integration_head = "b" * 40
+        task = {"id": "T1", "base_commit": planning_base, "assignment": None, "claim_id": "claim-1", "claim_expires_at": "2099-01-01T00:00:00Z"}
+        state = {"workflow_id": "workflow-1234"}
+        runner = {"capabilities": ["implementation"]}
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            if "rev-parse" in command:
+                return subprocess.CompletedProcess(command, 0, stdout="true\n", stderr="")
+            if "show-ref" in command:
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr="")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(ai_kit, "_git_head", return_value=integration_head),
+            mock.patch.object(ai_kit, "_load_runners", return_value={"runner": runner}),
+            mock.patch("subprocess.run", side_effect=fake_run),
+        ):
+            assignment = ai_kit._ensure_task_worktree(state, task, "runner", None, "agent-1", self.state_file)
+
+        self.assertEqual(assignment["base_commit"], integration_head)
+        add_command = next(command for command in commands if "worktree" in command and "add" in command)
+        self.assertEqual(add_command[-1], integration_head)
 
 
 class ShowTaskDetailTests(EngineTestCase):
@@ -1698,6 +1963,15 @@ class AutomationRunnersTestCase(EngineTestCase):
                                       reviewer="reviewer-runner", reviewer_model="reviewer-model")
         self.init_workflow()
         self.add_task("T1", owner="backend")
+        # These classes exercise the retained v4 compatibility pipeline.
+        # Governed v5 QA/review/delivery authority has dedicated tests below.
+        state = ai_kit.load(self.state_file)
+        ai_kit.task_map(state)["T1"]["governance_baseline"] = None
+        ai_kit.save(state, self.state_file, state["revision"])
+        contract_path = ai_kit.workspace(self.state_file) / "tasks" / "T1.json"
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        contract["governance_baseline"] = None
+        contract_path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
 
     def _write_automation_roles(self, qa: str, qa_model: str, reviewer: str, reviewer_model: str) -> None:
         (self.root / ".ai-config" / "automation.yaml").write_text(

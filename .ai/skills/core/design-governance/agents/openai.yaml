@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design Governance"
+  short_description: "Govern design policy and artifact architecture"
+  default_prompt: "Use $design-governance to assess this task against project design policy and validate its artifact-first architecture projection."

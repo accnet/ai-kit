@@ -39,7 +39,10 @@ python .ai/engine/ai_kit.py epic add checkout-revamp --spec .ai-work/plan/checko
 python .ai/engine/ai_kit.py epic add checkout-revamp --spec .ai-work/plan/checkout-revamp-spec.md --owner planner --force
 python .ai/engine/ai_kit.py drift T3
 python .ai/engine/ai_kit.py board --context ordering --format markdown --write
-python .ai/engine/ai_kit.py visualizer generate
+python .ai/engine/ai_kit.py artifact generate
+python .ai/engine/ai_kit.py artifact validate
+python .ai/engine/ai_kit.py artifact show architecture
+python .ai/engine/ai_kit.py visualizer serve --host 127.0.0.1 --port 8080
 python .ai/engine/ai_kit.py architecture discover
 python .ai/engine/ai_kit.py plan-draft create download-share --title "Share downloads" --problem "Users need shareable links" --scope "API" --acceptance "A user can create a link"
 python .ai/engine/ai_kit.py plan-draft update download-share --expected-revision 1 --summary "Clarified expiry" --add-scope "Expiry policy"
@@ -104,13 +107,24 @@ tracked source edit. Use `analyze --refresh` when relevant untracked files
 have been added. The route response includes `project_context` and places the
 snapshot path first in its minimal `context` list.
 
-`visualizer generate` exports the current board, module architecture, context
-impact, the last 200 runtime events, and the discovered feature-module
-architecture into `.visualizer/`. The same export is automatically
-regenerated after every state-mutating command (`init`, `add-task`,
-`update-task`, `transition`, and `plan`).
+`artifact generate` is the only publisher of project observation data. It
+normalizes workflow, project configuration, contract registry, evidence, Git,
+and source discovery into the exact 13-file
+`workspace(state)/artifacts/project/` bundle. Twelve schema-versioned payloads
+share one generation ID; `manifest.json` records their hashes and is replaced
+last as the atomic commit marker. A matching valid source fingerprint is a
+cache hit; `--refresh` forces a new generation. Lifecycle mutations request
+the same generator after their authoritative write. Projection failure warns
+but never rolls back a valid lifecycle transition.
 
-`architecture discover` is a read-only scan of the project's source tree that
+`artifact validate` is read-only. It verifies manifest hashes, envelope and
+generation consistency, stable cross-artifact references, evidence freshness,
+and architecture observation provenance. It is not a QA, review, design,
+contract, or delivery gate. `artifact show <name>` returns one validated
+payload. `visualizer generate` is retained only as a deprecated alias and
+delegates to `artifact generate`.
+
+`architecture discover` is a read-only query over the project's source tree that
 finds feature-level modules the declared `.ai-config/contexts.yaml` bounded
 contexts don't name individually (NestJS `*.module.ts` folders, React
 `src/{pages,components,features,services,contexts}`, Python packages with
@@ -121,21 +135,35 @@ authoritative: a discovered module whose path falls inside a declared
 context's glob is linked to it as a child (`parent`) rather than treated as
 an unrelated module, and every module is tagged `"source": "declared"` or
 `"source": "discovered"` plus a `confidence` for discovered entries. The
-command writes `.visualizer/discovered-architecture.json` (its own
-`schema_version`, separate from `architecture.json`'s shape) and records
+command returns schema-versioned discovery data and records
 anything it cannot resolve safely -- a missing source root, a dependency
 pointing at a module that doesn't exist, a duplicate module path, a module
 with no owner, or a discovered module outside every bounded context -- as a
 `warnings` entry rather than guessing. It only exits non-zero for a
 structurally invalid `contexts.yaml` entry (e.g. a non-string `path`);
-everything else degrades to a partial result with warnings. Source
+everything else degrades to a partial result with warnings. It never writes
+Visualizer or lifecycle state; only `artifact generate` may normalize and
+publish its observations. Source
 directories to scan can be configured via `project.source_dirs` in
 `.ai-config/kit.yaml`; `.git`, `node_modules`, `dist`, `build`,
 `__pycache__`, and other build/runtime directories are always skipped.
-`.visualizer/app.js` fetches `discovered-architecture.json` independently
-and falls back to the declared-only `architecture.json` view when the file
-is absent, so this capability is additive and never a breaking change to
-`ai-kit context list`, `context impact`, `route`, or `pipeline`.
+Each module/dependency relationship is classified `observed`, `inferred`, or
+`proposed` with source references, confidence, and rationale. Proposed edges
+remain visible but are excluded from active impact and gates. Promotion must
+change a canonical config/source/decision before the next generation.
+
+`visualizer serve` exposes the static dashboard plus read-only
+`/artifacts/project/*` endpoints for the selected state. The browser loads the
+manifest first, fetches required payloads in parallel, verifies their schema
+and generation, retries once during publication, and retains its previous
+render on an incomplete update. Its only computations are presentation
+filters, layout, and grouping. The compatibility `.visualizer/*.json` mirror
+is derived from the published bundle and is used only as a legacy fallback.
+
+`events.json` is a bounded replay projection of the latest 200 state events;
+it is not the append-only audit log. Archival history remains at
+`.ai-work/logs/events.jsonl`. A mismatch is surfaced as an
+`event_history_divergence` risk rather than silently merged.
 
 `complete` means implementation complete. A task becomes `done` only after
 `qa-pass`, `review-approve`, and `close`. QA and review actions require an
@@ -361,9 +389,11 @@ nothing else enforces them: `test_agents_conformance.py` reachability-checks
 every role/skill routing table this file documents against
 `.ai-config/registry.yaml`; `test_skill_system.py` and
 `test_architecture_discovery.py` cover skill routing and the read-only
-`architecture discover` scan; `test_visualizer_contract.py` and
-`test_dag_browser.py` pin the `dag.json` payload shape against the fields
-`.visualizer/dag.html` actually reads; and `test_install_parity.py` asserts
+`architecture discover` scan; `test_artifact_architecture.py` pins the exact
+13-file bundle, manifest-last publication, cache, provenance, event, and
+cross-reference contracts; `test_visualizer_contract.py` and
+`test_dag_browser.py` pin canonical loading and DAG rendering; and
+`test_install_parity.py` asserts
 that `.ai/install/config/` and `.ai/install/templates/.visualizer/` — the
 copies `install.sh` seeds new projects from — stay in sync with this repo's
 own live `.ai-config/` and `.visualizer/`, so a fresh install doesn't

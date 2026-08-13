@@ -20,8 +20,8 @@
 # NOTE: `ai-kit runner add` fully rewrites this file from its in-memory
 # runner list and does not preserve these comments -- re-add them (or copy
 # from `.ai/install/config/runners.yaml`) if you regenerate it that way.
-default_executor: "copilot-cli"
-default_model: "gpt-5.6-luna"
+default_executor: "codex-cli"
+default_model: "gpt-5.6-terra"
 
 runners:
   claude-cli:
@@ -29,33 +29,63 @@ runners:
     provider: "claude-cli"
     description: "Claude CLI runner"
     input: "json-file"
+    capabilities: [implementation, refactoring, testing, review]
+    roles: ["*"]
+    task_kinds: [general, contract, implementation, integration]
+    priority: 100
+    max_parallel: 1
   codex-cli:
     command: "codex exec -m {model} --sandbox danger-full-access --ask-for-approval never {prompt}"
     models: ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.4", "gpt-5.4-mini"]
     provider: "codex-cli"
     description: "Codex CLI runner"
     input: "json-file"
+    capabilities: [implementation, refactoring, testing, review]
+    roles: ["*"]
+    task_kinds: [general, contract, implementation, integration]
+    priority: 100
+    max_parallel: 1
   cline-pass:
     command: "cline -P cline-pass -m 'cline-pass/{model}' --auto-approve true {prompt}"
     models: ["glm-5.2"]
     provider: "cline-pass"
     description: "Cline pass runner"
+    capabilities: [implementation, testing]
+    roles: ["*"]
+    task_kinds: [general, implementation]
+    priority: 50
+    max_parallel: 1
   cline:
     command: "cline -P deepseek -m '{model}' --auto-approve true {prompt}"
     models: ["deepseek-v4-flash", "deepseek-v4-pro"]
     provider: "cline"
     description: "Cline DeepSeek runner"
+    capabilities: [implementation, testing, review]
+    roles: ["*"]
+    task_kinds: [general, implementation]
+    priority: 50
+    max_parallel: 1
   opencode-cli:
     command: "opencode run {prompt} --model deepseek/{model}"
     models: ["deepseek-v4-flash", "deepseek-v4-pro"]
     provider: "opencode-cli"
     description: "OpenCode CLI runner"
+    capabilities: [implementation, testing, review]
+    roles: ["*"]
+    task_kinds: [general, implementation]
+    priority: 60
+    max_parallel: 1
   copilot-cli:
     command: "copilot -p {prompt} --model {model} --allow-all-tools --log-level error"
     models: ["gpt-5.6-luna", "gpt-5.6-terra", "gemini-3.6-flash", "gemini-3.5-flash", "gpt-5.4", "gpt-5.4-mini", "claude-opus-4.8-fast", "grok-4.5", "kimi-k2.7-code", "gpt-4o", "gpt-4o-mini", "gpt-4o-mini-2024-08-23"]
     provider: "copilot-cli"
     description: "GitHub Copilot CLI runner"
     input: "json-file"
+    capabilities: [implementation, refactoring, testing, review]
+    roles: ["*"]
+    task_kinds: [general, contract, implementation, integration]
+    priority: 90
+    max_parallel: 1
 
 runner_aliases:
   claude: "claude-cli"

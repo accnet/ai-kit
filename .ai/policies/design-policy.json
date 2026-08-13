@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "policy_id": "ai-kit-core-design-governance",
+  "rules": [
+    {"id": "DG-ARCH-OWNERSHIP", "level": "MUST", "group": "architecture", "title": "Explicit boundary ownership", "description": "Every changed cross-layer or cross-module boundary has one canonical owner and an explicit direction.", "applies_to": {"task_kinds": ["contract", "implementation", "integration"]}},
+    {"id": "DG-CANONICAL-OWNER", "level": "MUST", "group": "ownership", "title": "Canonical ownership", "description": "A concept, state transition, or business invariant has exactly one authoritative owner.", "applies_to": {"task_kinds": ["contract", "implementation", "integration"]}},
+    {"id": "DG-DEPENDENCY-DIRECTION", "level": "FORBIDDEN", "group": "dependencies", "title": "No inverted or internal dependency", "description": "Code must not reverse the registered dependency direction or import another module's internal implementation.", "applies_to": {"task_kinds": ["implementation", "integration"]}},
+    {"id": "DG-CONCRETE-FIRST", "level": "SHOULD", "group": "abstraction", "title": "Concrete-first abstraction", "description": "Introduce abstractions only after a concrete boundary or repeated variation demonstrates the need.", "applies_to": {"task_kinds": ["implementation"]}},
+    {"id": "DG-MINIMAL-CHANGE", "level": "MUST", "group": "change-scope", "title": "Minimal architectural change", "description": "Use the smallest architectural change that satisfies the accepted task contract.", "applies_to": {"task_kinds": ["implementation", "integration"]}},
+    {"id": "DG-EXPLICIT-CONTRACT", "level": "MUST", "group": "contracts", "title": "Explicit boundary contracts", "description": "Public, cross-module, persisted, external, and asynchronous boundaries use an explicit versioned contract.", "applies_to": {"task_kinds": ["contract", "implementation", "integration"]}},
+    {"id": "DG-REPRESENTATION-SEPARATION", "level": "MUST", "group": "representations", "title": "Domain and API representation separation", "description": "Domain objects are not used as transport, persistence, or generated client representations without an explicit mapping boundary.", "applies_to": {"task_kinds": ["implementation", "integration"]}},
+    {"id": "DG-SOURCE-OF-TRUTH", "level": "MUST", "group": "derived-artifacts", "title": "Canonical source of truth", "description": "Generated and derived artifacts identify their canonical input and are reproducible from it.", "applies_to": {"task_kinds": ["contract", "implementation", "integration"]}},
+    {"id": "DG-BUSINESS-NAMING", "level": "SHOULD", "group": "naming", "title": "Business-oriented naming", "description": "Structure and names express business capabilities rather than accidental framework layers.", "applies_to": {"task_kinds": ["contract", "implementation"]}},
+    {"id": "DG-BOUNDARY-TESTS", "level": "MUST", "group": "testing", "title": "Boundary-oriented tests", "description": "Changed boundaries have conformance or regression coverage at the boundary where failure is observable.", "applies_to": {"task_kinds": ["implementation", "integration"]}},
+    {"id": "DG-LEGACY-PRESERVATION", "level": "MUST", "group": "legacy", "title": "Minimal legacy refactoring", "description": "Unrelated legacy behavior is preserved and refactoring is limited to what the task requires.", "applies_to": {"task_kinds": ["implementation"]}},
+    {"id": "DG-NO-LAYOUT-ASSUMPTION", "level": "MAY", "group": "project-layout", "title": "Project identity decides layout", "description": "domain/api-contract/backend/frontend are references only; project identity and registered contexts decide the real layout.", "applies_to": {"task_kinds": ["contract", "implementation", "integration"]}}
+  ]
+}
