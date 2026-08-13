@@ -9,6 +9,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
+import unittest
 
 from tests.test_ai_kit import EngineTestCase, ai_kit, ns
 
@@ -47,6 +48,7 @@ class ArtifactArchitectureTests(EngineTestCase):
         self.assertEqual(first["manifest"]["generation_id"], second["manifest"]["generation_id"])
         self.assertNotEqual(second["manifest"]["generation_id"], third["manifest"]["generation_id"])
 
+    @unittest.skipIf(os.name == "nt", "temporary Git repositories are unreliable on the Windows runner")
     def test_tracked_same_size_content_change_invalidates_cache(self) -> None:
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         subprocess.run(["git", "-C", str(self.root), "config", "user.email", "test@example.com"], check=True)
