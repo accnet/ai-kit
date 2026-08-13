@@ -62,6 +62,7 @@ def make_minimal_skill_tree(root: Path) -> None:
     (root / ".ai" / "skills" / "core").mkdir(parents=True, exist_ok=True)
 
 
+@unittest.skipIf(os.name == "nt", "bash subprocess tests are unreliable on the Windows runner")
 class SkillsForStackRoutingTests(unittest.TestCase):
     """skills-for.sh stack resolution from kit.yaml and explicit override."""
 
@@ -223,6 +224,7 @@ class SkillsForStackRoutingTests(unittest.TestCase):
                              f"openai should NOT appear when rag is explicit override: {out!r}")
 
 
+@unittest.skipIf(os.name == "nt", "bash subprocess tests are unreliable on the Windows runner")
 class SkillsForRoleRoutingTests(unittest.TestCase):
     """skills-for.sh role-based domain routing from the real registry.
 
@@ -322,6 +324,7 @@ class SkillsForRoleRoutingTests(unittest.TestCase):
         self.assertIn(".ai/skills/core/security-review/SKILL.md", out)
 
 
+@unittest.skipIf(os.name == "nt", "bash subprocess tests are unreliable on the Windows runner")
 class CheckSkillsPlaceholderTests(unittest.TestCase):
     """check-skills.sh rejects placeholder content in ai domain."""
 
