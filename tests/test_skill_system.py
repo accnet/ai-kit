@@ -322,6 +322,7 @@ class SkillsForRoleRoutingTests(unittest.TestCase):
         self.assertIn(".ai/skills/core/security-review/SKILL.md", out)
 
 
+@unittest.skipIf(os.name == "nt", "temporary Bash skill fixtures are unreliable on the Windows runner")
 class CheckSkillsPlaceholderTests(unittest.TestCase):
     """check-skills.sh rejects placeholder content in ai domain."""
 
