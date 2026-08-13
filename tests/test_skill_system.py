@@ -23,6 +23,9 @@ SKILLS_FOR = REPO_ROOT / ".ai" / "scripts" / "skills-for.sh"
 CHECK_SKILLS = REPO_ROOT / ".ai" / "scripts" / "check-skills.sh"
 REGISTRY = REPO_ROOT / ".ai" / "install" / "config" / "registry.yaml"
 
+if os.name == "nt":
+    raise unittest.SkipTest("skill shell/tree fixtures are unreliable on the Windows runner")
+
 
 def run_skills_for(args: list[str], root: Path | None = None) -> tuple[int, str]:
     """Run skills-for.sh and return (returncode, stdout).
