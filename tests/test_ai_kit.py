@@ -56,6 +56,7 @@ class EngineTestCase(unittest.TestCase):
 
     ROLES = ("planner", "backend", "qa", "reviewer")
     WORKFLOWS = ("feature",)
+    _canonical_root: Path | None = None
 
     def setUp(self) -> None:
         # Windows CI can briefly lose a temporary directory while a previous
@@ -91,6 +92,37 @@ class EngineTestCase(unittest.TestCase):
         for name, value in self._patched.items():
             setattr(ai_kit, name, value)
         self._tmp.cleanup()
+
+    def _use_canonical_kit_root(self) -> None:
+        """Copy installed routing inputs into this test's Git-free root."""
+        if EngineTestCase._canonical_root is None:
+            canonical = Path(tempfile.mkdtemp(prefix="ai-kit-canonical-"))
+            shutil.copytree(REPO_ROOT / ".ai" / "install" / "config",
+                            canonical / ".ai" / "install" / "config")
+
+            def ignore_skill_docs(_directory: str, names: list[str]) -> list[str]:
+                # Routing reads metadata and entrypoints only; omitting the
+                # long reference documents keeps the shared fixture small.
+                keep = {"skill.meta.yaml", "SKILL.md", "overview.md"}
+                return [name for name in names
+                        if name not in keep and not (Path(_directory) / name).is_dir()]
+
+            shutil.copytree(REPO_ROOT / ".ai" / "skills",
+                            canonical / ".ai" / "skills",
+                            ignore=ignore_skill_docs)
+            shutil.copytree(REPO_ROOT / ".ai" / "agents",
+                            canonical / ".ai" / "agents")
+            shutil.copytree(REPO_ROOT / ".ai" / "workflows",
+                            canonical / ".ai" / "workflows")
+            (canonical / ".ai-config").mkdir(parents=True, exist_ok=True)
+            # Keep project discovery bounded; these routing tests exercise the
+            # canonical registry/skills, not source-tree scanning.
+            (canonical / ".ai-config" / "kit.yaml").write_text(
+                "project:\n  stack: []\n  source_dirs: []\n",
+                encoding="utf-8",
+            )
+            EngineTestCase._canonical_root = canonical
+        ai_kit.ROOT = EngineTestCase._canonical_root
 
     # -- helpers -----------------------------------------------------------
     def init_workflow(self, title: str = "Test workflow", workflow: str = "feature") -> None:
@@ -1596,7 +1628,7 @@ class StackSkillsRoutingTests(EngineTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        ai_kit.ROOT = REPO_ROOT
+        self._use_canonical_kit_root()
 
     def test_stack_skills_section_is_parsed(self) -> None:
         mapping = ai_kit._load_stack_skills()
@@ -1628,7 +1660,7 @@ class DatabaseChangeRoutingTests(EngineTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        ai_kit.ROOT = REPO_ROOT
+        self._use_canonical_kit_root()
 
     def _skills(self, title: str, owner: str) -> list[str]:
         self.add_task(f"T{abs(hash(title)) % 9999}", title=title, owner=owner)
@@ -1836,11 +1868,10 @@ class RegistryEndToEndRoutingTests(EngineTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        # Point role/skill/config lookups at the source kit; _config_path()
-        # resolves its canonical install seeds when no project config exists.
-        # Only the
-        # workflow state itself stays in the isolated temp dir.
-        ai_kit.ROOT = REPO_ROOT
+        # Use a Git-free copy of the canonical kit inputs; only workflow state
+        # remains test-local, so routing cannot contend with the repository's
+        # Windows Git process while still exercising real registry/skills.
+        self._use_canonical_kit_root()
 
     def _route(self, task_id: str) -> dict:
         return ai_kit.cmd_route(ns(state=str(self.state_file), id=task_id))
