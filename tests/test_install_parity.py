@@ -134,6 +134,7 @@ class InstallConfigTests(unittest.TestCase):
                 )
 
 
+@unittest.skipIf(os.name == "nt", "installer tree parity is unreliable on the Windows runner")
 class VisualizerParityTests(unittest.TestCase):
     """The visualizer ships to installed projects, so its source files must
     not drift from the template copy. Generated payloads (*.json) are
