@@ -58,8 +58,12 @@ class EngineTestCase(unittest.TestCase):
     WORKFLOWS = ("feature",)
 
     def setUp(self) -> None:
+        # Windows CI can briefly lose a temporary directory while a previous
+        # subprocess is releasing a handle; ensure the fixture root exists
+        # before creating its skeleton.
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
+        self.root.mkdir(parents=True, exist_ok=True)
         for role in self.ROLES:
             (self.root / ".ai" / "agents" / role).mkdir(parents=True, exist_ok=True)
         for workflow in self.WORKFLOWS:
