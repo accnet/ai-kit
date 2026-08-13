@@ -12,6 +12,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -5151,14 +5152,24 @@ def _git_capture(*args: str) -> str | None:
         _GIT_CAPTURE_HEAD_CACHE[cache_key] = None
         return None
     try:
-        completed = subprocess.run(
-            ["git", *args], cwd=ROOT, text=True, capture_output=True, check=False
-        )
-    except OSError:
+        # File-backed stdout avoids the reader threads that CPython's Windows
+        # subprocess implementation creates for PIPE captures. Those threads
+        # can contend with the test runner when many routing fingerprints run
+        # in one process.
+        with tempfile.TemporaryFile(mode="w+b") as output:
+            completed = subprocess.run(
+                ["git", *args], cwd=ROOT, stdout=output,
+                stderr=subprocess.DEVNULL, check=False, timeout=5,
+            )
+            if completed.returncode == 0:
+                output.seek(0)
+                value = output.read().decode("utf-8", errors="replace")
+            else:
+                value = None
+    except (OSError, subprocess.TimeoutExpired):
         if cache_head:
             _GIT_CAPTURE_HEAD_CACHE[cache_key] = None
         return None
-    value = completed.stdout if completed.returncode == 0 else None
     if cache_head:
         _GIT_CAPTURE_HEAD_CACHE[cache_key] = value
     return value
