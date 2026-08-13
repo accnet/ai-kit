@@ -69,6 +69,7 @@ ARTIFACT_NAMES = {Path(name).stem: name for name in ARTIFACT_PAYLOAD_FILES}
 OBSERVATION_CLASSIFICATIONS = {"observed", "inferred", "proposed"}
 AUTO_ARTIFACT_GENERATION = True
 _GIT_HEAD_CACHE: dict[str, str | None] = {}
+_GIT_CAPTURE_HEAD_CACHE: dict[str, str | None] = {}
 # .ai-work/tasks/<id>.json: the self-contained "task contract" snapshot
 # written alongside tasks.md by add-task/plan (see state-schema.md's Task
 # contract files section). Bump only when its top-level shape changes.
@@ -5137,13 +5138,30 @@ def _sha256_file(path: Path) -> str | None:
 
 def _git_capture(*args: str) -> str | None:
     """Read a small Git metadata value without falling back to a tree scan."""
+    # The analyzer may fingerprint the same repository several times during a
+    # single process (notably while routing many tasks).  HEAD is immutable for
+    # that in-process snapshot and repeatedly spawning Git is costly on
+    # Windows, where captured subprocesses allocate reader threads.  Keep the
+    # diff/status calls uncached so source changes remain observable.
+    cache_head = args == ("rev-parse", "--verify", "HEAD")
+    cache_key = str(ROOT.resolve())
+    if cache_head and cache_key in _GIT_CAPTURE_HEAD_CACHE:
+        return _GIT_CAPTURE_HEAD_CACHE[cache_key]
+    if cache_head and not (ROOT / ".git").exists():
+        _GIT_CAPTURE_HEAD_CACHE[cache_key] = None
+        return None
     try:
         completed = subprocess.run(
             ["git", *args], cwd=ROOT, text=True, capture_output=True, check=False
         )
     except OSError:
+        if cache_head:
+            _GIT_CAPTURE_HEAD_CACHE[cache_key] = None
         return None
-    return completed.stdout if completed.returncode == 0 else None
+    value = completed.stdout if completed.returncode == 0 else None
+    if cache_head:
+        _GIT_CAPTURE_HEAD_CACHE[cache_key] = value
+    return value
 
 
 def _project_context_fingerprint() -> tuple[str, dict]:
