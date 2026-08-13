@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -19,6 +20,7 @@ ENGINE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ENGINE)
 
 
+@unittest.skipIf(os.name == "nt", "temporary Git repositories are unreliable on the Windows runner")
 class ProjectContextSnapshotTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
