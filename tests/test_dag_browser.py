@@ -91,12 +91,17 @@ class DagBrowserTests(unittest.TestCase):
         (root / ".ai" / "workflows" / "feature").mkdir(parents=True, exist_ok=True)
         (root / ".ai-config").mkdir(parents=True, exist_ok=True)
 
-        saved = {name: getattr(ai_kit, name) for name in ("ROOT", "STATE", "CURRENT", "EVENT_LOG", "VISUALIZER_DIR")}
+        saved = {
+            name: getattr(ai_kit, name)
+            for name in ("ROOT", "WORK", "STATE", "CURRENT", "EVENT_LOG", "VISUALIZER_DIR", "AUTO_ARTIFACT_GENERATION")
+        }
         ai_kit.ROOT = root
+        ai_kit.WORK = root / "unused"
         ai_kit.STATE = root / "unused" / "state" / "workflow.json"
         ai_kit.CURRENT = root / "unused" / "state" / "current.json"
         ai_kit.EVENT_LOG = root / "unused" / "logs" / "events.jsonl"
         ai_kit.VISUALIZER_DIR = cls.serve_dir
+        ai_kit.AUTO_ARTIFACT_GENERATION = False
         try:
             state_file = root / "work" / "state" / "workflow.json"
             cls._build_workflow(str(state_file))

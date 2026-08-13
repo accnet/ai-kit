@@ -1,43 +1,52 @@
 # AI-Kit Visualizer
 
-Visualizer dùng layout dashboard từ `diagram.html`, đã tách thành `index.html` (markup), `style.css` (CSS) và `app.js` (script). Header có search, view tabs **Evolution / Architecture / Runtime / Replay / DAG**; trung tâm là Architecture canvas, hai sidebar là module tree, thống kê, agent/event stream và inspector.
+Visualizer là consumer chỉ đọc của Artifact Architecture Machine. Dashboard
+không scan source, suy luận dependency, tính lifecycle, hoặc ghi state. Nó chỉ
+lọc, nhóm và bố trí dữ liệu đã được `artifact generate` publish.
 
-## DAG tab
-
-`architecture.json` graphs **contexts/modules** ("kiến trúc rộng bao nhiêu"); it has no task dependency edges, so it can't answer "task nào chặn task nào" or "đường tới hạn ở đâu". The **DAG** tab answers that instead, from a separate `dag.json` payload — deliberately kept as its own standalone page (`dag.html`, embedded via iframe) rather than another toggle-able layer on the Architecture canvas, since the two graphs answer different questions and sharing one canvas is why the Architecture canvas already needs a layer toggle to stay readable.
-
-`dag.html` is a zero-dependency, vanilla JS + SVG page — open it directly (works via `file://` too, showing an empty embedded snapshot) or serve it alongside the other JSON files for a live view. It reads `dag.json` for:
-
-- **Edges** (`needs`, with an `unlocked` flag = has the upstream task reached `done`)
-- **`layer`** — longest-path layering (wave number); columns in the DAG are waves
-- **`stage`** — index 0-5 in the linear `todo → done` lifecycle; `blocked` is `-1` (a branch, not a stage) and renders as a red hatch instead of the 6-segment progress rail
-- **`history`** — first timestamp each task reached each status, driving the replay scrubber
-- **`ready`**, **`critical_path`** — precomputed server-side (critical path is weighted by *remaining* stages, so a nearly-done task doesn't count as "critical" just because its chain is long)
-
-Rows in the DAG are lanes: `context` if set, else `owner` — with G6 `module_boundary` on, that's the same file-ownership boundary the engine already enforces.
-
-## Canvas và tương tác
-
-- Canvas vẽ node động từ `Object.keys(architecture.json)`, tự xếp theo tầng dependency hoặc vòng tròn; không phụ thuộc tên module cụ thể.
-- Các layer **Architecture (deps)**, **Owner groups**, **Revision heat** và **Impact propagation** đọc dữ liệu thật từ `architecture.json`/`impact.json`. Evolution tab hiển thị kanban từ `board.json`.
-- Click node khi Impact propagation bật sẽ highlight/dim dependents; khi tắt sẽ mở Inspector với info, dependencies, impact, tasks và events.
-- Replay timeline dùng timestamp thật trong `events.json`. Slider, click event và nút Play đều cập nhật replay state, ẩn/hiện module theo `add-task`, tính trạng thái tại mốc và fade-in lần đầu module xuất hiện. Nút **Về hiện tại** trả về live view.
-- Zoom, pan, search, refresh/diff và layout LTR/Radial vẫn được hỗ trợ; canvas chiếm phần lớn workspace desktop. Dữ liệu tự regenerate sau mỗi lệnh `ai-kit` mutate; cũng có thể chạy thủ công `python3 .ai/engine/ai_kit.py visualizer generate`.
-
-## Chạy và kiểm tra
+## Chạy
 
 ```bash
-python3 .ai/engine/ai_kit.py visualizer generate
-python3 -m http.server 8080 --directory .visualizer
+python3 .ai/engine/ai_kit.py artifact generate
+python3 .ai/engine/ai_kit.py artifact validate
+python3 .ai/engine/ai_kit.py visualizer serve --host 127.0.0.1 --port 8080
 ```
 
-Mở `http://localhost:8080/index.html`. `workflow.json` được thử đọc từ repository root khi static server cho phép; `board.json` là fallback dữ liệu đã export an toàn.
+Mở `http://127.0.0.1:8080/index.html`. `visualizer serve` chọn đúng workspace
+của `--state`, phục vụ static assets và endpoint chỉ đọc
+`/artifacts/project/*`. `visualizer generate` vẫn tồn tại như alias deprecated
+và chỉ delegate sang `artifact generate`.
 
-## Nguồn dữ liệu
+## Nguồn dữ liệu canonical
 
-- `architecture.json`: Module Registry của project qua `ai-kit --json context list`.
-- `impact.json`: kết quả `ai-kit --json context impact <module>` cho từng module trong `architecture.json`; danh sách module được đọc động, không hardcode.
-- `board.json`: workflow hiện tại qua `ai-kit board --format json`, kèm tags/files/acceptance_count.
-- `events.json`: 200 runtime events gần nhất từ `.ai-work/logs/events.jsonl`.
-- `dag.json`: task dependency graph (edges, layer/wave, stage, history, ready, critical_path) computed by `_generate_dag_payload()` from the current workflow state — see the "DAG tab" section above.
-- `artifacts.json`: schema-version manifest for the five payloads above (`{schema_version, generated_at, artifacts: {filename: version}}`), written alongside them on every `visualizer generate`. Not fetched by any page today; it exists so an external consumer of these files (or a future page) can check compatibility before parsing, the same way task handoff JSON already carries its own `schema_version`. Bump an artifact's entry here when its shape changes in a way a consumer must know about.
+Dashboard đọc `.ai-work/artifacts/project/manifest.json` trước, sau đó tải song
+song đủ 12 payload: `project`, `architecture`, `modules`, `dependencies`,
+`contracts`, `tasks`, `dag`, `ownership`, `risks`, `git`, `evidence`, và
+`events`. Nó kiểm schema và `generation_id`, retry một lần nếu publication đang
+diễn ra, và giữ render trước nếu generation mới chưa hoàn chỉnh.
+
+Các tab có ý nghĩa:
+
+- **Project**: identity, stack, freshness, Git, ownership, risk, evidence.
+- **Architecture**: contexts, modules, dependency/ownership graph và provenance.
+- **Contracts**: lifecycle và `represents/implements/consumes/verifies` graph.
+- **Evolution**: board projection từ `tasks.json`.
+- **Runtime**: assignment và gate/evidence state.
+- **Replay**: cửa sổ tối đa 200 lifecycle event từ `events.json`.
+- **DAG**: waves, ready set, critical path và dependency unlock state.
+
+Observation luôn có label và line style riêng: `observed` nét liền,
+`inferred` nét đứt, `proposed` nét chấm. Proposed edge chỉ hiển thị; nó không
+tham gia impact, ownership, QA hay dependency gating.
+
+## Publication và compatibility
+
+`manifest.json` là atomic commit marker và được ghi cuối. Artifact bundle là
+derived canonical projection, không phải lifecycle authority. Audit history
+gốc vẫn nằm ở `.ai-work/logs/events.jsonl`; `events.json` chỉ phục vụ replay.
+
+Trong phase tương thích này, generator tạo `board.json`, `impact.json`,
+`architecture.json`, `contracts.json`, `events.json`, `dag.json`,
+`discovered-architecture.json`, và `artifacts.json` trong `.visualizer/` từ
+chính bundle vừa publish. Browser dùng chúng làm fallback cho static server cũ;
+không payload legacy nào được tính độc lập.

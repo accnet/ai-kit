@@ -118,7 +118,8 @@ class DagPayloadContractTests(unittest.TestCase):
         self.assertEqual(
             set(self.payload["tasks"][0]),
             {"id", "title", "owner", "context", "epic", "phase", "status",
-             "stage", "needs", "layer", "ready", "blocked_reason", "history"},
+             "stage", "needs", "layer", "ready", "blocked_reason", "history",
+             "task_kind", "assignment", "contract_refs"},
         )
         self.assertEqual(set(self.payload["edges"][0]), {"from", "to", "unlocked"})
 
@@ -151,6 +152,35 @@ class VisualizerPayloadKeysTests(unittest.TestCase):
             self.assertIn('data-view="dag"', markup, f"{index} has no DAG tab")
             self.assertIn('id="viewDag"', markup, f"{index} has no DAG view panel")
             self.assertIn('src="dag.html"', markup, f"{index} does not embed dag.html")
+
+    def test_dashboard_exposes_project_and_contract_views(self) -> None:
+        for index in (REPO_ROOT / ".visualizer" / "index.html",
+                      REPO_ROOT / ".ai" / "install" / "templates" / ".visualizer" / "index.html"):
+            markup = index.read_text(encoding="utf-8")
+            for view in ("project", "contracts"):
+                self.assertIn(f'data-view="{view}"', markup)
+                self.assertIn(f'id="view{view.title()}"', markup)
+            self.assertIn('id="contractGraph"', markup)
+        app = (REPO_ROOT / ".visualizer" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("contract-lifecycle", app)
+        for relation in ("producer/consumer/verifier", "edge.relation"):
+            self.assertIn(relation, app)
+
+    def test_app_is_manifest_first_with_complete_bundle_and_legacy_fallback(self) -> None:
+        app = (REPO_ROOT / ".visualizer" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("/artifacts/project/manifest.json", app)
+        self.assertIn("payload.generation_id !== manifest.generation_id", app)
+        for filename in ai_kit.ARTIFACT_PAYLOAD_FILES:
+            self.assertIn(filename, app)
+        self.assertIn("loadLegacyArtifacts", app)
+        self.assertIn("if (hasLoaded) return false", app)
+
+    def test_dag_is_canonical_first_with_legacy_fallback(self) -> None:
+        page = (REPO_ROOT / ".visualizer" / "dag.html").read_text(encoding="utf-8")
+        canonical = page.index("/artifacts/project/manifest.json")
+        legacy = page.index("fetch('dag.json'")
+        self.assertLess(canonical, legacy)
+        self.assertIn("artifact.generation_id !== manifest.generation_id", page)
 
 
 if __name__ == "__main__":

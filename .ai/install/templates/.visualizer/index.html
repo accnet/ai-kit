@@ -34,8 +34,10 @@
     </div>
 
     <nav class="view-tabs">
+      <div class="view-tab active" data-view="project">Project</div>
       <div class="view-tab" data-view="evolution">Evolution</div>
-      <div class="view-tab active" data-view="architecture">Architecture</div>
+      <div class="view-tab" data-view="architecture">Architecture</div>
+      <div class="view-tab" data-view="contracts">Contracts</div>
       <div class="view-tab" data-view="runtime">Runtime</div>
       <div class="view-tab" data-view="replay">Replay</div>
       <div class="view-tab" data-view="dag">DAG</div>
@@ -130,10 +132,31 @@
       </div>
 
       <!-- View panels (Evolution / Runtime / Replay) -->
+      <div class="view-panel active" id="viewProject">
+        <div class="view-h" style="color:var(--teal);">Project Artifact Snapshot</div>
+        <div class="view-sub" id="artifactStatus">Loading canonical artifact bundle…</div>
+        <div class="project-grid" id="projectOverview"></div>
+        <div class="artifact-section">
+          <div class="artifact-section-title">Open risks</div>
+          <div id="projectRisks"></div>
+        </div>
+      </div>
+
       <div class="view-panel" id="viewEvolution">
         <div class="view-h" style="color:var(--cyan);">Task Evolution Board</div>
         <div class="view-sub">Trạng thái task từ board.json thực — AI-Kit v2 workflow engine.</div>
         <div class="evo-wrap" id="evoBoard"></div>
+      </div>
+
+      <div class="view-panel" id="viewContracts">
+        <div class="view-h" style="color:var(--purple);">Contract Spine</div>
+        <div class="view-sub">Contract versions and observed task relations from the canonical projection.</div>
+        <div id="contractSummary" class="project-grid"></div>
+        <div id="contractGraph" class="contract-graph" aria-label="Contract producer consumer verifier graph"></div>
+        <table class="dt" id="contractTable">
+          <thead><tr><th>Contract</th><th>Kind</th><th>Owner</th><th>Status</th><th>Represents</th><th>Task relations</th></tr></thead>
+          <tbody id="contractBody"></tbody>
+        </table>
       </div>
 
       <div class="view-panel" id="viewRuntime">
@@ -197,6 +220,8 @@
             <div class="insp-tab" data-itab="impact">Impact</div>
             <div class="insp-tab" data-itab="tasks">Tasks</div>
             <div class="insp-tab" data-itab="events">Events</div>
+            <div class="insp-tab" data-itab="risks">Risks</div>
+            <div class="insp-tab" data-itab="evidence">Evidence</div>
           </div>
           <div class="insp-body" id="inspBody">
             <div class="ib ib-full" style="color:var(--text-dim); font-size:12px; padding-top:8px;">

@@ -448,6 +448,43 @@
     .view-panel.active { display: block; }
     .view-h { font-family: var(--head); font-size: 17px; font-weight: 700; margin-bottom: 6px; }
     .view-sub { font-size: 12px; color: var(--text-sub); margin-bottom: 18px; }
+    .project-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px; margin-bottom: 18px;
+    }
+    .project-fact {
+      background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px; min-width: 0;
+    }
+    .project-fact-label { color: var(--text-dim); font-size: 9px; text-transform: uppercase; letter-spacing: .5px; }
+    .project-fact-value { color: var(--text); font-family: var(--mono); font-size: 12px; margin-top: 5px; overflow-wrap: anywhere; }
+    .artifact-section { margin-top: 12px; }
+    .artifact-section-title { color: var(--text-sub); font-size: 11px; font-weight: 700; margin-bottom: 8px; text-transform: uppercase; letter-spacing: .5px; }
+    .risk-row { border-left: 2px solid var(--amber); padding: 7px 9px; margin-bottom: 6px; background: rgba(245,158,11,.05); }
+    .risk-kind { color: var(--amber); font-family: var(--mono); font-size: 10px; }
+    .risk-detail { color: var(--text-sub); font-size: 10px; margin-top: 3px; }
+    .obs-label { font-family: var(--mono); font-size: 8px; text-transform: uppercase; letter-spacing: .4px; }
+    .obs-observed { color: var(--green); }
+    .obs-inferred { color: var(--amber); }
+    .obs-proposed { color: var(--purple); }
+    .contract-graph { display: grid; gap: 10px; margin: 2px 0 18px; }
+    .contract-graph-row {
+      display: grid; grid-template-columns: minmax(150px, .8fr) minmax(210px, 1fr) minmax(220px, 1.4fr);
+      align-items: stretch; gap: 10px; padding: 10px;
+      border: 1px solid var(--border); border-radius: 10px; background: rgba(15,23,42,.35);
+    }
+    .contract-domain, .contract-node, .contract-relations { border-radius: 8px; padding: 10px; }
+    .contract-domain { border: 1px dashed var(--teal); color: var(--teal); font-family: var(--mono); font-size: 10px; }
+    .contract-node { border: 2px solid var(--purple); background: rgba(167,139,250,.07); }
+    .contract-node-name { font-family: var(--mono); font-size: 11px; color: var(--text); font-weight: 700; }
+    .contract-lifecycle { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+    .contract-lifecycle span { color: var(--text-dim); font-size: 8px; font-family: var(--mono); }
+    .contract-lifecycle span.current { color: var(--green); font-weight: 700; }
+    .contract-relation { display: grid; grid-template-columns: minmax(80px,1fr) auto minmax(100px,1.3fr); gap: 6px; align-items: center; margin-bottom: 5px; font-size: 9px; }
+    .contract-relation:last-child { margin-bottom: 0; }
+    .contract-relation-label { color: var(--amber); font-family: var(--mono); }
+    .contract-relation-arrow { color: var(--purple); }
+    @media (max-width: 900px) { .contract-graph-row { grid-template-columns: 1fr; } }
 
     /* ── Graph Canvas ── */
     .canvas-wrap {
@@ -474,6 +511,9 @@
       transition: stroke .2s;
     }
     .edge-dep { stroke: rgba(167,139,250,.5); stroke-dasharray: 5 3; }
+    .edge-observed { stroke: var(--teal); stroke-dasharray: none; }
+    .edge-inferred { stroke: var(--amber); stroke-dasharray: 7 5; }
+    .edge-proposed { stroke: var(--purple); stroke-dasharray: 2 6; opacity: .8; }
     @keyframes dash-flow {
       from { stroke-dashoffset: 200; }
       to { stroke-dashoffset: 0; }
@@ -506,6 +546,8 @@
       border-color: var(--teal) !important;
       box-shadow: 0 0 24px rgba(45,212,191,.55) !important;
     }
+    .node-card.node-observation-inferred { border-style: dashed; }
+    .node-card.node-observation-proposed { border-style: dotted; box-shadow: var(--glow-p); }
     .node-card.impact-hi {
       border-color: var(--amber) !important;
       box-shadow: 0 0 20px rgba(245,158,11,.5) !important;

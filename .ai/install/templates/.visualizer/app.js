@@ -7,33 +7,134 @@
     let events = [];
     let discovered = null; // discovered-architecture.json — optional, may not exist yet
     let discoveryWarnings = [];
+    let architectureEdges = [];
+    let taskModuleMap = {};
+    let projectData = {};
+    let contractsData = {items:[], edges:[]};
+    let ownershipData = {owners:{}, unowned:[]};
+    let risksData = {items:[]};
+    let evidenceData = {items:[]};
+    let taskItemsData = [];
+    let gitData = {};
+    let artifactManifest = null;
+    let artifactMode = 'loading';
+    let hasLoaded = false;
     let sourceFilter = 'all'; // 'all' | 'declared' | 'discovered'
     let ownerFilterVal = 'all';
     let contextFilterVal = 'all';
 
-    async function loadData() {
+    const ARTIFACT_FILES = [
+      'project.json','architecture.json','modules.json','dependencies.json','contracts.json','tasks.json',
+      'dag.json','ownership.json','risks.json','git.json','evidence.json','events.json'
+    ];
+
+    async function loadCanonicalArtifacts(attempt = 0) {
       try {
-        const [b,a,im,ev] = await Promise.all([
+        const manifestResponse = await fetch('/artifacts/project/manifest.json', {cache:'no-store'});
+        if (!manifestResponse.ok) throw new Error(`manifest HTTP ${manifestResponse.status}`);
+        const manifest = await manifestResponse.json();
+        if (manifest.schema_version !== 1 || manifest.artifact_set_version !== 1) throw new Error('unsupported artifact manifest');
+        const declared = Object.keys(manifest.artifacts || {}).sort();
+        if (declared.join('|') !== [...ARTIFACT_FILES].sort().join('|')) throw new Error('artifact manifest is incomplete');
+        const values = await Promise.all(ARTIFACT_FILES.map(async filename => {
+          const response = await fetch(`/artifacts/project/${filename}`, {cache:'no-store'});
+          if (!response.ok) throw new Error(`${filename} HTTP ${response.status}`);
+          return response.json();
+        }));
+        const bundle = Object.fromEntries(ARTIFACT_FILES.map((filename,index)=>[filename,values[index]]));
+        for (const [filename,payload] of Object.entries(bundle)) {
+          if (payload.schema_version !== 1 || payload.generation_id !== manifest.generation_id || payload.artifact !== filename.replace('.json','')) {
+            throw new Error(`mixed or unsupported artifact generation: ${filename}`);
+          }
+        }
+
+        const moduleItems = bundle['modules.json'].data.items || [];
+        const moduleNames = Object.fromEntries(moduleItems.map(item=>[item.id,item.name]));
+        const nextArch = {};
+        const nextTaskModuleMap = {};
+        moduleItems.forEach(item => {
+          nextArch[item.name] = {
+            path:item.path, owner:item.owner, source:item.source, kind:item.kind,
+            parent:item.parent_ref ? item.parent_ref.replace(/^context:/,'') : null,
+            framework:item.framework, confidence:item.observation?.confidence,
+            observation:item.observation || {classification:'observed',confidence:1},
+            related_tasks:(item.task_refs||[]).map(ref=>ref.split(':').at(-1)),
+            depends_on:(item.depends_on||[]).map(ref=>moduleNames[ref]).filter(Boolean),
+          };
+          (item.task_refs||[]).forEach(ref=>{ nextTaskModuleMap[ref.split(':').at(-1)] = item.name; });
+        });
+        const nextEdges = (bundle['dependencies.json'].data.items || []).map(edge=>({
+          from:moduleNames[edge.from], to:moduleNames[edge.to], active:edge.active,
+          kind:edge.kind, observation:edge.observation
+        })).filter(edge=>edge.from && edge.to);
+        const nextImpact = {};
+        Object.entries(bundle['architecture.json'].data.impact || {}).forEach(([moduleRef,value]) => {
+          const name = moduleNames[moduleRef];
+          if (!name) return;
+          nextImpact[name] = {
+            direct_dependents:(value.direct_dependents||[]).map(ref=>moduleNames[ref]).filter(Boolean),
+            all_dependents:(value.all_dependents||[]).map(ref=>moduleNames[ref]).filter(Boolean),
+            affected_tasks:(value.affected_task_refs||[]).map(ref=>ref.split(':').at(-1)),
+          };
+        });
+
+        // Commit only after the whole generation validates. A failed refresh
+        // leaves the previous render intact until a complete manifest appears.
+        artifactManifest = manifest;
+        projectData = bundle['project.json'].data;
+        contractsData = bundle['contracts.json'].data;
+        ownershipData = bundle['ownership.json'].data;
+        risksData = bundle['risks.json'].data;
+        evidenceData = bundle['evidence.json'].data;
+        taskItemsData = bundle['tasks.json'].data.items || [];
+        gitData = bundle['git.json'].data;
+        board = bundle['tasks.json'].data.board;
+        events = bundle['events.json'].data.events || [];
+        arch = nextArch;
+        impact = nextImpact;
+        architectureEdges = nextEdges;
+        taskModuleMap = nextTaskModuleMap;
+        discoveryWarnings = (risksData.items||[]).filter(item=>item.source==='architecture-discovery');
+        artifactMode = 'canonical';
+        hasLoaded = true;
+        return true;
+      } catch (error) {
+        if (attempt === 0) {
+          await new Promise(resolve=>setTimeout(resolve,80));
+          return loadCanonicalArtifacts(1);
+        }
+        console.warn('Canonical artifact bundle unavailable:', error);
+        return false;
+      }
+    }
+
+    async function loadLegacyArtifacts() {
+      try {
+        const [b,a,im,ev,discoveryResponse] = await Promise.all([
           fetch('board.json').then(r=>r.json()),
           fetch('architecture.json').then(r=>r.json()),
           fetch('impact.json').then(r=>r.json()),
           fetch('events.json').then(r=>r.json()),
+          fetch('discovered-architecture.json').catch(()=>null),
         ]);
         board = b; arch = a; impact = im; events = ev;
-      } catch(e) {
-        console.warn('Could not load data files — using empty state:', e);
+        discovered = discoveryResponse?.ok ? await discoveryResponse.json() : null;
+        architectureEdges = []; taskModuleMap = {};
+        mergeDiscoveredArchitecture();
+        projectData = {}; contractsData = {items:[],edges:[]}; ownershipData = {owners:{},unowned:[]}; taskItemsData = [];
+        risksData = {items:[]}; evidenceData = {items:[]}; gitData = {};
+        artifactManifest = null; artifactMode = 'legacy'; hasLoaded = true;
+        return true;
+      } catch(error) {
+        console.warn('Legacy visualizer projection unavailable:', error);
+        return false;
       }
-      // discovered-architecture.json is a separate, optional artifact: older
-      // projects (or ones that never ran `ai-kit architecture discover`)
-      // won't have it yet, so this always falls back to architecture.json
-      // alone rather than failing the whole load.
-      try {
-        const res = await fetch('discovered-architecture.json');
-        discovered = res.ok ? await res.json() : null;
-      } catch (e) {
-        discovered = null;
-      }
-      mergeDiscoveredArchitecture();
+    }
+
+    async function loadData() {
+      if (await loadCanonicalArtifacts()) return true;
+      if (hasLoaded) return false;
+      return loadLegacyArtifacts();
     }
 
     // ── MERGE DECLARED + DISCOVERED ARCHITECTURE ──────────────
@@ -45,20 +146,23 @@
     function mergeDiscoveredArchitecture() {
       const merged = {};
       Object.entries(arch).forEach(([name, info]) => {
-        merged[name] = Object.assign({source: 'declared', kind: 'bounded-context', parent: null, confidence: 1}, info);
+        merged[name] = Object.assign({source: 'declared', kind: 'bounded-context', parent: null, confidence: 1,
+          observation:{classification:'observed',source_kind:'config',confidence:1}}, info);
       });
       discoveryWarnings = (discovered && discovered.warnings) || [];
       if (discovered && discovered.modules) {
         Object.entries(discovered.modules).forEach(([name, info]) => {
           if (info.source === 'declared') return; // already present from architecture.json
           if (!merged[name]) {
-            merged[name] = Object.assign({depends_on: []}, info);
+            merged[name] = Object.assign({depends_on: [], observation:{classification:'inferred',source_kind:'convention',confidence:info.confidence||.5}}, info);
           }
         });
         (discovered.edges || []).forEach(edge => {
           if (!merged[edge.from]) return;
           const deps = merged[edge.from].depends_on || (merged[edge.from].depends_on = []);
           if (!deps.includes(edge.to)) deps.push(edge.to);
+          architectureEdges.push({from:edge.from,to:edge.to,active:true,kind:edge.kind,
+            observation:{classification:edge.kind==='declared'?'observed':'inferred',confidence:edge.confidence||.5}});
         });
       }
       arch = merged;
@@ -115,10 +219,21 @@
     const canvasWrap = document.getElementById('canvasWrap');
     const minimapCanvas = document.getElementById('minimapCanvas');
     const minimapView = document.getElementById('minimapView');
+    const artifactStatus = document.getElementById('artifactStatus');
+    const projectOverview = document.getElementById('projectOverview');
+    const projectRisks = document.getElementById('projectRisks');
+    const contractSummary = document.getElementById('contractSummary');
+    const contractGraph = document.getElementById('contractGraph');
+    const contractBody = document.getElementById('contractBody');
 
     // ── HELPERS ────────────────────────────────────────────────
     const ownerColors = { backend: '#60a5fa', frontend: '#a78bfa', devops: '#2dd4bf', qa: '#f59e0b' };
     function ownerColor(o) { return ownerColors[o] || '#94a3b8'; }
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, char=>({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+      })[char]);
+    }
 
     function timeAgo(iso) {
       const diff = Date.now() - new Date(iso).getTime();
@@ -151,6 +266,7 @@
     function taskForId(id) { return allTasks().find(task => task.id === id); }
     function moduleForTask(task) {
       if (!task) return null;
+      if (artifactMode === 'canonical') return taskModuleMap[task.id] || null;
       if (task.context && arch[task.context]) return task.context;
       const files = task.files || [];
       if (!files.length) return null;
@@ -525,6 +641,77 @@
       });
     }
 
+    // ── PROJECT / CONTRACT ARTIFACT VIEWS ─────────────────────
+    function projectFact(label, value) {
+      return `<div class="project-fact"><div class="project-fact-label">${escapeHtml(label)}</div><div class="project-fact-value">${escapeHtml(value ?? '—')}</div></div>`;
+    }
+
+    function renderProject() {
+      const identity = projectData.identity || {};
+      const workflow = projectData.workflow || {};
+      const generation = artifactManifest?.generation_id ? artifactManifest.generation_id.slice(0,12) : 'legacy projection';
+      artifactStatus.textContent = artifactMode === 'canonical'
+        ? `Canonical generation ${generation} · ${artifactManifest.generated_at}`
+        : 'Legacy compatibility projection — run ai-kit visualizer serve for manifest-first loading.';
+      projectOverview.innerHTML = [
+        projectFact('Project', identity.name || 'Unnamed project'),
+        projectFact('Architecture', identity.architecture || 'Not declared'),
+        projectFact('Stack', (projectData.stack || []).join(', ') || '—'),
+        projectFact('Workflow', workflow.title ? `${workflow.title} · r${workflow.revision}` : 'No active workflow'),
+        projectFact('Git branch', gitData.branch || (gitData.repository === false ? 'Not a Git repository' : 'Detached / unavailable')),
+        projectFact('Git HEAD', gitData.head ? gitData.head.slice(0,12) : '—'),
+        projectFact('Working tree', gitData.dirty ? `${(gitData.tracked_changes||[]).length} tracked · ${(gitData.untracked_paths||[]).length} untracked` : 'Clean'),
+        projectFact('Ownership', `${Object.keys(ownershipData.owners||{}).length} owners · ${(ownershipData.unowned||[]).length} unowned`),
+        projectFact('Evidence', `${evidenceData.counts?.current || 0} current · ${evidenceData.counts?.stale || 0} stale`),
+      ].join('');
+      const risks = risksData.items || [];
+      projectRisks.innerHTML = risks.length ? risks.slice(0,20).map(risk=>`
+        <div class="risk-row"><div class="risk-kind">${escapeHtml(risk.kind)}</div><div class="risk-detail">${escapeHtml(risk.detail)}</div></div>
+      `).join('') : '<div class="view-sub">No open projected risks.</div>';
+    }
+
+    function renderContracts() {
+      const contracts = contractsData.items || [];
+      const edges = contractsData.edges || [];
+      const statusCounts = contracts.reduce((acc,item)=>{ acc[item.status]=(acc[item.status]||0)+1; return acc; },{});
+      contractSummary.innerHTML = [
+        projectFact('Versions', contracts.length),
+        projectFact('Active', statusCounts.active || 0),
+        projectFact('Approved', statusCounts.approved || 0),
+        projectFact('Relations', edges.length),
+      ].join('');
+      const taskLabels = Object.fromEntries(taskItemsData.map(task=>[task.id, `${task.task_id} · ${task.owner}`]));
+      const lifecycle = ['draft','proposed','approved','active','deprecated','removed'];
+      contractGraph.innerHTML = contracts.map(contract=>{
+        const incoming = edges.filter(edge=>edge.to===contract.id && edge.relation!=='represents');
+        const relations = incoming.length ? incoming.map(edge=>`
+          <div class="contract-relation">
+            <span>${escapeHtml(taskLabels[edge.from] || edge.from)}</span>
+            <span class="contract-relation-arrow">—${escapeHtml(edge.relation)}→</span>
+            <span class="contract-relation-label">${escapeHtml(contract.contract_id)}@${escapeHtml(contract.version)}</span>
+          </div>`).join('') : '<div class="view-sub" style="margin:0">No producer/consumer/verifier task relation.</div>';
+        return `<div class="contract-graph-row">
+          <div class="contract-domain">represents → ${escapeHtml(contract.represents || 'unassigned domain')}</div>
+          <div class="contract-node">
+            <div class="contract-node-name">${escapeHtml(contract.contract_id)}@${escapeHtml(contract.version)}</div>
+            <div class="contract-lifecycle">${lifecycle.map(status=>`<span class="${status===contract.status?'current':''}">${status}</span>`).join('<span>→</span>')}</div>
+          </div>
+          <div class="contract-relations">${relations}</div>
+        </div>`;
+      }).join('');
+      if (!contracts.length) contractGraph.innerHTML = '<div class="view-sub">No registered contract graph.</div>';
+      contractBody.innerHTML = contracts.map(contract=>{
+        const relations = edges.filter(edge=>edge.to===contract.id && edge.relation!=='represents').map(edge=>edge.relation);
+        return `<tr>
+          <td><strong>${escapeHtml(contract.contract_id)}@${escapeHtml(contract.version)}</strong></td>
+          <td>${escapeHtml(contract.kind)}</td><td>${escapeHtml(contract.owner || '—')}</td>
+          <td><span class="badge bg-cyan">${escapeHtml(contract.status)}</span></td>
+          <td>${escapeHtml(contract.represents || '—')}</td><td>${escapeHtml(relations.join(', ') || '—')}</td>
+        </tr>`;
+      }).join('');
+      if (!contracts.length) contractBody.innerHTML = '<tr><td colspan="6" style="color:var(--text-dim)">No registered contracts.</td></tr>';
+    }
+
     // ── RENDER STATS ──────────────────────────────────────────
     function renderStats() {
       const total = allTasks().length;
@@ -618,6 +805,17 @@
 
     // ── RENDER RUNTIME TABLE ─────────────────────────────────
     function renderRuntime() {
+      const assigned = taskItemsData.filter(task=>task.assignment);
+      if (assigned.length) {
+        runtimeBody.innerHTML = assigned.map(task=>`<tr>
+          <td><strong>@${escapeHtml(task.assignment.agent_id || task.owner)}</strong></td>
+          <td>${escapeHtml(task.assignment.runner || 'assigned')}</td>
+          <td><span style="font-family:var(--mono); color:var(--cyan);">${escapeHtml(task.task_id)}</span></td>
+          <td style="font-family:var(--mono); font-size:10px;">${escapeHtml(task.assignment.assigned_at || '—')}</td>
+          <td><span class="badge bg-cyan">${escapeHtml(task.status)} · ${task.evidence_refs.length} evidence</span></td>
+        </tr>`).join('');
+        return;
+      }
       const actorMap = {};
       events.forEach(e => {
         actorMap[e.actor] = { action:e.action, task:e.task, ts:e.ts };
@@ -672,18 +870,17 @@
 
       // Draw edges (arch dependency)
       if (layers.arch) {
-        mods.forEach(k => {
-          const deps = arch[k]?.depends_on || [];
-          deps.forEach(dep => {
-            if (!pos[k] || !pos[dep]) return;
-            const x1 = pos[k].x + 93, y1 = pos[k].y + 20;
-            const x2 = pos[dep].x + 93, y2 = pos[dep].y + 80;
+        architectureEdges.forEach(edge => {
+            if (!mods.includes(edge.from) || !mods.includes(edge.to) || !pos[edge.from] || !pos[edge.to]) return;
+            const x1 = pos[edge.from].x + 93, y1 = pos[edge.from].y + 20;
+            const x2 = pos[edge.to].x + 93, y2 = pos[edge.to].y + 80;
             const mx = (x1+x2)/2;
             const path = document.createElementNS('http://www.w3.org/2000/svg','path');
             path.setAttribute('d', `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`);
-            path.setAttribute('class', 'edge-path edge-dep');
+            const classification = edge.observation?.classification || 'observed';
+            path.setAttribute('class', `edge-path edge-dep edge-${classification}`);
+            path.setAttribute('data-observation', classification);
             archSvg.appendChild(path);
-          });
         });
       }
 
@@ -698,7 +895,8 @@
         const impCount = (impData.all_dependents||[]).length;
 
         const card = document.createElement('div');
-        card.className = 'node-card' + (selectedMod===k?' selected':'');
+        const observationClass = m.observation?.classification || 'observed';
+        card.className = 'node-card' + (selectedMod===k?' selected':'') + ` node-observation-${observationClass}`;
         if (isReplayMode() && moduleTasks(k).length && !replaySeenModules.has(k)) card.classList.add('node-replay-in');
         card.dataset.mod = k;
         card.style.left = p.x+'px';
@@ -727,6 +925,7 @@
             <span class="mod-src-tag ${m.source==='discovered'?'mod-src-discovered':'mod-src-declared'}" style="margin-left:auto;">${m.source||'declared'}${m.source==='discovered' && m.confidence!=null ? ' ' + Math.round(m.confidence*100) + '%' : ''}</span>
           </div>
           <div class="node-name">${shortName}</div>
+          <div class="obs-label obs-${observationClass}">${observationClass}</div>
           <div class="node-path">${m.parent ? '↳ ' + m.parent + ' / ' : ''}${m.path}</div>
           ${layers.evolution ? `<div class="prog-row"><span>acceptance</span><span>${stats.passed}/${stats.total}</span></div>
           <div class="prog-bar"><div class="prog-fill" style="width:${Math.round(stats.ratio * 100)}%;"></div></div>` : ''}
@@ -802,7 +1001,26 @@
 
     // ── RENDER INSPECTOR ──────────────────────────────────────
     function renderInspector() {
-      if (!selectedMod) return;
+      if (currentTab === 'risks') {
+        const risks = risksData.items || [];
+        inspBody.innerHTML = `<div class="ib ib-full"><div class="ib-k">Projected risks</div>${risks.length ? risks.map(risk=>`
+          <div class="risk-row"><div class="risk-kind">${escapeHtml(risk.kind)}</div><div class="risk-detail">${escapeHtml(risk.detail)}</div></div>
+        `).join('') : '<div class="ib-v">No projected risks.</div>'}</div>`;
+        return;
+      }
+      if (currentTab === 'evidence') {
+        const items = evidenceData.items || [];
+        inspBody.innerHTML = `<div class="ib ib-full"><div class="ib-k">Evidence index</div>${items.length ? items.map(item=>`
+          <div class="risk-row" style="border-left-color:${item.current?'var(--green)':'var(--amber)'}">
+            <div class="risk-kind" style="color:${item.current?'var(--green)':'var(--amber)'}">${escapeHtml(item.id)} · ${item.current?'current':'stale'}</div>
+            <div class="risk-detail">${escapeHtml(item.verdict ?? 'no verdict')} · ${escapeHtml(item.path)}</div>
+          </div>`).join('') : '<div class="ib-v">No evidence artifacts.</div>'}</div>`;
+        return;
+      }
+      if (!selectedMod) {
+        inspBody.innerHTML = '<div class="ib ib-full" style="color:var(--text-dim)">← Click a module node to inspect details</div>';
+        return;
+      }
       const k = selectedMod;
       const m = arch[k] || {};
       const impData = impact[k] || {};
@@ -813,6 +1031,7 @@
           <div class="ib"><div class="ib-k">Module</div><div class="ib-v">${k}</div></div>
           <div class="ib"><div class="ib-k">Owner</div><div class="ib-v" style="color:${ownerColor(m.owner)}">@${m.owner||'—'}</div></div>
           <div class="ib"><div class="ib-k">Source</div><div class="ib-v"><span class="mod-src-tag ${m.source==='discovered'?'mod-src-discovered':'mod-src-declared'}">${m.source||'declared'}</span></div></div>
+          <div class="ib"><div class="ib-k">Observation</div><div class="ib-v obs-${m.observation?.classification||'observed'}">${m.observation?.classification||'observed'} · ${Math.round((m.observation?.confidence??1)*100)}%</div></div>
           <div class="ib"><div class="ib-k">Kind</div><div class="ib-v">${m.kind||'bounded-context'}</div></div>
           ${m.source==='discovered' ? `<div class="ib"><div class="ib-k">Confidence</div><div class="ib-v">${Math.round((m.confidence||0)*100)}%${m.framework?` (${m.framework})`:''}</div></div>` : ''}
           ${m.parent ? `<div class="ib"><div class="ib-k">Parent context</div><div class="ib-v">${m.parent}</div></div>` : ''}
@@ -930,6 +1149,8 @@
 
     // ── FULL RENDER ───────────────────────────────────────────
     function renderAll() {
+      renderProject();
+      renderContracts();
       refreshFilterOptions();
       renderModTree();
       renderStats();
@@ -939,6 +1160,7 @@
       renderRuntime();
       renderReplay();
       renderCanvas();
+      renderInspector();
       updateTimecode();
     }
 

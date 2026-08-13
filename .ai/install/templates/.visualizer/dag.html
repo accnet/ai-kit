@@ -218,7 +218,40 @@
   const banner = el('banner');
 
   // ── Data loading ──────────────────────────────────────────────
+  function canonicalDagToPresentation(data) {
+    const names = Object.fromEntries((data.tasks || []).map(task => [task.id, task['task_id'] || task.id.split(':').at(-1)]));
+    return {
+      tasks: (data.tasks || []).map(task => ({
+        ...task,
+        id: names[task.id],
+        needs: (task.needs || []).map(ref => names[ref]).filter(Boolean),
+        contract_refs: (task.contract_refs || []).map(({contract_ref, ...ref}) => ref),
+      })),
+      edges: (data.edges || []).map(edge => ({
+        from: names[edge.from], to: names[edge.to], unlocked: edge.unlocked,
+      })).filter(edge => edge.from && edge.to),
+      waves: data.waves || 0,
+      ready: (data.ready || []).map(ref => names[ref]).filter(Boolean),
+      critical_path: (data.critical_path || []).map(ref => names[ref]).filter(Boolean),
+    };
+  }
+
   async function fetchDag() {
+    try {
+      const manifestRes = await fetch('/artifacts/project/manifest.json', { cache: 'no-store' });
+      if (!manifestRes.ok) throw new Error('manifest http ' + manifestRes.status);
+      const manifest = await manifestRes.json();
+      const artifactRes = await fetch('/artifacts/project/dag.json', { cache: 'no-store' });
+      if (!artifactRes.ok) throw new Error('artifact http ' + artifactRes.status);
+      const artifact = await artifactRes.json();
+      if (manifest.schema_version !== 1 || artifact.schema_version !== 1 || artifact.generation_id !== manifest.generation_id) {
+        throw new Error('mixed artifact generation');
+      }
+      banner.classList.remove('show');
+      return canonicalDagToPresentation(artifact.data);
+    } catch (canonicalError) {
+      // Compatibility mirror for direct file:// use and older installations.
+    }
     try {
       const res = await fetch('dag.json', { cache: 'no-store' });
       if (!res.ok) throw new Error('http ' + res.status);
@@ -226,7 +259,7 @@
       banner.classList.remove('show');
       return data;
     } catch (err) {
-      banner.textContent = 'Không fetch được dag.json (mở qua file:// hoặc chưa có ai-kit state) — đang hiển thị snapshot rỗng. Chạy: cd .visualizer && python3 -m http.server 8080';
+      banner.textContent = 'Không đọc được canonical artifact hoặc legacy dag.json — đang hiển thị snapshot rỗng. Chạy: ai-kit visualizer serve';
       banner.classList.add('show');
       return EMBEDDED_SNAPSHOT;
     }
