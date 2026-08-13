@@ -5189,6 +5189,22 @@ def _run_captured(command: object, *, cwd: Path | str | None = None,
     stdout_path = tempfile.TemporaryFile(mode="w+b")
     stderr_path = tempfile.TemporaryFile(mode="w+b")
     try:
+        if shell:
+            try:
+                completed = subprocess.run(
+                    command, shell=True, cwd=str(cwd) if cwd is not None else None,
+                    stdout=stdout_path, stderr=stderr_path, check=False,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess(command, -9, "", "command timed out")
+            stdout_path.seek(0)
+            stderr_path.seek(0)
+            return subprocess.CompletedProcess(
+                command, completed.returncode,
+                stdout_path.read().decode("utf-8", errors="replace"),
+                stderr_path.read().decode("utf-8", errors="replace"),
+            )
         process = subprocess.Popen(
             command, shell=shell, cwd=str(cwd) if cwd is not None else None,
             stdout=stdout_path, stderr=stderr_path,
