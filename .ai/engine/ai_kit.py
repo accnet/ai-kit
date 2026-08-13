@@ -13,6 +13,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,12 @@ STATE = WORK / "state" / "workflow.json"
 CURRENT = WORK / "state" / "current.json"
 EVENT_LOG = WORK / "logs" / "events.jsonl"
 VISUALIZER_DIR = ROOT / ".visualizer"
+# Source discovery and payload construction walk the project tree.  Serialize
+# in-process refreshes so concurrent callers do not make two expensive scans
+# compete for the Windows runner's GIL/thread startup and then contend on the
+# publication lock.  Cross-process callers remain protected by the lockfile
+# in ``_publish_artifacts``.
+_ARTIFACT_GENERATION_MUTEX = threading.Lock()
 # Per-artifact schema version for the generated .visualizer/*.json payloads.
 # Bump an individual entry when that artifact's shape changes in a way a
 # consumer must know about (added/removed/retyped top-level field); the
@@ -2810,7 +2817,7 @@ def _publish_artifacts(state_file: Path, payloads: dict[str, dict], manifest: di
             pass
 
 
-def _generate_project_artifacts(state_arg: str | Path | None = None, *, refresh: bool = False) -> dict:
+def _generate_project_artifacts_unlocked(state_arg: str | Path | None = None, *, refresh: bool = False) -> dict:
     state_file = state_path(str(state_arg) if state_arg is not None else None)
     state = _artifact_state(state_file)
     fingerprint, _inputs = _artifact_source_fingerprint(state_file)
@@ -2828,6 +2835,12 @@ def _generate_project_artifacts(state_arg: str | Path | None = None, *, refresh:
     _publish_artifacts(state_file, payloads, manifest)
     legacy = _write_legacy_visualizer_projection(payloads, discovery)
     return {"status": "refreshed", "root": display_path(_artifact_root(state_file)), "manifest": manifest, "payloads": payloads, "legacy": legacy}
+
+
+def _generate_project_artifacts(state_arg: str | Path | None = None, *, refresh: bool = False) -> dict:
+    """Generate one coherent artifact bundle per in-process caller."""
+    with _ARTIFACT_GENERATION_MUTEX:
+        return _generate_project_artifacts_unlocked(state_arg, refresh=refresh)
 
 
 def cmd_artifact_generate(args: argparse.Namespace) -> dict:
