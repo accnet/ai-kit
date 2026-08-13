@@ -5190,6 +5190,13 @@ def _run_captured(command: object, *, cwd: Path | str | None = None,
     stderr_path = tempfile.TemporaryFile(mode="w+b")
     try:
         if shell:
+            # Avoid starting a platform shell for the portable sentinel
+            # commands commonly used in verification fixtures.
+            sentinel = str(command).strip().lower()
+            if sentinel in {"true", "exit 0"}:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if sentinel in {"false", "exit 1"}:
+                return subprocess.CompletedProcess(command, 1, "", "")
             try:
                 completed = subprocess.run(
                     command, shell=True, cwd=str(cwd) if cwd is not None else None,
