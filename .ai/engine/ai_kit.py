@@ -1946,23 +1946,20 @@ def _artifact_source_fingerprint(state_file: Path) -> tuple[str, dict]:
 
 
 def _git_artifact() -> dict:
-    def capture(*args: str) -> tuple[int, str]:
-        try:
-            run = subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, check=False)
-        except OSError:
-            return 127, ""
-        return run.returncode, run.stdout.strip()
-
-    inside_code, inside = capture("rev-parse", "--is-inside-work-tree")
-    if inside_code != 0 or inside != "true":
+    # Reuse the bounded, file-backed Git capture path.  Artifact generation
+    # runs in the same process as the test suite on Windows, where
+    # ``subprocess.run(..., capture_output=True)`` can allocate reader threads
+    # that contend with concurrent test/process teardown.
+    inside = _git_capture("rev-parse", "--is-inside-work-tree")
+    if inside is None or inside.strip() != "true":
         return {
             "repository": False, "head": None, "branch": None,
             "integration_branch": _delivery_config().get("integration_branch"),
             "dirty": False, "tracked_changes": [], "untracked_paths": [], "conflicts": [],
         }
-    _code, head = capture("rev-parse", "HEAD")
-    branch_code, branch = capture("symbolic-ref", "--quiet", "--short", "HEAD")
-    _status_code, status = capture("status", "--porcelain=v1", "--untracked-files=all")
+    head = _git_capture("rev-parse", "HEAD") or ""
+    branch = _git_capture("symbolic-ref", "--quiet", "--short", "HEAD")
+    status = _git_capture("status", "--porcelain=v1", "--untracked-files=all") or ""
     tracked, untracked, conflicts = [], [], []
     for line in status.splitlines():
         if len(line) < 4:
@@ -1977,7 +1974,7 @@ def _git_artifact() -> dict:
     return {
         "repository": True,
         "head": head or None,
-        "branch": branch if branch_code == 0 else None,
+        "branch": branch or None,
         "integration_branch": _delivery_config().get("integration_branch"),
         "dirty": bool(status),
         "tracked_changes": sorted(set(tracked)),
