@@ -5148,8 +5148,9 @@ def _git_capture(*args: str) -> str | None:
     cache_key = str(ROOT.resolve())
     if cache_head and cache_key in _GIT_CAPTURE_HEAD_CACHE:
         return _GIT_CAPTURE_HEAD_CACHE[cache_key]
-    if cache_head and not (ROOT / ".git").exists():
-        _GIT_CAPTURE_HEAD_CACHE[cache_key] = None
+    if not (ROOT / ".git").exists():
+        if cache_head:
+            _GIT_CAPTURE_HEAD_CACHE[cache_key] = None
         return None
     try:
         # File-backed stdout avoids the reader threads that CPython's Windows
