@@ -450,6 +450,23 @@ class GovernedControlPlaneTests(EngineTestCase):
         with mock.patch("subprocess.run", side_effect=AssertionError("git must not run")):
             self.assertIsNone(ai_kit._git_head())
 
+    def test_git_head_is_cached_for_the_current_repository(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        original_root = ai_kit.ROOT
+        ai_kit.ROOT = repo
+        try:
+            with mock.patch(
+                "subprocess.run",
+                return_value=subprocess.CompletedProcess(["git"], 0, stdout="abc123\n", stderr=""),
+            ) as run:
+                self.assertEqual(ai_kit._git_head(), "abc123")
+                self.assertEqual(ai_kit._git_head(), "abc123")
+                run.assert_called_once()
+        finally:
+            ai_kit.ROOT = original_root
+
 
 class ShowTaskDetailTests(EngineTestCase):
     """`ai-kit show <id>` is the CLI's advertised way to debug a stuck

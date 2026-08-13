@@ -68,6 +68,7 @@ ARTIFACT_PAYLOAD_FILES = (
 ARTIFACT_NAMES = {Path(name).stem: name for name in ARTIFACT_PAYLOAD_FILES}
 OBSERVATION_CLASSIFICATIONS = {"observed", "inferred", "proposed"}
 AUTO_ARTIFACT_GENERATION = True
+_GIT_HEAD_CACHE: dict[str, str | None] = {}
 # .ai-work/tasks/<id>.json: the self-contained "task contract" snapshot
 # written alongside tasks.md by add-task/plan (see state-schema.md's Task
 # contract files section). Bump only when its top-level shape changes.
@@ -753,16 +754,26 @@ def _render_runner_command(template: str, prompt: str, model: str | None) -> str
 def _git_head() -> str | None:
     """Return the repo's current HEAD commit hash, or None outside git / before the first commit."""
     import subprocess as _sp
+    # A CLI invocation operates on one repository snapshot. Cache the lookup
+    # so workflows that create many tasks do not repeatedly spawn Git (which
+    # is especially expensive and prone to pipe-reader contention on Windows).
+    cache_key = str(ROOT.resolve())
+    if cache_key in _GIT_HEAD_CACHE:
+        return _GIT_HEAD_CACHE[cache_key]
     # Avoid spawning Git for the common temporary/non-repository case. Besides
     # being cheaper, this matters on Windows where a captured subprocess can
     # allocate reader threads even though Git has no repository to inspect.
     # Worktrees use a `.git` file, so checking existence covers both layouts.
     if not (ROOT / ".git").exists():
+        _GIT_HEAD_CACHE[cache_key] = None
         return None
     try:
         result = _sp.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
-        return result.stdout.strip() if result.returncode == 0 else None
+        value = result.stdout.strip() if result.returncode == 0 else None
+        _GIT_HEAD_CACHE[cache_key] = value
+        return value
     except Exception:
+        _GIT_HEAD_CACHE[cache_key] = None
         return None
 
 
