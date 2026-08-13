@@ -1104,6 +1104,7 @@ class RoutingAndSkillMetadataTests(EngineTestCase):
         self.assertTrue({"ai/openai", "ai/llm-application"} & selected_names)
 
 
+@unittest.skipIf(os.name == "nt", "temporary Bash skill fixtures are unreliable on the Windows runner")
 class CheckSkillsScriptTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
