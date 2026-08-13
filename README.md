@@ -128,7 +128,7 @@ external dependencies (no PyYAML required).
 Copy this repository's `.ai/` directory into the target project root (so the
 project ends up with a top-level `.ai/` folder), then run the installer from
 inside that project. It materializes root-level adapter files (`AGENTS.md`,
-`CLAUDE.md`, `.cursor/`, `.windsurf/`, etc.) from `.ai/install/templates/` and
+`CLAUDE.md`, `.cursor/`, etc.) from `.ai/install/templates/` and
 seeds `.ai-config/` from `.ai/install/config/`, without touching the kit's
 `.ai-work` session state:
 
