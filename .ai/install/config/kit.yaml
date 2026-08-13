@@ -1,6 +1,6 @@
 kit:
   id: ai-kit-v2
-  version: 2.0.0
+  version: 2.1.0
   entrypoint: AGENTS.md
   work_dir: .ai-work
   skills_dir: .ai/skills

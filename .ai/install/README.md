@@ -16,3 +16,7 @@ as `AGENTS.md`, `CLAUDE.md`, `ANTIGRAVITY.md`, Cursor/Copilot/Claude support,
 and the Git hook from templates under `.ai/install/templates/`. Use
 `--target <project-root>` when the project is elsewhere, `--dry-run` to preview
 copies, and `--force` to replace conflicting managed files.
+
+The installer adds `.ai-work/` to the target `.gitignore`. This entire tree is
+disposable control-plane state (tasks, handoffs, evidence, logs, projections,
+and locks) and must never be committed.

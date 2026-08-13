@@ -24,7 +24,7 @@ TEMPLATE_VISUALIZER = REPO_ROOT / ".ai" / "install" / "templates" / ".visualizer
 PROJECT_OWNED_CONFIGS = ("contexts.yaml", "epics.yaml")
 EXPECTED_CONFIGS = {
     "automation.yaml", "contexts.yaml", "epics.yaml", "kit.yaml",
-    "registry.yaml", "rules.yaml", "runners.yaml",
+    "registry.yaml", "rules.yaml", "runners.yaml", "design-policy.json", "contracts.json", "delivery.json",
 }
 
 class InstallConfigTests(unittest.TestCase):
@@ -32,7 +32,7 @@ class InstallConfigTests(unittest.TestCase):
         self.assertFalse((REPO_ROOT / ".ai-config").exists())
 
     def test_templates_are_the_complete_canonical_seed_set(self) -> None:
-        self.assertEqual({p.name for p in TEMPLATE_CONFIG.glob("*.yaml")}, EXPECTED_CONFIGS)
+        self.assertEqual({p.name for p in TEMPLATE_CONFIG.iterdir() if p.is_file()}, EXPECTED_CONFIGS)
 
     def test_installer_materializes_project_config_from_templates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -44,7 +44,7 @@ class InstallConfigTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             installed = project / ".ai-config"
-            self.assertEqual({p.name for p in installed.glob("*.yaml")}, EXPECTED_CONFIGS)
+            self.assertEqual({p.name for p in installed.iterdir() if p.is_file()}, EXPECTED_CONFIGS)
             for name in EXPECTED_CONFIGS:
                 self.assertEqual((installed / name).read_bytes(), (TEMPLATE_CONFIG / name).read_bytes())
             source_files = {
@@ -58,6 +58,34 @@ class InstallConfigTests(unittest.TestCase):
                 if path.is_file() and "__pycache__" not in path.parts
             }
             self.assertEqual(installed_files, source_files)
+            self.assertFalse((project / ".ai-work").exists(), "installer must copy templates only")
+            ignore = (project / ".gitignore").read_text(encoding="utf-8")
+            self.assertIn(".ai-work/", ignore)
+            self.assertIn(".visualizer/*.json", ignore)
+
+    def test_bootstrap_creates_initial_exact_artifact_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            installed = subprocess.run(
+                ["bash", str(REPO_ROOT / ".ai" / "install" / "install.sh"), "--target", str(project)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            self.assertFalse((project / ".ai-work").exists())
+
+            bootstrapped = subprocess.run(
+                ["bash", ".ai/scripts/bootstrap.sh"], cwd=project, capture_output=True, text=True,
+            )
+            self.assertEqual(bootstrapped.returncode, 0, bootstrapped.stderr)
+            artifact_root = project / ".ai-work" / "artifacts" / "project"
+            expected = {"manifest.json", *ai_kit.ARTIFACT_PAYLOAD_FILES}
+            self.assertEqual({path.name for path in artifact_root.iterdir() if path.is_file()}, expected)
+            validated = subprocess.run(
+                [sys.executable, ".ai/engine/ai_kit.py", "artifact", "validate"],
+                cwd=project, capture_output=True, text=True,
+            )
+            self.assertEqual(validated.returncode, 0, validated.stderr)
 
     def test_automation_seed_has_manual_roles_with_valid_runner_models(self) -> None:
         """A fresh install must not dispatch QA/review until enabled, and its
@@ -65,7 +93,10 @@ class InstallConfigTests(unittest.TestCase):
         roles = ai_kit._load_automation_roles()
         self.assertFalse(roles["qa"]["enabled"])
         self.assertFalse(roles["reviewer"]["enabled"])
-        self.assertTrue(ai_kit._load_post_completion_config()["enabled"])
+        self.assertFalse(
+            ai_kit._load_post_completion_config()["enabled"],
+            "fresh installs must not auto-run QA/review/retry while both roles are manual",
+        )
         for role in ("qa", "reviewer"):
             config = roles[role]
             for runner_key, model_key in (("runner", "model"), ("backup_runner", "backup_model")):

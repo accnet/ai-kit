@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-08-14
+
 ### Added
 
 - Structured runner registry: `.ai/runners.json` is replaced by

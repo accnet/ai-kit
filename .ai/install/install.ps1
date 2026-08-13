@@ -63,22 +63,13 @@ foreach ($entry in $entries) {
 }
 
 if (-not $DryRun) {
-    $visualizerPath = Join-Path $targetPath '.visualizer'
-    if (Test-Path -LiteralPath $visualizerPath -PathType Container) {
-        try {
-            & python3 (Join-Path $targetPath '.ai/engine/ai_kit.py') visualizer generate
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning 'Unable to generate initial visualizer data'
-            }
-        }
-        catch {
-            Write-Warning "Unable to generate initial visualizer data: $($_.Exception.Message)"
-        }
-    }
     $ignore = Join-Path $targetPath '.gitignore'
     $marker = '# AI-Kit runtime state'
     if (-not (Test-Path -LiteralPath $ignore) -or -not (Select-String -LiteralPath $ignore -SimpleMatch $marker -Quiet)) {
-        Add-Content -LiteralPath $ignore -Value "`n$marker`n.ai-work/state/`n.ai-work/logs/`n.ai-work/snapshots/`n.ai-work/**/*.lock`n.ai-work/**/*.tmp"
+        Add-Content -LiteralPath $ignore -Value "`n$marker"
+    }
+    if (-not (Select-String -LiteralPath $ignore -Pattern '^\.ai-work/$' -Quiet)) {
+        Add-Content -LiteralPath $ignore -Value '.ai-work/'
     }
     if (-not (Select-String -LiteralPath $ignore -SimpleMatch '.visualizer/*.json' -Quiet)) {
         Add-Content -LiteralPath $ignore -Value '.visualizer/*.json'

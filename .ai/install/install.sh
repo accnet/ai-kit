@@ -29,7 +29,7 @@ CONFIG_TEMPLATE_ROOT="$AI_ROOT/install/config"
 PROJECT_ROOT="$(cd "$AI_ROOT/.." && pwd)"
 SOURCES=()
 DESTINATIONS=()
-CONFIG_FILES=(runners.yaml automation.yaml registry.yaml contexts.yaml epics.yaml rules.yaml kit.yaml)
+CONFIG_FILES=(runners.yaml automation.yaml registry.yaml contexts.yaml epics.yaml rules.yaml kit.yaml design-policy.json contracts.json delivery.json)
 
 add_entry() {
   SOURCES+=("$1")
@@ -95,15 +95,13 @@ for index in "${!SOURCES[@]}"; do
 done
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
-  if [[ -d "$TARGET/.visualizer" ]]; then
-    if ! python3 "$TARGET/.ai/engine/ai_kit.py" visualizer generate; then
-      echo "WARNING: unable to generate initial visualizer data" >&2
-    fi
-  fi
   ignore="$TARGET/.gitignore"
   marker="# AI-Kit runtime state"
   if ! [[ -f "$ignore" ]] || ! grep -qF "$marker" "$ignore"; then
-    printf '\n%s\n.ai-work/state/\n.ai-work/logs/\n.ai-work/snapshots/\n.ai-work/**/*.lock\n.ai-work/**/*.tmp\n' "$marker" >> "$ignore"
+    printf '\n%s\n' "$marker" >> "$ignore"
+  fi
+  if ! grep -qxF '.ai-work/' "$ignore"; then
+    printf '.ai-work/\n' >> "$ignore"
   fi
   if ! grep -qF '.visualizer/*.json' "$ignore"; then
     printf '.visualizer/*.json\n' >> "$ignore"
