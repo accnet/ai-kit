@@ -5183,6 +5183,34 @@ def _git_capture(*args: str) -> str | None:
     return value
 
 
+def _run_captured(command: object, *, cwd: Path | str | None = None,
+                  shell: bool = False, timeout: float = 30) -> subprocess.CompletedProcess:
+    """Run a configured command without Windows PIPE reader threads."""
+    stdout_path = tempfile.TemporaryFile(mode="w+b")
+    stderr_path = tempfile.TemporaryFile(mode="w+b")
+    try:
+        process = subprocess.Popen(
+            command, shell=shell, cwd=str(cwd) if cwd is not None else None,
+            stdout=stdout_path, stderr=stderr_path,
+        )
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            if time.monotonic() >= deadline:
+                process.kill()
+                return subprocess.CompletedProcess(command, -9, "", "command timed out")
+            time.sleep(0.01)
+        stdout_path.seek(0)
+        stderr_path.seek(0)
+        return subprocess.CompletedProcess(
+            command, process.returncode,
+            stdout_path.read().decode("utf-8", errors="replace"),
+            stderr_path.read().decode("utf-8", errors="replace"),
+        )
+    finally:
+        stdout_path.close()
+        stderr_path.close()
+
+
 def _project_context_fingerprint() -> tuple[str, dict]:
     """Fingerprint analyzer inputs using config/marker hashes and Git metadata.
 
@@ -6903,7 +6931,7 @@ def cmd_verify(args: argparse.Namespace) -> dict:
                 # not an argv list -- same G4 threat model as dispatch's
                 # runner command above: treat write access to kit.yaml as
                 # equivalent to arbitrary shell execution.
-                result = _sp.run(cmd, shell=True, cwd=str(run_root), capture_output=True, text=True)
+                result = _run_captured(cmd, shell=True, cwd=run_root)
                 check = {"name": key, "command": cmd, "exit_code": result.returncode, "status": "pass" if result.returncode == 0 else "fail"}
                 if result.returncode != 0:
                     check["stderr"] = result.stderr[-500:] if result.stderr else ""
@@ -6938,7 +6966,7 @@ def cmd_verify(args: argparse.Namespace) -> dict:
         gates = ROOT / ".ai" / "scripts" / "check-gates.sh"
     if gates.exists():
         print("  Running security gates (G4)...", file=sys.stderr)
-        result = _sp.run(["bash", str(gates), "all"], cwd=str(run_root), capture_output=True, text=True)
+        result = _run_captured(["bash", str(gates), "all"], cwd=run_root)
         check = {"name": "security-gates", "exit_code": result.returncode, "status": "pass" if result.returncode == 0 else "fail"}
         if result.returncode != 0:
             check["stderr"] = result.stderr[-500:] if result.stderr else ""
