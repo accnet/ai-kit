@@ -49,10 +49,12 @@ def ns(**kwargs) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
-def run_capture(command: object, *, cwd: Path | str | None = None) -> subprocess.CompletedProcess:
+def run_capture(command: object, *, cwd: Path | str | None = None,
+                env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Capture a child process without Windows PIPE reader threads."""
     with tempfile.TemporaryFile(mode="w+b") as stdout, tempfile.TemporaryFile(mode="w+b") as stderr:
         completed = subprocess.run(command, cwd=str(cwd) if cwd is not None else None,
+                                   env=env,
                                    stdout=stdout, stderr=stderr, check=False)
         stdout.seek(0); stderr.seek(0)
         return subprocess.CompletedProcess(
@@ -1423,6 +1425,7 @@ class VerifyExitCodeTests(unittest.TestCase):
             [sys.executable, str(self.root / ".ai" / "engine" / "ai_kit.py"),
              "--state", str(self.state), *args],
             cwd=self.root,
+            env={**os.environ, "AI_KIT_AUTO_ARTIFACT_GENERATION": "0"},
         )
 
     def _prepare(self, verification: str) -> None:

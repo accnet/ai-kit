@@ -68,7 +68,7 @@ ARTIFACT_PAYLOAD_FILES = (
 )
 ARTIFACT_NAMES = {Path(name).stem: name for name in ARTIFACT_PAYLOAD_FILES}
 OBSERVATION_CLASSIFICATIONS = {"observed", "inferred", "proposed"}
-AUTO_ARTIFACT_GENERATION = True
+AUTO_ARTIFACT_GENERATION = os.environ.get("AI_KIT_AUTO_ARTIFACT_GENERATION", "1").lower() not in {"0", "false", "no"}
 _GIT_HEAD_CACHE: dict[str, str | None] = {}
 _GIT_CAPTURE_HEAD_CACHE: dict[str, str | None] = {}
 # .ai-work/tasks/<id>.json: the self-contained "task contract" snapshot
