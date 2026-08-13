@@ -89,6 +89,9 @@
 
 ### Fixed
 
+- Windows CI now places Git Bash on `PATH`, and the shell-script test harness
+  normalizes temporary Windows paths before invoking Bash; the 2.1.0 release
+  gate no longer fails on platform-specific script path handling.
 - `dispatch`: the prompt sent to the runner hardcoded `.ai-work/tasks/tasks.md`
   and instructed the completion command with no `--state` flag, regardless of
   what `--state` the dispatch call itself used. A dispatch against a custom

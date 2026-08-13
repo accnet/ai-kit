@@ -24,6 +24,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Add Git Bash to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "${env:ProgramFiles}\Git\bin" >> $env:GITHUB_PATH
       - name: Engine tests
         run: python -m unittest discover -s tests -v
       - name: Validate kit contracts

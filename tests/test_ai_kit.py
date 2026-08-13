@@ -26,6 +26,19 @@ sys.path.insert(0, str(ENGINE_DIR))
 import ai_kit  # noqa: E402
 
 
+def bash_command(script: Path, *args: str) -> list[str]:
+    """Build a Git-Bash command that works with Windows drive paths too."""
+    executable = shutil.which("bash") or shutil.which("bash.exe")
+    if executable is None and os.name == "nt":
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        candidate = Path(program_files) / "Git" / "bin" / "bash.exe"
+        if candidate.exists():
+            executable = str(candidate)
+    executable = executable or "bash"
+    script_arg = script.as_posix() if os.name == "nt" else str(script)
+    return [executable, script_arg, *args]
+
+
 def ns(**kwargs) -> argparse.Namespace:
     """Build an argparse.Namespace with the fields ai_kit's cmd_* functions expect."""
     defaults = dict(
@@ -1091,10 +1104,8 @@ class CheckSkillsScriptTests(unittest.TestCase):
         (path / "skill.meta.yaml").write_text(meta, encoding="utf-8")
 
     def _run(self, mode: str | None = None) -> subprocess.CompletedProcess:
-        cmd = ["bash", str(self.script)]
-        if mode:
-            cmd.append(mode)
-        return subprocess.run(cmd, cwd=self.root, capture_output=True, text=True)
+        args = (mode,) if mode else ()
+        return subprocess.run(bash_command(self.script, *args), cwd=self.root, capture_output=True, text=True)
 
     def test_default_mode_is_all_and_detects_placeholder(self) -> None:
         self._mk_tech("database", "redis", placeholder=True)
@@ -1657,8 +1668,11 @@ class LocalScriptContractTests(unittest.TestCase):
         self.assertIn("ready", next_task, "next-task.sh should list ready work")
 
     def test_new_task_rejects_missing_arguments(self) -> None:
-        result = subprocess.run(["bash", str(self.SCRIPTS / "new-task.sh"), "T9"],
-                                capture_output=True, text=True)
+        result = subprocess.run(
+            bash_command(self.SCRIPTS / "new-task.sh", "T9"),
+            capture_output=True,
+            text=True,
+        )
         self.assertEqual(result.returncode, 2)
         self.assertIn("usage:", result.stderr)
 
