@@ -446,6 +446,10 @@ class GovernedControlPlaneTests(EngineTestCase):
         add_command = next(command for command in commands if "worktree" in command and "add" in command)
         self.assertEqual(add_command[-1], integration_head)
 
+    def test_git_head_skips_subprocess_outside_a_repository(self) -> None:
+        with mock.patch("subprocess.run", side_effect=AssertionError("git must not run")):
+            self.assertIsNone(ai_kit._git_head())
+
 
 class ShowTaskDetailTests(EngineTestCase):
     """`ai-kit show <id>` is the CLI's advertised way to debug a stuck

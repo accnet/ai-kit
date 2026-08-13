@@ -753,6 +753,12 @@ def _render_runner_command(template: str, prompt: str, model: str | None) -> str
 def _git_head() -> str | None:
     """Return the repo's current HEAD commit hash, or None outside git / before the first commit."""
     import subprocess as _sp
+    # Avoid spawning Git for the common temporary/non-repository case. Besides
+    # being cheaper, this matters on Windows where a captured subprocess can
+    # allocate reader threads even though Git has no repository to inspect.
+    # Worktrees use a `.git` file, so checking existence covers both layouts.
+    if not (ROOT / ".git").exists():
+        return None
     try:
         result = _sp.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
         return result.stdout.strip() if result.returncode == 0 else None
