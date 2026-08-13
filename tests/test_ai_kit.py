@@ -8,6 +8,8 @@ nothing here ever touches this repository's real .ai-work/, .ai-config/, or
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -1421,12 +1423,31 @@ class VerifyExitCodeTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _run(self, *args: str) -> subprocess.CompletedProcess:
-        return run_capture(
-            [sys.executable, str(self.root / ".ai" / "engine" / "ai_kit.py"),
-             "--state", str(self.state), *args],
-            cwd=self.root,
-            env={**os.environ, "AI_KIT_AUTO_ARTIFACT_GENERATION": "0"},
-        )
+        saved = {
+            name: getattr(ai_kit, name)
+            for name in ("ROOT", "WORK", "STATE", "CURRENT", "EVENT_LOG", "VISUALIZER_DIR", "AUTO_ARTIFACT_GENERATION")
+        }
+        argv = [str(self.root / ".ai" / "engine" / "ai_kit.py"), "--state", str(self.state), *args]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        try:
+            ai_kit.ROOT = self.root
+            ai_kit.WORK = self.root / "work"
+            ai_kit.STATE = self.state
+            ai_kit.CURRENT = self.root / "work" / "state" / "current.json"
+            ai_kit.EVENT_LOG = self.root / "work" / "logs" / "events.jsonl"
+            ai_kit.VISUALIZER_DIR = self.root / ".visualizer"
+            ai_kit.AUTO_ARTIFACT_GENERATION = False
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                old_argv = sys.argv
+                sys.argv = argv
+                try:
+                    returncode = ai_kit.main()
+                finally:
+                    sys.argv = old_argv
+        finally:
+            for name, value in saved.items():
+                setattr(ai_kit, name, value)
+        return subprocess.CompletedProcess(argv, returncode, stdout.getvalue(), stderr.getvalue())
 
     def _prepare(self, verification: str) -> None:
         (self.root / ".ai-config" / "kit.yaml").write_text(
