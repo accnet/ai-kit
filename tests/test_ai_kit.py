@@ -49,6 +49,19 @@ def ns(**kwargs) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
+def run_capture(command: object, *, cwd: Path | str | None = None) -> subprocess.CompletedProcess:
+    """Capture a child process without Windows PIPE reader threads."""
+    with tempfile.TemporaryFile(mode="w+b") as stdout, tempfile.TemporaryFile(mode="w+b") as stderr:
+        completed = subprocess.run(command, cwd=str(cwd) if cwd is not None else None,
+                                   stdout=stdout, stderr=stderr, check=False)
+        stdout.seek(0); stderr.seek(0)
+        return subprocess.CompletedProcess(
+            command, completed.returncode,
+            stdout.read().decode("utf-8", errors="replace"),
+            stderr.read().decode("utf-8", errors="replace"),
+        )
+
+
 class EngineTestCase(unittest.TestCase):
     """Base case: builds an isolated temp ROOT with the minimal skeleton
     validate()/role_names()/workflow_names() need, and points every
@@ -1162,7 +1175,7 @@ class CheckSkillsScriptTests(unittest.TestCase):
 
     def _run(self, mode: str | None = None) -> subprocess.CompletedProcess:
         args = (mode,) if mode else ()
-        return subprocess.run(bash_command(self.script, *args), cwd=self.root, capture_output=True, text=True)
+        return run_capture(bash_command(self.script, *args), cwd=self.root)
 
     def test_default_mode_is_all_and_detects_placeholder(self) -> None:
         self._mk_tech("database", "redis", placeholder=True)
@@ -1406,10 +1419,10 @@ class VerifyExitCodeTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _run(self, *args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
+        return run_capture(
             [sys.executable, str(self.root / ".ai" / "engine" / "ai_kit.py"),
              "--state", str(self.state), *args],
-            capture_output=True, text=True, cwd=str(self.root),
+            cwd=self.root,
         )
 
     def _prepare(self, verification: str) -> None:
@@ -1725,10 +1738,8 @@ class LocalScriptContractTests(unittest.TestCase):
         self.assertIn("ready", next_task, "next-task.sh should list ready work")
 
     def test_new_task_rejects_missing_arguments(self) -> None:
-        result = subprocess.run(
+        result = run_capture(
             bash_command(self.SCRIPTS / "new-task.sh", "T9"),
-            capture_output=True,
-            text=True,
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("usage:", result.stderr)
