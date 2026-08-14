@@ -15,3 +15,8 @@ verification:
   typecheck_command: true
   build_command: true
   lint_command: true
+
+dispatch:
+  # Repository-local by default so sandboxed Windows sessions can create it.
+  # Override with AI_KIT_WORKTREE_ROOT or dispatch --worktree-root PATH.
+  worktree_root: .ai-work/worktrees

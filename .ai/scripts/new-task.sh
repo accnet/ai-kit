@@ -26,7 +26,8 @@ USAGE
 fi
 
 ID="$1"; TITLE="$2"; OWNER="$3"; PHASE="$4"; ACCEPTANCE="$5"; shift 5
-PYTHON_CMD=${PYTHON_CMD:-$(command -v python3 || command -v python)}
+source .ai/scripts/python-command.sh
+PYTHON_CMD="$(ai_kit_python_command)" || { echo "AI-Kit: Python runtime not found" >&2; exit 127; }
 
 args=(add-task "$ID" --title "$TITLE" --owner "$OWNER" --phase "$PHASE" --acceptance "$ACCEPTANCE")
 [[ $# -gt 0 ]] && args+=(--needs "$@")

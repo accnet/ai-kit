@@ -10,6 +10,7 @@ import os
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -790,7 +791,16 @@ def _safe_git_component(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-") or "task"
 
 
-def _ensure_task_worktree(state: dict, task: dict, runner_name: str, model: str | None, agent_id: str, state_file: Path) -> dict:
+def _ensure_task_worktree(
+    state: dict,
+    task: dict,
+    runner_name: str,
+    model: str | None,
+    agent_id: str,
+    state_file: Path,
+    worktree_root: str | None = None,
+    no_worktree: bool = False,
+) -> dict:
     """Create or reuse the task's isolated branch/worktree assignment."""
     import subprocess as _sp
     existing = task.get("assignment") or {}
@@ -813,20 +823,28 @@ def _ensure_task_worktree(state: dict, task: dict, runner_name: str, model: str 
     # became done after the plan was created. Retries returned above keep the
     # original assignment base and worktree unchanged.
     base_commit = _git_head() or task.get("base_commit")
-    if not base_commit:
+    if no_worktree:
+        worktree = ROOT
+        branch = None
+        isolation = "shared-workspace"
+    elif not base_commit:
         # Non-git fixtures and unborn repositories still receive an auditable
         # assignment, but cannot provide filesystem isolation.
         worktree = ROOT
         branch = None
+        isolation = "unavailable"
     else:
         probe = _sp.run(["git", "-C", str(ROOT), "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True)
         if probe.returncode != 0:
             worktree, branch = ROOT, None
+            isolation = "unavailable"
         else:
             workflow_short = _safe_git_component(str(state.get("workflow_id") or "workflow")[:8])
             task_component = _safe_git_component(task["id"])
             branch = f"agent/{workflow_short}/{task_component}"
-            worktree = (ROOT.parent / f".{ROOT.name}-ai-worktrees" / workflow_short / task_component).resolve()
+            worktree = (_dispatch_worktree_root(worktree_root) / workflow_short / task_component).resolve()
+            if worktree == ROOT.resolve():
+                raise EngineError("dispatch worktree_root must not resolve to the repository root")
             worktree.parent.mkdir(parents=True, exist_ok=True)
             branch_probe = _sp.run(["git", "-C", str(ROOT), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"])
             command = ["git", "-C", str(ROOT), "worktree", "add"]
@@ -837,6 +855,7 @@ def _ensure_task_worktree(state: dict, task: dict, runner_name: str, model: str 
             result = _sp.run(command, capture_output=True, text=True)
             if result.returncode != 0:
                 raise EngineError(f"failed to create task worktree {worktree}: {(result.stderr or result.stdout).strip()}")
+            isolation = "linked-worktree"
     assignment = {
         "runner": runner_name,
         "model": model,
@@ -844,6 +863,7 @@ def _ensure_task_worktree(state: dict, task: dict, runner_name: str, model: str 
         "capabilities": _entry_list(_load_runners().get(runner_name, {}), "capabilities"),
         "branch": branch,
         "worktree": str(worktree.resolve()),
+        "isolation": isolation,
         "base_commit": base_commit,
         "assigned_at": now(),
         "state_path": str(state_file.resolve()),
@@ -1058,6 +1078,23 @@ def workspace(path: Path) -> Path:
     return path.parent.parent if path.parent.name == "state" else path.parent / path.stem
 
 
+def _portable_workspace_ref(state_file: Path, path: Path) -> str:
+    """Store workspace-owned paths without binding evidence to one machine."""
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(workspace(state_file).resolve()).as_posix()
+    except ValueError:
+        # External reviewer attachments may legitimately live outside the
+        # workflow workspace. Preserve those as absolute references.
+        return str(resolved)
+
+
+def _resolve_workspace_ref(state_file: Path, value: object) -> Path:
+    """Resolve both portable refs and legacy absolute evidence paths."""
+    path = Path(str(value or ""))
+    return path.resolve() if path.is_absolute() else (workspace(state_file) / path).resolve()
+
+
 def _dispatch_audit_path(state_file: Path, task_id: str, role: str | None = None) -> Path:
     """Canonical location for structured dispatch audit metadata.
 
@@ -1074,6 +1111,72 @@ def display_path(path: Path) -> str:
         return path.relative_to(ROOT).as_posix()
     except ValueError:
         return str(path)
+
+
+def _is_windows_runtime() -> bool:
+    return os.name == "nt" or sys.platform.startswith(("win32", "cygwin", "msys"))
+
+
+def _bash_executable() -> str:
+    """Select native Git Bash on Windows instead of an accidental WSL shim."""
+    override = str(os.environ.get("AI_KIT_BASH") or "").strip()
+    if override:
+        if not Path(override).exists() and not shutil.which(override):
+            raise EngineError(f"AI_KIT_BASH does not exist or is not executable: {override}")
+        return override
+    candidates: list[str] = []
+    if _is_windows_runtime():
+        for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            root = os.environ.get(variable)
+            if not root:
+                continue
+            suffix = Path("Programs/Git/bin/bash.exe") if variable == "LOCALAPPDATA" else Path("Git/bin/bash.exe")
+            candidates.append(str(Path(root) / suffix))
+        for name in ("bash.exe", "bash"):
+            resolved = shutil.which(name)
+            if resolved:
+                candidates.append(resolved)
+    else:
+        resolved = shutil.which("bash")
+        if resolved:
+            candidates.append(resolved)
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return candidate
+    raise EngineError("bash is required; install Git Bash on Windows or set AI_KIT_BASH")
+
+
+def _bash_argv(*args: str) -> list[str]:
+    executable = _bash_executable()
+    command = [executable]
+    normalized = executable.replace("\\", "/").lower()
+    if _is_windows_runtime() and "/git/" in normalized:
+        command.append("--login")
+    command.extend(args)
+    return command
+
+
+def _dispatch_worktree_root(explicit: str | None = None) -> Path:
+    value = explicit or os.environ.get("AI_KIT_WORKTREE_ROOT")
+    if not value:
+        path = _config_path("kit.yaml")
+        in_dispatch = False
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip() == "dispatch:" and not line.startswith((" ", "\t")):
+                    in_dispatch = True
+                    continue
+                if in_dispatch and line and not line.startswith((" ", "\t")):
+                    break
+                if in_dispatch:
+                    match = re.match(r"^\s+worktree_root:\s*(.+?)\s*$", line)
+                    if match:
+                        value = match.group(1).strip().strip('"\'')
+                        break
+    if not value:
+        value = ".ai-work/worktrees"
+    root = Path(value)
+    return (root if root.is_absolute() else ROOT / root).resolve()
 
 
 def role_names() -> set[str]:
@@ -2064,6 +2167,11 @@ def _evidence_artifact(state_file: Path, state: dict | None) -> dict:
             if kind == "qa" and task_id in task_by_id:
                 try:
                     current = _qa_evidence_is_current(state_file, task_by_id[task_id])[0]
+                except (EngineError, OSError):
+                    current = False
+            elif kind == "review" and task_id in task_by_id:
+                try:
+                    current = _review_recommendation_is_current(state_file, task_by_id[task_id], path)[0]
                 except (EngineError, OSError):
                     current = False
             records.append({
@@ -6342,7 +6450,13 @@ def cmd_dispatch(args: argparse.Namespace) -> dict:
         raise EngineError(f"cannot dispatch {task['id']} from status {task['status']} (must be todo or in-progress)")
     state = load(state_file); validate(state)
     live_task = task_map(state)[task["id"]]
-    assignment = _ensure_task_worktree(state, live_task, runner_name, selected_model, agent_id, state_file)
+    assignment = _ensure_task_worktree(
+        state, live_task, runner_name, selected_model, agent_id, state_file,
+        worktree_root=getattr(args, "worktree_root", None),
+        no_worktree=bool(getattr(args, "no_worktree", False)),
+    )
+    if assignment.get("isolation") == "shared-workspace":
+        print(f"WARNING: task {task['id']} is running without worktree isolation", file=sys.stderr)
     _persist_assignment(state_file, task["id"], assignment)
     task = _resolve_task_definition(task["id"], load(state_file), state_file)
     state_flag = f" --state {shlex.quote(str(state_file.resolve()))}"
@@ -6447,10 +6561,14 @@ def cmd_dispatch_ready(args: argparse.Namespace) -> dict:
     for entry in claimed:
         # --state is a root-parser option and must precede the "dispatch"
         # subcommand token, or argparse's subparser rejects it as unrecognized.
-        cmd = ["bash", str(ROOT / ".ai" / "scripts" / "ai-kit")]
+        cmd = [sys.executable, str(ROOT / ".ai" / "engine" / "ai_kit.py")]
         if args.state:
             cmd += ["--state", args.state]
         cmd += ["dispatch", entry["task"], "--runner", runner_name, "--agent-id", entry["agent_id"]]
+        if getattr(args, "worktree_root", None):
+            cmd += ["--worktree-root", args.worktree_root]
+        if getattr(args, "no_worktree", False):
+            cmd.append("--no-worktree")
         if selected_model is not None:
             cmd += ["--model", selected_model]
         # Redirect the child's stdout/stderr to its own log file instead of
@@ -6529,7 +6647,7 @@ def _evidence_fingerprint(task: dict, cwd: Path) -> dict:
             content.update(candidate.read_bytes())
         else:
             content.update(b"<deleted>")
-    return {
+    fingerprint = {
         "task_contract_hash": task.get("contract_hash"),
         "base_commit": (task.get("assignment") or {}).get("base_commit") or task.get("base_commit"),
         "changed_paths_hash": hashlib.sha256("\n".join(changed).encode("utf-8")).hexdigest(),
@@ -6537,6 +6655,14 @@ def _evidence_fingerprint(task: dict, cwd: Path) -> dict:
         "design_policy_hash": _design_policy_hash(_merged_design_policy()),
         "contract_snapshots": (task.get("governance_baseline") or {}).get("contract_snapshots", {}),
     }
+    # This is deliberately based on the verified final bytes, not HEAD. The
+    # same implementation remains current when those exact bytes are committed
+    # after QA, while any source, scope, policy, or contract drift invalidates
+    # the evidence chain.
+    fingerprint["source_fingerprint"] = hashlib.sha256(
+        json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return fingerprint
 
 
 def _activate_integration_contracts(task: dict, evidence: str) -> list[str]:
@@ -6594,9 +6720,11 @@ def cmd_qa_run(args: argparse.Namespace) -> dict:
     evidence = {
         "schema_version": 1, "kind": "qa", "task": task["id"], "status": status,
         "created_at": now(), "authority": "ai-kit-local", "worktree": str(cwd),
+        "evidence_id": f"evidence:qa:{task['id']}",
         "fingerprint": _evidence_fingerprint(task, cwd), "checks": checks,
         "functional": functional, "design": design, "contract": contract, "scope": scope,
     }
+    evidence["source_fingerprint"] = evidence["fingerprint"]["source_fingerprint"]
     evidence_path = _qa_evidence_path(state_file, task["id"])
     _atomic_write_json(evidence_path, evidence)
     evidence_ref = str(evidence_path.resolve())
@@ -6614,13 +6742,20 @@ def cmd_qa_run(args: argparse.Namespace) -> dict:
 
 
 def cmd_qa_show(args: argparse.Namespace) -> dict:
-    path = _qa_evidence_path(state_path(args.state), args.id)
+    state_file = state_path(args.state)
+    path = _qa_evidence_path(state_file, args.id)
     if not path.exists():
         raise EngineError(f"QA evidence not found for task {args.id}")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise EngineError(f"invalid QA evidence: {exc}") from exc
+    state = load(state_file); validate(state)
+    task = task_map(state).get(args.id)
+    if not task:
+        raise EngineError(f"unknown task: {args.id}")
+    current, detail = _qa_evidence_is_current(state_file, task)
+    return {**payload, "current": current, "current_detail": detail}
 
 
 def _review_evidence_path(state_file: Path, task_id: str) -> Path:
@@ -6633,8 +6768,13 @@ def cmd_review_submit(args: argparse.Namespace) -> dict:
     task = task_map(state).get(args.id)
     if not task:
         raise EngineError(f"unknown task: {args.id}")
-    if task["status"] != "qa-passed":
-        raise EngineError(f"review recommendation requires qa-passed, found {task['status']}")
+    if task["status"] not in {"qa-passed", "review-approved"}:
+        raise EngineError(f"review recommendation requires qa-passed or review-approved, found {task['status']}")
+    qa_current, qa_detail = _qa_evidence_is_current(state_file, task)
+    if not qa_current:
+        raise EngineError(qa_detail)
+    qa_path = Path(qa_detail)
+    qa_payload = json.loads(qa_path.read_text(encoding="utf-8"))
     source = Path(args.input).resolve()
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
@@ -6653,27 +6793,48 @@ def cmd_review_submit(args: argparse.Namespace) -> dict:
         candidates = [evidence_path] if evidence_path.is_absolute() else [cwd / evidence_path, ROOT / evidence_path]
         if not any(candidate.exists() for candidate in candidates):
             raise EngineError(f"review evidence path does not exist: {item}")
+    audit_only = task["status"] == "review-approved"
+    if audit_only and payload.get("runner") != "manual-waiver":
+        raise EngineError("post-approval review submission is audit-only and requires runner 'manual-waiver'")
     canonical = {
         "schema_version": 1, "kind": "review", "task": task["id"],
+        "evidence_id": f"evidence:review:{task['id']}",
         "decision": payload["decision"], "verdict": "approve" if payload["decision"] == "approve" else "changes-requested",
         "findings": payload.get("findings", []), "evidence": payload.get("evidence", []),
         "runner": payload["runner"], "model": payload["model"], "agent_id": payload["agent_id"],
+        "qa_evidence": _portable_workspace_ref(state_file, qa_path),
+        "qa_evidence_sha256": hashlib.sha256(qa_path.read_bytes()).hexdigest(),
+        "qa_fingerprint": qa_payload.get("fingerprint"),
+        "source_fingerprint": qa_payload.get("source_fingerprint") or (qa_payload.get("fingerprint") or {}).get("source_fingerprint"),
         "submitted_at": now(),
     }
-    path = _review_evidence_path(state_file, task["id"])
+    if audit_only:
+        canonical["audit_only"] = True
+        canonical["authority"] = "user-waiver-record"
+    path = (
+        workspace(state_file) / "evidence" / "review" / f"{task['id']}.waiver.json"
+        if audit_only else _review_evidence_path(state_file, task["id"])
+    )
     _atomic_write_json(path, canonical)
     _auto_generate_for_args(args)
-    return {"task": task["id"], "decision": canonical["decision"], "recommendation": str(path.resolve())}
+    return {"task": task["id"], "decision": canonical["decision"], "recommendation": str(path.resolve()), "audit_only": audit_only}
 
 
 def cmd_review_show(args: argparse.Namespace) -> dict:
-    path = _review_evidence_path(state_path(args.state), args.id)
+    state_file = state_path(args.state)
+    path = _review_evidence_path(state_file, args.id)
     if not path.exists():
         raise EngineError(f"review recommendation not found for task {args.id}")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise EngineError(f"invalid review recommendation: {exc}") from exc
+    state = load(state_file); validate(state)
+    task = task_map(state).get(args.id)
+    if not task:
+        raise EngineError(f"unknown task: {args.id}")
+    current, detail = _review_recommendation_is_current(state_file, task, path)
+    return {**payload, "current": current, "current_detail": detail}
 
 
 def _qa_evidence_is_current(state_file: Path, task: dict) -> tuple[bool, str]:
@@ -6690,6 +6851,38 @@ def _qa_evidence_is_current(state_file: Path, task: dict) -> tuple[bool, str]:
     current = _evidence_fingerprint(task, cwd)
     if payload.get("fingerprint") != current:
         return False, "QA evidence fingerprint is stale"
+    return True, str(path.resolve())
+
+
+def _review_recommendation_is_current(state_file: Path, task: dict, path: Path | None = None) -> tuple[bool, str]:
+    path = path or _review_evidence_path(state_file, task["id"])
+    if not path.exists():
+        return False, "review recommendation is missing"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False, "review recommendation is invalid JSON"
+    if payload.get("schema_version") != 1 or payload.get("task") != task["id"]:
+        return False, "review recommendation schema/task mismatch"
+    if payload.get("decision") not in {"approve", "changes-requested"}:
+        return False, "review recommendation decision is invalid"
+    qa_current, qa_detail = _qa_evidence_is_current(state_file, task)
+    if not qa_current:
+        return False, qa_detail
+    qa_path = Path(qa_detail)
+    try:
+        qa_payload = json.loads(qa_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False, "QA evidence is invalid JSON"
+    if _resolve_workspace_ref(state_file, payload.get("qa_evidence")) != qa_path.resolve():
+        return False, "review recommendation references different QA evidence"
+    if payload.get("qa_evidence_sha256") != hashlib.sha256(qa_path.read_bytes()).hexdigest():
+        return False, "review recommendation QA evidence hash is stale"
+    if payload.get("qa_fingerprint") != qa_payload.get("fingerprint"):
+        return False, "review recommendation QA fingerprint is stale"
+    source_fingerprint = qa_payload.get("source_fingerprint") or (qa_payload.get("fingerprint") or {}).get("source_fingerprint")
+    if payload.get("source_fingerprint") != source_fingerprint:
+        return False, "review recommendation source fingerprint is stale"
     return True, str(path.resolve())
 
 
@@ -6729,6 +6922,9 @@ def cmd_review_apply(args: argparse.Namespace) -> dict:
         raise EngineError(f"invalid review recommendation: {exc}") from exc
     if recommendation.get("schema_version") != 1 or recommendation.get("task") != task["id"]:
         raise EngineError("review recommendation schema/task mismatch")
+    review_current, review_detail = _review_recommendation_is_current(state_file, task, recommendation_path)
+    if not review_current:
+        raise EngineError(review_detail)
     assignment = task.get("assignment") or {}
     if recommendation.get("agent_id") == assignment.get("agent_id"):
         raise EngineError("reviewer agent_id must differ from executor")
@@ -6756,11 +6952,17 @@ def cmd_review_apply(args: argparse.Namespace) -> dict:
 
 
 def _delivery_config() -> dict:
-    config = _load_json_config("delivery.json", {"schema_version": 1, "integration_branch": "main", "push_required": False, "pre_integration_commands": []})
+    config = _load_json_config("delivery.json", {"schema_version": 1, "integration_branch": "main", "push_required": False, "pre_integration_commands": [], "local_ci": {"enabled": False, "command": "act", "required": False}})
     if config.get("schema_version") != 1 or not str(config.get("integration_branch") or "").strip():
         raise EngineError("delivery.json must use schema_version 1 and set integration_branch")
     if not isinstance(config.get("pre_integration_commands", []), list):
         raise EngineError("delivery pre_integration_commands must be an array")
+    local_ci = config.get("local_ci", {"enabled": False, "command": "act", "required": False})
+    if not isinstance(local_ci, dict) or not isinstance(local_ci.get("enabled", False), bool) or not isinstance(local_ci.get("required", False), bool):
+        raise EngineError("delivery local_ci must contain boolean enabled/required fields")
+    if local_ci.get("enabled") and not str(local_ci.get("command") or "").strip():
+        raise EngineError("delivery local_ci.command is required when enabled")
+    config["local_ci"] = local_ci
     return config
 
 
@@ -6822,8 +7024,9 @@ def _delivery_check(state_file: Path, task: dict, commit: str) -> dict:
     qa_current, qa_detail = _qa_evidence_is_current(state_file, task)
     checks.append({"name": "qa-current", "status": "pass" if qa_current else "fail", "detail": qa_detail})
     recommendation = _review_evidence_path(state_file, task["id"])
-    review_current = recommendation.exists() and str(recommendation.resolve()) in [str(Path(item).resolve()) for item in task.get("evidence", [])]
-    checks.append({"name": "review-current", "status": "pass" if review_current else "fail"})
+    review_current, review_detail = _review_recommendation_is_current(state_file, task, recommendation)
+    review_referenced = str(recommendation.resolve()) in [str(Path(item).resolve()) for item in task.get("evidence", [])]
+    checks.append({"name": "review-current", "status": "pass" if review_current and review_referenced else "fail", "detail": review_detail if review_referenced else "review recommendation is not attached to task lifecycle evidence"})
     design = _design_validation(state_file, task)
     checks.append({"name": "design-current", "status": "pass" if design.get("passed") else "fail"})
     contract = _contract_convergence(task, Path((task.get("assignment") or {}).get("worktree") or ROOT))
@@ -6838,6 +7041,17 @@ def _delivery_check(state_file: Path, task: dict, commit: str) -> dict:
     for index, command in enumerate(config.get("pre_integration_commands", []), 1):
         run = _sp.run(command, shell=True, cwd=str(ROOT), capture_output=True, text=True)
         checks.append({"name": f"pre-integration-{index}", "command": command, "status": "pass" if run.returncode == 0 else "fail", "exit_code": run.returncode, "stderr": run.stderr[-500:]})
+    local_ci = config["local_ci"]
+    if local_ci.get("enabled"):
+        command = str(local_ci["command"])
+        run = _run_captured(command, shell=True, cwd=ROOT, timeout=300)
+        required = bool(local_ci.get("required"))
+        checks.append({
+            "name": "local-ci-approximation", "command": command,
+            "authoritative": False, "required": required,
+            "status": "pass" if run.returncode == 0 else "fail" if required else "advisory",
+            "exit_code": run.returncode, "stderr": run.stderr[-500:],
+        })
     pushed = None
     upstream = _sp.run(["git", "-C", str(ROOT), "rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"], capture_output=True, text=True)
     if upstream.returncode == 0:
@@ -6846,7 +7060,17 @@ def _delivery_check(state_file: Path, task: dict, commit: str) -> dict:
     if config.get("push_required"):
         checks.append({"name": "push-required", "status": "pass" if pushed else "fail", "detail": upstream.stdout.strip() if upstream.returncode == 0 else "no upstream"})
     tree = _sp.run(["git", "-C", str(ROOT), "rev-parse", f"{commit}^{{tree}}"], capture_output=True, text=True)
-    return {"task": task["id"], "commit": commit, "tree": tree.stdout.strip(), "branch": branch, "passed": all(check["status"] == "pass" for check in checks), "checks": checks, "changed_paths": changed_paths, "pushed": pushed}
+    qa_path = _qa_evidence_path(state_file, task["id"])
+    return {
+        "task": task["id"], "commit": commit, "tree": tree.stdout.strip(),
+        "branch": branch, "passed": all(check["status"] != "fail" for check in checks),
+        "checks": checks, "changed_paths": changed_paths, "pushed": pushed,
+        "source_fingerprint": (_evidence_fingerprint(task, worktree) if worktree.exists() else {}).get("source_fingerprint"),
+        "evidence_bindings": {
+            "qa": {"path": _portable_workspace_ref(state_file, qa_path), "sha256": hashlib.sha256(qa_path.read_bytes()).hexdigest() if qa_path.exists() else None},
+            "review": {"path": _portable_workspace_ref(state_file, recommendation), "sha256": hashlib.sha256(recommendation.read_bytes()).hexdigest() if recommendation.exists() else None},
+        },
+    }
 
 
 def cmd_delivery_check(args: argparse.Namespace) -> dict:
@@ -6999,7 +7223,7 @@ def cmd_verify(args: argparse.Namespace) -> dict:
         gates = ROOT / ".ai" / "scripts" / "check-gates.sh"
     if gates.exists():
         print("  Running security gates (G4)...", file=sys.stderr)
-        result = _run_captured(["bash", str(gates), "all"], cwd=run_root)
+        result = _run_captured(_bash_argv(str(gates), "all"), cwd=run_root)
         check = {"name": "security-gates", "exit_code": result.returncode, "status": "pass" if result.returncode == 0 else "fail"}
         if result.returncode != 0:
             check["stderr"] = result.stderr[-500:] if result.stderr else ""
@@ -7102,8 +7326,8 @@ def parser() -> argparse.ArgumentParser:
     delivery_check = delivery_sub.add_parser("check"); delivery_check.add_argument("id"); delivery_check.add_argument("--commit", required=True); delivery_check.set_defaults(fn=cmd_delivery_check)
     delivery_attest = delivery_sub.add_parser("attest"); delivery_attest.add_argument("id"); delivery_attest.add_argument("--commit", required=True); delivery_attest.set_defaults(fn=cmd_delivery_attest)
     delivery_close = delivery_sub.add_parser("close"); delivery_close.add_argument("id"); delivery_close.add_argument("--evidence"); delivery_close.set_defaults(fn=cmd_delivery_close)
-    dispatch = sub.add_parser("dispatch"); dispatch.add_argument("id"); dispatch.add_argument("--runner"); dispatch.add_argument("--model"); dispatch.add_argument("--agent-id"); dispatch.set_defaults(fn=cmd_dispatch)
-    dispatch_ready = sub.add_parser("dispatch-ready"); dispatch_ready.add_argument("--runner"); dispatch_ready.add_argument("--model"); dispatch_ready.add_argument("--limit", type=int); dispatch_ready.add_argument("--context"); dispatch_ready.add_argument("--epic"); dispatch_ready.add_argument("--agent-id"); dispatch_ready.set_defaults(fn=cmd_dispatch_ready)
+    dispatch = sub.add_parser("dispatch"); dispatch.add_argument("id"); dispatch.add_argument("--runner"); dispatch.add_argument("--model"); dispatch.add_argument("--agent-id"); dispatch.add_argument("--worktree-root"); dispatch.add_argument("--no-worktree", action="store_true"); dispatch.set_defaults(fn=cmd_dispatch)
+    dispatch_ready = sub.add_parser("dispatch-ready"); dispatch_ready.add_argument("--runner"); dispatch_ready.add_argument("--model"); dispatch_ready.add_argument("--limit", type=int); dispatch_ready.add_argument("--context"); dispatch_ready.add_argument("--epic"); dispatch_ready.add_argument("--agent-id"); dispatch_ready.add_argument("--worktree-root"); dispatch_ready.add_argument("--no-worktree", action="store_true"); dispatch_ready.set_defaults(fn=cmd_dispatch_ready)
     pipeline = sub.add_parser("pipeline"); pipeline.add_argument("id"); pipeline.add_argument("--agent-id"); pipeline.set_defaults(fn=cmd_pipeline)
     route = sub.add_parser("route"); route.add_argument("id"); route.add_argument("--explain", action="store_true"); route.set_defaults(fn=cmd_route)
     activate = sub.add_parser("activate", help="select an isolated workflow as the active workspace"); activate.add_argument("workflow_state"); activate.set_defaults(fn=cmd_activate)

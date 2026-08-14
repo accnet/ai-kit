@@ -8,7 +8,8 @@ mkdir -p .ai-work/{logs,phases,plan,reports,roadmap,state,tasks,artifacts/projec
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git config core.hooksPath .githooks
 fi
-PYTHON_CMD=${PYTHON_CMD:-$(command -v python3 || command -v python)}
+source .ai/scripts/python-command.sh
+PYTHON_CMD="$(ai_kit_python_command)" || { echo "AI-Kit: Python runtime not found" >&2; exit 127; }
 if [[ ! -f .ai-work/state/workflow.json ]]; then
   "$PYTHON_CMD" .ai/engine/ai_kit.py init --title "Untitled workflow" --workflow feature >/dev/null
 fi

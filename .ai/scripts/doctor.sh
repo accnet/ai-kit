@@ -16,11 +16,12 @@ for file in AGENTS.md .ai-config/kit.yaml .ai-config/rules.yaml .ai-config/regis
   [[ -f "$file" ]] && ok "$file" || bad "$file missing"
 done
 
-PYTHON_CMD=${PYTHON_CMD:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}
+source .ai/scripts/python-command.sh
+PYTHON_CMD="$(ai_kit_python_command 2>/dev/null || true)"
 if [[ -n "$PYTHON_CMD" ]]; then
   ok "python found: $PYTHON_CMD"
 else
-  bad "python3 (or python) not found in PATH"
+  bad "Python not found (set AI_KIT_PYTHON to an executable if PATH is ambiguous)"
 fi
 
 if bash .ai/scripts/check-kit.sh; then
@@ -29,9 +30,10 @@ else
   bad "v2 contract validation failed"
 fi
 
-if [[ -f .ai-work/state/workflow.json ]]; then
-  PYTHON_CMD=${PYTHON_CMD:-$(command -v python3 || command -v python)}
+if [[ -f .ai-work/state/workflow.json && -n "$PYTHON_CMD" ]]; then
   "$PYTHON_CMD" .ai/engine/ai_kit.py validate >/dev/null && ok "workflow state valid" || bad "workflow state invalid"
+elif [[ -f .ai-work/state/workflow.json ]]; then
+  bad "workflow state cannot be validated without Python"
 else
   note "workflow state not initialized (run .ai/scripts/bootstrap.sh)"
 fi

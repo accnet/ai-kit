@@ -4,5 +4,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 TASK="${1:?usage: context-pack.sh T<n>}"
-PYTHON_CMD=${PYTHON_CMD:-$(command -v python3 || command -v python)}
+source .ai/scripts/python-command.sh
+PYTHON_CMD="$(ai_kit_python_command)" || { echo "AI-Kit: Python runtime not found" >&2; exit 127; }
 exec "$PYTHON_CMD" .ai/engine/ai_kit.py route "$TASK"

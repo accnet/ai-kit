@@ -39,6 +39,40 @@ Move a governed task through worker `start`/`complete`, authoritative
 `qa run`, `review submit`/`review apply`, and `delivery attest`/`delivery close`;
 the engine rejects illegal transitions. All transitions are persisted
 to `.ai-work/state/workflow.json` and audit events to `.ai-work/logs/events.jsonl`.
+Review recommendations are cryptographically bound to the exact current QA
+evidence and source fingerprint, so a source or policy change requires fresh
+QA and a fresh independent recommendation. Workspace evidence references are
+relative and portable across machines while legacy absolute references remain
+readable. Optional `delivery.json.local_ci`
+can run `act` (or another command) as a non-authoritative local approximation;
+remote GitHub Actions remains outside the local lifecycle authority boundary.
+
+### Windows and sandboxed dispatch
+
+The shell wrappers select `python` first under Git Bash/MSYS/Cygwin and
+`python3` first on Linux/macOS. The engine honors `AI_KIT_BASH` and otherwise
+auto-detects common native Git Bash installations on Windows, avoiding an
+accidental WindowsApps or WSL shim:
+
+```powershell
+$env:AI_KIT_BASH = "C:\Program Files\Git\bin\bash.exe"
+$env:AI_KIT_PYTHON = "C:\Python313\python.exe" # optional explicit runtime
+python .ai/engine/ai_kit.py qa run T1
+```
+
+Linked task worktrees default to the ignored, repository-local
+`.ai-work/worktrees/` directory so filesystem-restricted sessions do not need
+write access beside the repository. Override it globally with
+`AI_KIT_WORKTREE_ROOT`, in `.ai-config/kit.yaml`, or per dispatch:
+
+```bash
+ai-kit dispatch T1 --worktree-root .ai-work/custom-worktrees
+ai-kit dispatch T1 --no-worktree  # explicit fallback; shared and not isolated
+```
+
+`--no-worktree` is intentionally opt-in and the assignment records
+`isolation: shared-workspace`. It is suitable only when the caller accepts
+that parallel workers can collide.
 
 Generate and inspect the read-only project architecture projection with:
 

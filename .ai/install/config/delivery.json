@@ -2,5 +2,10 @@
   "schema_version": 1,
   "integration_branch": "main",
   "push_required": false,
-  "pre_integration_commands": []
+  "pre_integration_commands": [],
+  "local_ci": {
+    "enabled": false,
+    "command": "act",
+    "required": false
+  }
 }

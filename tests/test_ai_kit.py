@@ -285,6 +285,112 @@ class GovernedControlPlaneTests(EngineTestCase):
         closed = ai_kit.cmd_delivery_close(ns(state=str(self.state_file), id="T1", evidence=None))
         self.assertEqual(closed["status"], "done")
 
+    def test_review_is_bound_to_exact_qa_evidence(self) -> None:
+        self._quality_command(); self.init_workflow(); self.add_task("T1")
+        self._implementation_complete()
+        state = ai_kit.load(self.state_file); task = ai_kit.task_map(state)["T1"]
+        task["assignment"] = {"runner": "executor", "model": "m1", "agent_id": "exec-1", "worktree": str(self.root), "base_commit": None}
+        ai_kit.save(state, self.state_file, state["revision"])
+        ai_kit.cmd_qa_run(ns(state=str(self.state_file), id="T1"))
+        recommendation_input = self.root / "recommendation.json"
+        recommendation_input.write_text(json.dumps({"task": "T1", "decision": "approve", "findings": [], "evidence": [], "runner": "reviewer", "model": "m2", "agent_id": "review-1"}), encoding="utf-8")
+        ai_kit.cmd_review_submit(ns(state=str(self.state_file), id="T1", input=str(recommendation_input)))
+
+        qa_path = ai_kit._qa_evidence_path(self.state_file, "T1")
+        qa_payload = json.loads(qa_path.read_text(encoding="utf-8"))
+        qa_payload["rerun_marker"] = True
+        ai_kit._atomic_write_json(qa_path, qa_payload)
+
+        shown = ai_kit.cmd_review_show(ns(state=str(self.state_file), id="T1"))
+        self.assertFalse(shown["current"])
+        self.assertIn("hash is stale", shown["current_detail"])
+        with self.assertRaisesRegex(ai_kit.EngineError, "hash is stale"):
+            ai_kit.cmd_review_apply(ns(state=str(self.state_file), id="T1", evidence=None))
+
+    def test_review_evidence_binding_survives_workspace_move(self) -> None:
+        self._quality_command(); self.init_workflow(); self.add_task("T1")
+        self._implementation_complete()
+        ai_kit.cmd_qa_run(ns(state=str(self.state_file), id="T1"))
+        recommendation_input = self.root / "recommendation.json"
+        recommendation_input.write_text(json.dumps({"task": "T1", "decision": "approve", "findings": [], "evidence": [], "runner": "reviewer", "model": "m2", "agent_id": "review-1"}), encoding="utf-8")
+        result = ai_kit.cmd_review_submit(ns(state=str(self.state_file), id="T1", input=str(recommendation_input)))
+        recommendation = json.loads(Path(result["recommendation"]).read_text(encoding="utf-8"))
+        self.assertEqual(recommendation["qa_evidence"], "evidence/qa/T1.json")
+
+        moved_workspace = self.root / "moved-workspace"
+        shutil.copytree(ai_kit.workspace(self.state_file), moved_workspace)
+        moved_state = moved_workspace / "state" / "workflow.json"
+        moved_task = ai_kit.task_map(ai_kit.load(moved_state))["T1"]
+        moved_review = moved_workspace / "evidence" / "review" / "T1.recommendation.json"
+
+        current, _detail = ai_kit._review_recommendation_is_current(moved_state, moved_task, moved_review)
+        self.assertTrue(current)
+
+        # Evidence written by older AI-Kit versions remains readable.
+        recommendation = json.loads(moved_review.read_text(encoding="utf-8"))
+        recommendation["qa_evidence"] = str((moved_workspace / "evidence" / "qa" / "T1.json").resolve())
+        ai_kit._atomic_write_json(moved_review, recommendation)
+        current, _detail = ai_kit._review_recommendation_is_current(moved_state, moved_task, moved_review)
+        self.assertTrue(current)
+
+    def test_qa_show_exposes_current_source_fingerprint(self) -> None:
+        self._quality_command(); self.init_workflow(); self.add_task("T1")
+        self._implementation_complete()
+        ai_kit.cmd_qa_run(ns(state=str(self.state_file), id="T1"))
+
+        shown = ai_kit.cmd_qa_show(ns(state=str(self.state_file), id="T1"))
+
+        self.assertTrue(shown["current"])
+        self.assertEqual(shown["source_fingerprint"], shown["fingerprint"]["source_fingerprint"])
+
+    def test_optional_local_ci_configuration_is_non_authoritative(self) -> None:
+        (self.root / ".ai-config" / "delivery.json").write_text(json.dumps({
+            "schema_version": 1,
+            "integration_branch": "main",
+            "push_required": False,
+            "pre_integration_commands": [],
+            "local_ci": {"enabled": True, "command": "act", "required": False},
+        }), encoding="utf-8")
+
+        config = ai_kit._delivery_config()
+
+        self.assertTrue(config["local_ci"]["enabled"])
+        self.assertFalse(config["local_ci"]["required"])
+
+    def test_post_approval_waiver_is_a_separate_audit_record(self) -> None:
+        self._quality_command(); self.init_workflow(); self.add_task("T1")
+        self._implementation_complete()
+        state = ai_kit.load(self.state_file); task = ai_kit.task_map(state)["T1"]
+        task["assignment"] = {"runner": "executor", "model": "m1", "agent_id": "exec-1", "worktree": str(self.root), "base_commit": None}
+        ai_kit.save(state, self.state_file, state["revision"])
+        ai_kit.cmd_qa_run(ns(state=str(self.state_file), id="T1"))
+        review_input = self.root / "review.json"
+        review_input.write_text(json.dumps({"task": "T1", "decision": "approve", "findings": [], "evidence": [], "runner": "reviewer", "model": "m2", "agent_id": "review-1"}), encoding="utf-8")
+        ai_kit.cmd_review_submit(ns(state=str(self.state_file), id="T1", input=str(review_input)))
+        ai_kit.cmd_review_apply(ns(state=str(self.state_file), id="T1", evidence=None))
+        canonical = ai_kit._review_evidence_path(self.state_file, "T1").read_bytes()
+
+        waiver_input = self.root / "waiver.json"
+        waiver_input.write_text(json.dumps({"task": "T1", "decision": "approve", "findings": [], "evidence": [], "runner": "manual-waiver", "model": "user-approved-review-waiver", "agent_id": "codex-root-review-waived"}), encoding="utf-8")
+        result = ai_kit.cmd_review_submit(ns(state=str(self.state_file), id="T1", input=str(waiver_input)))
+
+        self.assertTrue(result["audit_only"])
+        waiver = json.loads(Path(result["recommendation"]).read_text(encoding="utf-8"))
+        self.assertTrue(waiver["audit_only"])
+        self.assertEqual(waiver["authority"], "user-waiver-record")
+        self.assertEqual(ai_kit._review_evidence_path(self.state_file, "T1").read_bytes(), canonical)
+
+    def test_windows_bash_prefers_explicit_native_runtime_and_login(self) -> None:
+        fake_bash = self.root / "Git" / "bin" / "bash.exe"
+        fake_bash.parent.mkdir(parents=True)
+        fake_bash.write_bytes(b"")
+        with (
+            mock.patch.dict(os.environ, {"AI_KIT_BASH": str(fake_bash)}, clear=False),
+            mock.patch.object(ai_kit, "_is_windows_runtime", return_value=True),
+        ):
+            command = ai_kit._bash_argv("check-gates.sh", "all")
+        self.assertEqual(command, [str(fake_bash), "--login", "check-gates.sh", "all"])
+
     def test_worker_cannot_take_privileged_transition_after_assignment(self) -> None:
         self.init_workflow(); self.add_task("T1"); self._implementation_complete()
         state = ai_kit.load(self.state_file); ai_kit.task_map(state)["T1"]["assignment"] = {"runner": "executor", "model": "m", "agent_id": "a"}
@@ -498,6 +604,20 @@ class GovernedControlPlaneTests(EngineTestCase):
         self.assertEqual(assignment["base_commit"], integration_head)
         add_command = next(command for command in commands if "worktree" in command and "add" in command)
         self.assertEqual(add_command[-1], integration_head)
+        expected_root = (ai_kit.ROOT / ".ai-work" / "worktrees").resolve()
+        self.assertTrue(Path(assignment["worktree"]).is_relative_to(expected_root))
+        self.assertEqual(assignment["isolation"], "linked-worktree")
+
+    def test_explicit_no_worktree_mode_is_audited(self) -> None:
+        task = {"id": "T1", "base_commit": "a" * 40, "assignment": None, "claim_id": "claim-1", "claim_expires_at": "2099-01-01T00:00:00Z"}
+        with (
+            mock.patch.object(ai_kit, "_git_head", return_value="b" * 40),
+            mock.patch.object(ai_kit, "_load_runners", return_value={"runner": {"capabilities": ["implementation"]}}),
+            mock.patch("subprocess.run", side_effect=AssertionError("no Git worktree command expected")),
+        ):
+            assignment = ai_kit._ensure_task_worktree({"workflow_id": "wf"}, task, "runner", None, "agent-1", self.state_file, no_worktree=True)
+        self.assertEqual(Path(assignment["worktree"]), ai_kit.ROOT.resolve())
+        self.assertEqual(assignment["isolation"], "shared-workspace")
 
     def test_git_head_skips_subprocess_outside_a_repository(self) -> None:
         with mock.patch("subprocess.run", side_effect=AssertionError("git must not run")):
@@ -1751,6 +1871,49 @@ class LocalScriptContractTests(unittest.TestCase):
     """The helper scripts in .ai/scripts/ are the kit's local QA surface."""
 
     SCRIPTS = REPO_ROOT / ".ai" / "scripts"
+
+    def test_python_selector_prefers_python_on_windows_shells(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            binary_dir = Path(directory)
+            for name in ("python", "python3"):
+                executable = binary_dir / name
+                executable.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            env = {**os.environ, "OS": "Windows_NT", "PATH": f"{binary_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
+            result = run_capture(
+                bash_command(Path("-c"), f"source '{self.SCRIPTS / 'python-command.sh'}'; ai_kit_python_command"),
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(Path(result.stdout.strip()), binary_dir / "python")
+
+    def test_doctor_avoids_windows_python3_shim_and_honors_ai_kit_python(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            project.mkdir()
+            shutil.copytree(REPO_ROOT / ".ai", project / ".ai")
+            shutil.copy2(REPO_ROOT / "AGENTS.md", project / "AGENTS.md")
+            config = project / ".ai-config"
+            config.mkdir()
+            for name in ("kit.yaml", "rules.yaml", "registry.yaml"):
+                shutil.copy2(REPO_ROOT / ".ai" / "install" / "config" / name, config / name)
+            binary_dir = project / "bin"
+            binary_dir.mkdir()
+            python = binary_dir / "python"
+            python.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+            python.chmod(0o755)
+            shim = binary_dir / "python3"
+            shim.write_text("WindowsApps shim\n", encoding="utf-8")
+            shim.chmod(0o000)
+            env = {
+                **os.environ,
+                "OS": "Windows_NT",
+                "PATH": f"{binary_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                "AI_KIT_PYTHON": str(python),
+            }
+            result = run_capture(bash_command(project / ".ai" / "scripts" / "doctor.sh"), cwd=project, env=env)
+            self.assertIn(f"python found: {python}", result.stdout)
+            self.assertNotIn("Permission denied", result.stdout + result.stderr)
 
     def test_new_task_and_next_task_are_not_duplicates(self) -> None:
         """new-task.sh used to be a byte-for-byte duplicate of next-task.sh:

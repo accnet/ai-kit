@@ -360,12 +360,41 @@ and configured generators/verifiers remain tool-agnostic shell commands.
 Task refs use `defines|implements|consumes|verifies` and are emitted in
 `.ai-work/artifacts/project/contracts.json` alongside `represents` edges.
 
-Project-owned `delivery.json` defines the integration branch and optional
-pre-integration commands. `delivery attest` verifies commit reachability,
+Project-owned `delivery.json` defines the integration branch, optional
+pre-integration commands, and an optional non-authoritative local CI
+approximation (for example `act`). `delivery attest` verifies commit reachability,
 scope, current QA/review/design/contract evidence, dependencies, conflicts,
 and optional push status. `delivery close` is the governed transition from
 `review-approved` to `done`; control-plane-only/no-code tasks receive a
 machine-verifiable `not-applicable` attestation.
+
+QA evidence records a source fingerprint over the task contract, assigned
+base, verified final bytes, design policy, and contract snapshots. A review
+recommendation is bound to the exact QA evidence path, SHA-256, and source
+fingerprint. Re-running QA or changing any governed input makes the previous
+recommendation stale; `review apply` and `delivery attest` reject it.
+Workspace-owned evidence bindings use workspace-relative POSIX references so
+the workflow can be moved to another checkout, drive, or operating system.
+Readers continue to accept legacy absolute references for compatibility.
+
+Runner assignments record `isolation` as `linked-worktree`,
+`shared-workspace`, or `unavailable`. Linked worktrees default to
+`.ai-work/worktrees/<workflow>/<task>` and may be relocated with
+`dispatch.worktree_root`, `AI_KIT_WORKTREE_ROOT`, or `--worktree-root`.
+`--no-worktree` is an explicit recovery mode; it never claims filesystem
+isolation.
+
+On Windows, shell-backed deterministic gates use `AI_KIT_BASH` when set and
+otherwise search native Git for Windows locations before PATH. Git Bash is
+invoked with `--login`; Linux and macOS continue to use PATH `bash`.
+Shell entrypoints accept `AI_KIT_PYTHON` as their explicit Python runtime
+override (with legacy `PYTHON_CMD` compatibility) and prefer `python` over a
+potential WindowsApps `python3` shim on MSYS/MINGW/Cygwin.
+
+A review submitted after a task is already `review-approved` is accepted only
+when `runner` is `manual-waiver`. It is written as a separate
+`<task>.waiver.json` audit-only record and cannot replace the canonical
+independent recommendation used by review or delivery gates.
 
 ## Project Analyzer / Knowledge Graph Builder
 
