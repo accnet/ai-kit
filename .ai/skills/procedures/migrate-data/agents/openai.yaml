@@ -1,0 +1,4 @@
+interface:
+  display_name: "Migrate Data"
+  short_description: "Perform safe schema and data migrations"
+  default_prompt: "Use $migrate-data to plan a safe data migration."

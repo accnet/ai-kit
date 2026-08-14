@@ -112,10 +112,35 @@ the contract file is not a second lifecycle source, only a stable
 description of what the task is, independent of `workflow.json`'s size and
 lifecycle churn.
 
+## Procedure routing and handoffs
+
+AI-Kit selects one active procedure for every routed lifecycle operation:
+`plan-task`, `assess-architecture`, `design-contract`, `implement-change`,
+`migrate-data`, `validate-quality`, `review-change`, or `attest-delivery`.
+The procedure registry in `.ai-config/registry.yaml` (seeded from
+`.ai/install/config/registry.yaml`) is authoritative for operation, actors,
+expected outputs, and authority. Project-owned registry overrides merge onto
+the shipped procedure defaults, so existing projects receive the additive
+contract without an installer overwriting their configuration.
+
+`route <task> [--operation ...]` emits `active_procedure` first in
+`skill_details`; policy/core skills and technology packs are supplemental.
+The derived task artifact records the selected procedure but remains a
+projection, not lifecycle authority. Every procedure SOP has exactly these
+headings: `INPUTS`, `PRECONDITIONS`, `ACTIONS`, `OUTPUTS`, `VALIDATION`, and
+`FORBIDDEN`. Procedure prose cannot grant lifecycle power: workers can only
+complete a valid lease, reviewers only submit recommendations, and the control
+plane applies QA, review, and delivery transitions.
+
 Executor handoffs under `.ai-work/handoffs/<task-id>.json` use
 `schema_version: 2`. Their prompt carries the handoff's absolute canonical
 path because the runner executes inside a linked worktree while `.ai-work`
 remains outside that worktree as gitignored control-plane state.
+
+The `routing` object in a handoff additionally carries `operation` and
+`active_procedure` (procedure ID, actor roles, outputs, and authority) before
+the selected policy/core and technology skill details. This is an additive
+schema-v2 field; older handoff readers can ignore it safely.
 
 Every task also carries `contract_revision` and `contract_hash` on its
 `workflow.json` entry -- the revision and SHA-256 content hash of the

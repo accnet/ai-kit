@@ -1,0 +1,4 @@
+interface:
+  display_name: "Validate Quality"
+  short_description: "Produce deterministic QA evidence"
+  default_prompt: "Use $validate-quality to validate task quality."

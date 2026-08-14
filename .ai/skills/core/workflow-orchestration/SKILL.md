@@ -53,9 +53,12 @@ diagnosing a stalled workflow or auditing a past transition sequence.
    `history` array in `workflow.json` with: `from_status`, `to_status`, `timestamp`, `actor`
    (role or agent ID), and a short `reason`. The Reviewer and QA roles verify this trail
    at G3 — a transition with no recorded reason is a gate violation.
-8. **Close tasks with evidence.** Move a task to `done` only when its acceptance criteria
-   each have an `--evidence` path (`ai_kit.py qa-pass T<n> --evidence <path>`). A task
-   marked `done` without evidence fails G2 and must be reopened.
+8. **Hand off lifecycle evidence to the control plane.** The worker may report
+   implementation completion with its valid lease. `validate-quality` invokes
+   authoritative QA, `review-change` submits a recommendation, and
+   `attest-delivery` verifies an integration commit. Only the control plane
+   applies QA/review/delivery transitions; a task marked `done` without
+   current evidence must be reopened.
 
 ## Checklist
 - [ ] Task graph is a valid DAG with no cycles and no missing dependency IDs
@@ -65,7 +68,7 @@ diagnosing a stalled workflow or auditing a past transition sequence.
 - [ ] Blocked tasks have a concrete, actionable `blocked_reason` with an unblock owner
 - [ ] Retry attempts are counted and capped; failed-gate tasks are not retried without a fix
 - [ ] Every transition has a history entry with timestamp, actor, and reason
-- [ ] Tasks are moved to `done` only after G2 evidence paths are recorded
+- [ ] QA, review, and delivery are applied by the control plane from current evidence
 
 ## Anti-patterns
 - Directly editing `workflow.json` status fields to skip a gate — this voids the audit trail
@@ -80,6 +83,5 @@ diagnosing a stalled workflow or auditing a past transition sequence.
   approves; these are separate gate events recorded by separate roles.
 
 ## Output
-Updated `workflow.json` with valid DAG, legal state transitions, complete history entries, and
-G2 evidence paths on every `done` task. Handoff context in `.ai-work/tasks/tasks.md` for each
-role boundary crossed.
+Valid DAG and complete handoff context. Workflow state transitions and evidence
+application remain control-plane operations, not worker outputs.

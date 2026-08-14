@@ -128,11 +128,15 @@ The kit is tool-agnostic. `AGENTS.md` is the authoritative instruction file.
 ## Skill Routing And Metadata
 
 - `route T<n>` now returns:
+  - exactly one `active_procedure` selected by lifecycle operation
+    (`plan`, `assess`, `contract`, `implement`, `migrate`, `qa`, `review`,
+    or `delivery`)
   - backward-compatible `skills` entrypoints
   - `skill_details` with each selected skill's path, entrypoint, full document
     list, selection reasons, and loading phase/order
   - `trigger_matches` and `loading_instructions`
-- `route T<n> --explain` adds routing diagnostics (`role_domains`, task tokens,
+- `route T<n> --operation <name>` inspects an explicit lifecycle procedure;
+  `route T<n> --explain` adds routing diagnostics (`role_domains`, task tokens,
   phase order, and selection counts).
 - Technology skills use `skill.meta.yaml`; schema is documented in
   `.ai/skills/SKILL-METADATA.md`.
@@ -159,6 +163,31 @@ technology-specific-but-useless prose, so that judgement stays with review.
 
 Invest in promoting a skill to a deeper tier only when a real task keeps
 failing for want of the detail.
+
+### Mandatory procedure SOPs
+
+AI-Kit has eight procedure skills under `.ai/skills/procedures/`: `plan-task`,
+`assess-architecture`, `design-contract`, `implement-change`, `migrate-data`,
+`validate-quality`, `review-change`, and `attest-delivery`. A route loads
+exactly one procedure first, then any selected core policy/reference skills and
+technology packs. This prevents tool-specific prompt styles from becoming
+competing delivery processes.
+
+Every procedure `SKILL.md` has exactly these headings, in order:
+
+```text
+# INPUTS
+# PRECONDITIONS
+# ACTIONS
+# OUTPUTS
+# VALIDATION
+# FORBIDDEN
+```
+
+The registry is the canonical machine-readable source for procedure operation,
+actor roles, outputs, and authority; the SOP is the concise agent-facing
+instruction. `check-skills.sh procedures` validates both the section contract
+and that procedure actions do not claim privileged lifecycle transitions.
 
 ## Gate Rules Configuration
 
@@ -221,6 +250,8 @@ Both installers stop before replacing a different managed file. Use
   lifecycle, router, and audit events.
 - `.ai/agents/`: v2 role contracts, split into six concise documents.
 - `.ai/skills/`: technology reference material, grouped by domain.
+- `.ai/skills/procedures/`: eight mandatory execution SOPs; each route selects
+  one before policies and technology packs.
 - `.ai/skills/backend/distributed/`: transactional outbox, saga orchestration,
   and circuit-breaker/fallback guardrails routed by distributed-system terms.
 - `.ai/workflows/`: feature, bugfix, migration, release, and research paths.
@@ -246,12 +277,15 @@ Both installers stop before replacing a different managed file. Use
 - placeholder marker rejection
 - metadata contract/path alignment (`skill.meta.yaml`)
 - core `SKILL.md` front matter contract
+- mandatory procedure SOP section order, non-empty content, registry parity,
+  and control-plane authority boundary
 
 Additional modes:
 
 - `bash .ai/scripts/check-skills.sh core` — core skills only
 - `bash .ai/scripts/check-skills.sh ai` — AI technology skills plus AI-trigger
   core skills
+- `bash .ai/scripts/check-skills.sh procedures` — mandatory procedure SOPs
 
 ## Compatibility with v1
 

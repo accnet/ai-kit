@@ -28,6 +28,75 @@ validate_no_placeholder() {
   fi
 }
 
+PROCEDURE_SECTIONS=(INPUTS PRECONDITIONS ACTIONS OUTPUTS VALIDATION FORBIDDEN)
+PROCEDURE_NAMES=(plan-task assess-architecture design-contract implement-change migrate-data validate-quality review-change attest-delivery)
+
+procedure_section_body() {
+  local file="$1" section="$2"
+  awk -v section="$section" '
+    $0 == "# " section { active=1; next }
+    active && /^# / { exit }
+    active { print }
+  ' "$file"
+}
+
+validate_procedure_skill() {
+  local name="$1"
+  local folder=".ai/skills/procedures/$name"
+  local file="$folder/SKILL.md"
+  [[ -s "$file" ]] || { bad "$file missing or empty"; return; }
+  validate_no_placeholder "$file"
+
+  local fm_end
+  fm_end="$(grep -n '^---$' "$file" | sed -n '2p' | cut -d: -f1 || true)"
+  [[ -n "$fm_end" ]] || { bad "$file missing closing front matter delimiter"; return; }
+  for key in name description; do
+    head -n "$fm_end" "$file" | grep -Eq "^$key:" || bad "$file missing front matter field '$key'"
+  done
+  if head -n "$fm_end" "$file" | grep -Eq '^(version|tier|stack|owner|gates):'; then
+    bad "$file must keep procedure metadata in registry.yaml, not SKILL.md front matter"
+  fi
+
+  local actual expected count body
+  mapfile -t actual < <(grep '^# ' "$file" | sed 's/^# //')
+  if [[ "${actual[*]}" != "${PROCEDURE_SECTIONS[*]}" ]]; then
+    bad "$file must contain exactly the six SOP sections in canonical order"
+  fi
+  for expected in "${PROCEDURE_SECTIONS[@]}"; do
+    count="$(grep -Ec "^# $expected$" "$file" || true)"
+    [[ "$count" -eq 1 ]] || bad "$file must contain exactly one # $expected section"
+    body="$(procedure_section_body "$file" "$expected")"
+    [[ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ]] || bad "$file section $expected must not be empty"
+  done
+
+  # A procedure may name privileged commands only in FORBIDDEN.  The engine,
+  # rather than a worker SOP, owns QA/review/delivery state application.
+  body="$(procedure_section_body "$file" ACTIONS)"
+  if printf '%s\n' "$body" | grep -Eqi 'qa-pass|review-approve|delivery close|transition .*close|workflow\.json.*edit'; then
+    bad "$file ACTIONS claims a privileged control-plane transition"
+  fi
+
+  local registry=".ai/install/config/registry.yaml"
+  if ! awk -v name="$name" '
+    $0 == "procedures:" { in_section=1; next }
+    in_section && $0 !~ /^ / { exit }
+    in_section && $0 == "  " name ":" { found=1 }
+    END { exit found ? 0 : 1 }
+  ' "$registry"; then
+    bad "$registry missing procedures.$name"
+  fi
+  grep -Fq "path: .ai/skills/procedures/$name" "$registry" || bad "$registry missing path for procedure $name"
+}
+
+validate_procedures() {
+  # Fixture-based legacy tests intentionally omit this directory. A project
+  # that declares procedures must provide the complete mandatory set.
+  [[ -d .ai/skills/procedures ]] || return 0
+  for name in "${PROCEDURE_NAMES[@]}"; do
+    validate_procedure_skill "$name"
+  done
+}
+
 validate_core_skill() {
   local folder="$1"
   local file="$folder/SKILL.md"
@@ -134,6 +203,7 @@ collect_tech_ai() {
 
 case "$mode" in
   all)
+    validate_procedures
     while IFS= read -r folder; do
       validate_technology_skill "$folder"
     done < <(collect_tech_all)
@@ -146,6 +216,9 @@ case "$mode" in
       validate_core_skill "$folder"
     done < <(collect_core)
     ;;
+  procedures)
+    validate_procedures
+    ;;
   ai)
     while IFS= read -r folder; do
       validate_technology_skill "$folder"
@@ -155,7 +228,7 @@ case "$mode" in
     done
     ;;
   *)
-    bad "unknown mode '$mode' (use: all|core|ai)"
+    bad "unknown mode '$mode' (use: all|core|ai|procedures)"
     ;;
 esac
 

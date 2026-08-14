@@ -1,0 +1,4 @@
+interface:
+  display_name: "Assess Architecture"
+  short_description: "Assess boundaries and architecture evidence"
+  default_prompt: "Use $assess-architecture to assess project architecture."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Attest Delivery"
+  short_description: "Attest an integrated delivery commit"
+  default_prompt: "Use $attest-delivery to attest an integration commit."

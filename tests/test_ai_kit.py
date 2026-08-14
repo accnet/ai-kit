@@ -1117,6 +1117,10 @@ class RoutingAndSkillMetadataTests(EngineTestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        shutil.copytree(REPO_ROOT / ".ai" / "install" / "config",
+                        self.root / ".ai" / "install" / "config")
+        shutil.copytree(REPO_ROOT / ".ai" / "skills" / "procedures",
+                        self.root / ".ai" / "skills" / "procedures")
         for core_name in [
             "skill-router",
             "api-contract",
@@ -1225,10 +1229,30 @@ class RoutingAndSkillMetadataTests(EngineTestCase):
         )
         data = json.loads(Path(handoff).read_text(encoding="utf-8"))
         self.assertIn("routing", data)
+        self.assertEqual(route_payload["active_procedure"]["id"], "implement-change")
+        self.assertEqual(data["routing"]["active_procedure"]["id"], "implement-change")
+        self.assertEqual(data["routing"]["operation"], "implement")
         self.assertIn("skills", data["routing"])
         self.assertIn("skill_details", data["routing"])
         selected_names = {item["name"] for item in data["routing"]["skill_details"]}
         self.assertTrue({"ai/openai", "ai/llm-application"} & selected_names)
+
+    def test_route_selects_lifecycle_procedure_and_explicit_operation(self) -> None:
+        self.init_workflow()
+        task = self.add_task("T4", owner="backend", task_kind="contract")
+        contract = ai_kit.cmd_route(ns(state=str(self.state_file), id="T4", explain=False))
+        self.assertEqual(contract["active_procedure"]["id"], "design-contract")
+        self.assertEqual(contract["skill_details"][0]["type"], "procedure")
+
+        task["status"] = "implementation-complete"
+        state = ai_kit.load(self.state_file)
+        ai_kit.task_map(state)["T4"]["status"] = "implementation-complete"
+        ai_kit.save(state, self.state_file, state["revision"])
+        qa = ai_kit.cmd_route(ns(state=str(self.state_file), id="T4", explain=False))
+        self.assertEqual(qa["active_procedure"]["id"], "validate-quality")
+
+        review = ai_kit.cmd_route(ns(state=str(self.state_file), id="T4", explain=False, operation="review"))
+        self.assertEqual(review["active_procedure"]["id"], "review-change")
 
 
 @unittest.skipIf(os.name == "nt", "temporary Bash skill fixtures are unreliable on the Windows runner")

@@ -32,6 +32,11 @@ for skill in .ai/skills/core/*; do
   [[ -s "$skill/SKILL.md" ]] || bad "$skill/SKILL.md missing or empty"
 done
 
+for procedure in plan-task assess-architecture design-contract implement-change migrate-data validate-quality review-change attest-delivery; do
+  [[ -s ".ai/skills/procedures/$procedure/SKILL.md" ]] || bad ".ai/skills/procedures/$procedure/SKILL.md missing or empty"
+  [[ -s ".ai/skills/procedures/$procedure/agents/openai.yaml" ]] || bad ".ai/skills/procedures/$procedure/agents/openai.yaml missing or empty"
+done
+
 for workflow in .ai/workflows/*/workflow.md; do
   [[ -s "$workflow" ]] || bad "$workflow missing or empty"
 done

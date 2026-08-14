@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implement Change"
+  short_description: "Implement scoped product changes"
+  default_prompt: "Use $implement-change to implement the assigned task."

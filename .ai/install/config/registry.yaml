@@ -18,6 +18,75 @@ core_skills:
   contract: SKILL.md plus v2 adapter documents
   names: [accessibility, api-contract, architecture-decisions, code-review, contract-testing, data-migration, debugging, dependency-management, deployment-infra, design-governance, documentation-maintenance, e2e-testing, frontend-core, github-actions-ci, integration-contracts, nodejs-api-core, observability, performance-profiling, refactoring, release-management, requirement-decomposer, requirements-intake, security-review, skill-router, system-designer, test-and-validation, threat-modeling, webhooks-and-retries, workflow-orchestration]
 
+# Procedure skills are the canonical execution SOPs. They are intentionally
+# separate from core policy/reference skills and technology knowledge packs:
+# a route selects exactly one procedure plus any number of policies/packs.
+procedures:
+  plan-task:
+    path: .ai/skills/procedures/plan-task
+    operations: [plan]
+    actors: [planner]
+    task_kinds: [general]
+    statuses: [todo, blocked]
+    outputs: [plan-draft]
+    authority: control-plane
+  assess-architecture:
+    path: .ai/skills/procedures/assess-architecture
+    operations: [assess]
+    actors: [architect]
+    task_kinds: [general, contract, integration]
+    statuses: [todo, blocked]
+    outputs: [architecture-assessment]
+    authority: assessment-only
+  design-contract:
+    path: .ai/skills/procedures/design-contract
+    operations: [contract]
+    actors: [architect, backend, integration]
+    task_kinds: [contract]
+    statuses: [todo, in-progress, blocked]
+    outputs: [contract-draft, compatibility-report]
+    authority: assessment-only
+  implement-change:
+    path: .ai/skills/procedures/implement-change
+    operations: [implement]
+    actors: [backend, frontend, integration]
+    task_kinds: [general, implementation, integration]
+    statuses: [todo, in-progress, blocked]
+    outputs: [implementation-handoff]
+    authority: worker-complete-only
+  migrate-data:
+    path: .ai/skills/procedures/migrate-data
+    operations: [migrate]
+    actors: [backend, database]
+    task_kinds: [general, implementation]
+    statuses: [todo, in-progress, blocked]
+    outputs: [migration-evidence]
+    authority: worker-complete-only
+  validate-quality:
+    path: .ai/skills/procedures/validate-quality
+    operations: [qa]
+    actors: [qa]
+    task_kinds: [general, contract, implementation, integration]
+    statuses: [implementation-complete]
+    outputs: [qa-evidence]
+    authority: qa-evidence-only
+  review-change:
+    path: .ai/skills/procedures/review-change
+    operations: [review]
+    actors: [reviewer]
+    task_kinds: [general, contract, implementation, integration]
+    statuses: [qa-passed]
+    outputs: [review-recommendation]
+    authority: recommendation-only
+  attest-delivery:
+    path: .ai/skills/procedures/attest-delivery
+    operations: [delivery]
+    actors: [release, integration]
+    task_kinds: [general, contract, implementation, integration]
+    statuses: [review-approved]
+    outputs: [delivery-attestation]
+    authority: delivery-evidence-only
+
 stack_skills:
   nestjs-core: {path: .ai/skills/backend/nestjs-core, stack: [nestjs]}
   nestjs-data-access: {path: .ai/skills/backend/nestjs-data-access, stack: [nestjs, database]}

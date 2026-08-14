@@ -286,23 +286,13 @@ def _reject_unterminated_list(value: str, source: Path, key: str) -> None:
         )
 
 
-def _load_yaml_registry(relative_path: str, top_key: str) -> dict:
-    """Minimal indented-YAML reader shared by the context/epic registries.
-
-    Format:
-      <top_key>:
-        <name>:
-          <field>: <value>
-          ...
-    """
-    path = _config_path(Path(relative_path).name) if Path(relative_path).name in CONFIG_FILES else ROOT / relative_path
-    if not path.exists():
-        return {}
+def _parse_yaml_registry_text(text: str, path: Path, top_key: str) -> dict:
+    """Parse one supported registry section from already-loaded YAML text."""
     entries: dict[str, dict] = {}
     current = None
     in_section = False
     header = f"{top_key}:"
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -340,6 +330,21 @@ def _load_yaml_registry(relative_path: str, top_key: str) -> dict:
                     value = [item.strip().strip("\"'") for item in value[1:-1].split(",") if item.strip()]
             entries[current][field_match.group(1)] = value
     return entries
+
+
+def _load_yaml_registry(relative_path: str, top_key: str) -> dict:
+    """Minimal indented-YAML reader shared by the context/epic registries.
+
+    Format:
+      <top_key>:
+        <name>:
+          <field>: <value>
+          ...
+    """
+    path = _config_path(Path(relative_path).name) if Path(relative_path).name in CONFIG_FILES else ROOT / relative_path
+    if not path.exists():
+        return {}
+    return _parse_yaml_registry_text(path.read_text(encoding="utf-8"), path, top_key)
 
 
 def _load_contexts() -> dict:
@@ -1375,6 +1380,96 @@ def _load_skill_triggers() -> dict[str, dict]:
             "reason": str(payload.get("reason") or "").strip(),
         }
     return normalized
+
+
+def _load_procedures() -> dict[str, dict]:
+    """Load the machine-readable contract for the eight procedure skills.
+
+    The registry is authoritative for routing/authority/output metadata;
+    SKILL.md supplies the concise agent-facing SOP. Keeping these roles
+    separate prevents prose and control-plane policy from becoming competing
+    lifecycle authorities.
+    """
+    # registry.yaml is project-owned and is never overwritten by an installer.
+    # Merge its optional procedure overrides onto the shipped defaults so an
+    # existing project gains this additive contract without config churn.
+    template_path = ROOT / ".ai" / "install" / "config" / "registry.yaml"
+    defaults = _parse_yaml_registry_text(template_path.read_text(encoding="utf-8"), template_path, "procedures") if template_path.exists() else {}
+    configured = _load_yaml_registry(".ai-config/registry.yaml", "procedures")
+    raw = {key: dict(value) for key, value in defaults.items()}
+    for procedure_id, override in configured.items():
+        raw[procedure_id] = {**raw.get(procedure_id, {}), **override}
+    procedures: dict[str, dict] = {}
+    for procedure_id, payload in raw.items():
+        path = str(payload.get("path") or "").strip()
+        if not path:
+            raise EngineError(f"registry procedure {procedure_id!r} requires path")
+        procedures[procedure_id] = {
+            "id": procedure_id,
+            "path": path.rstrip("/"),
+            "operations": _parse_inline_list(payload.get("operations")),
+            "actors": _parse_inline_list(payload.get("actors")),
+            "task_kinds": _parse_inline_list(payload.get("task_kinds")),
+            "statuses": _parse_inline_list(payload.get("statuses")),
+            "outputs": _parse_inline_list(payload.get("outputs")),
+            "authority": str(payload.get("authority") or "").strip(),
+        }
+    return procedures
+
+
+def _default_procedure_operation(task: dict) -> str:
+    """Choose the active lifecycle procedure without keyword inference."""
+    status = str(task.get("status") or "todo")
+    by_status = {
+        "implementation-complete": "qa",
+        "qa-passed": "review",
+        "review-approved": "delivery",
+    }
+    if status in by_status:
+        return by_status[status]
+    if task.get("task_kind") == "contract":
+        return "contract"
+    tags = {str(tag).lower() for tag in task.get("tags") or []}
+    title = str(task.get("title") or "").lower()
+    if {"migration", "database", "backfill", "seed", "ddl"} & tags or any(term in title for term in ("migration", "backfill", "schema change")):
+        return "migrate"
+    if task.get("owner") == "architect" or "architecture" in tags:
+        return "assess"
+    return "implement"
+
+
+def _select_procedure(task: dict, requested_operation: str | None = None) -> dict:
+    operation = str(requested_operation or _default_procedure_operation(task)).strip().lower()
+    procedures = _load_procedures()
+    candidates = [item for item in procedures.values() if operation in item["operations"]]
+    if len(candidates) != 1:
+        # AI-Kit v2 projects created before procedure SOPs can still inspect
+        # their old workflows. An installed/current kit is checked strictly by
+        # check-kit/check-skills, so this compatibility projection never gives
+        # an incomplete installation new lifecycle authority.
+        if not (ROOT / ".ai" / "skills" / "procedures").exists() and not candidates:
+            return {
+                "id": "legacy-compatible", "name": "legacy-compatible", "path": None,
+                "operations": [operation], "actors": [], "task_kinds": [], "statuses": [],
+                "outputs": [], "authority": "legacy-compatible", "operation": operation,
+                "entrypoint": "", "type": "procedure", "loading_phase": "procedure",
+                "selection_reasons": ["legacy:no-procedure-sop", f"operation:{operation}"],
+            }
+        raise EngineError(f"registry must define exactly one procedure for operation {operation!r}; found {len(candidates)}")
+    procedure = candidates[0]
+    skill_dir = ROOT / procedure["path"]
+    entrypoint = skill_dir / "SKILL.md"
+    if not entrypoint.exists():
+        raise EngineError(f"procedure {procedure['id']} entrypoint missing: {display_path(entrypoint)}")
+    return {
+        **procedure,
+        "name": procedure["id"],
+        "operation": operation,
+        "entrypoint": entrypoint.relative_to(ROOT).as_posix(),
+        "type": "procedure",
+        "loading_phase": "procedure",
+        "selection_reasons": [f"operation:{operation}", f"lifecycle:{task.get('status') or 'todo'}"],
+    }
 
 
 def _task_text(task: dict) -> str:
@@ -2431,8 +2526,9 @@ def _task_artifact(state_file: Path, state: dict | None, evidence: dict) -> dict
     items = []
     for task in state.get("tasks", []):
         stable_id = f"task:{state['workflow_id']}:{task['id']}"
+        procedure = _select_procedure(task)
         entry = _board_entry(task, state_file)
-        entry.update({"tags": task.get("tags", []), "files": task.get("files", []), "acceptance_count": len(task.get("acceptance", []))})
+        entry.update({"tags": task.get("tags", []), "files": task.get("files", []), "acceptance_count": len(task.get("acceptance", [])), "procedure": procedure["id"]})
         board[task["status"]].append(entry)
         items.append({
             "id": stable_id, "task_id": task["id"], "title": task["title"], "owner": task["owner"],
@@ -2441,6 +2537,7 @@ def _task_artifact(state_file: Path, state: dict | None, evidence: dict) -> dict
             "epic": task.get("epic"), "needs": [f"task:{state['workflow_id']}:{dep}" for dep in task.get("needs", [])],
             "acceptance": task.get("acceptance", []), "files": task.get("files", []), "tags": task.get("tags", []),
             "assignment": task.get("assignment"), "governance_baseline": task.get("governance_baseline"),
+            "procedure": {key: procedure[key] for key in ("id", "operation", "outputs", "authority", "actors")},
             "contract_refs": [{**ref, "contract_ref": f"contract:{ref['id']}@{ref['version']}"} for ref in task.get("contract_refs", [])],
             "evidence_refs": sorted(evidence_by_task.get(stable_id, [])), "blocked_reason": task.get("blocked_reason"),
             "ready": runnable(task, task_map(state)),
@@ -3847,6 +3944,7 @@ def cmd_route(args: argparse.Namespace) -> dict:
     tokens = _tokenize_task(task)
     task_text = _task_text(task)
     trigger_registry = _load_skill_triggers()
+    procedure = _select_procedure(task, getattr(args, "operation", None))
 
     selected_tech: dict[str, dict] = {}
     selected_core: dict[str, dict] = {}
@@ -3866,7 +3964,8 @@ def cmd_route(args: argparse.Namespace) -> dict:
                 "documents": [key],
                 "selection_reasons": [reason],
                 "loading_phase": phase,
-                "type": "core",
+                "type": "policy",
+                "classification": "legacy-core",
             }
             return
         if reason not in current["selection_reasons"]:
@@ -3962,19 +4061,26 @@ def cmd_route(args: argparse.Namespace) -> dict:
         if resolved:
             add_technology(resolved, "RAG stack indicates qdrant backend", "trigger-database")
 
-    phase_order = {"role-core": 1, "role-technology": 2, "trigger-core": 3, "trigger-technology": 4, "trigger-database": 5}
-    all_details = list(selected_core.values()) + list(selected_tech.values())
-    all_details.sort(key=lambda item: (phase_order.get(item["loading_phase"], 9), item["entrypoint"]))
+    phase_order = {"procedure": 0, "role-core": 1, "role-technology": 2, "trigger-core": 3, "trigger-technology": 4, "trigger-database": 5}
+    all_details = [procedure] + list(selected_core.values()) + list(selected_tech.values())
+    all_details.sort(key=lambda item: (phase_order.get(item["loading_phase"], 9), item.get("entrypoint") or ""))
     for idx, item in enumerate(all_details, start=1):
         item["loading_order"] = idx
 
-    skills = [item["entrypoint"] for item in all_details]
+    skills = [item["entrypoint"] for item in all_details if item.get("entrypoint")]
+    procedure_instruction = (
+        "Read the active procedure SKILL.md first; it is the mandatory SOP for this operation."
+        if procedure.get("entrypoint")
+        else "This is a legacy-compatible route with no installed procedure SOP; follow the control-plane and selected legacy skills without inferring new authority."
+    )
     root = workspace(state_file)
     snapshot_path = _project_context_snapshot_path(state_file)
     context_paths = [display_path(snapshot_path), display_path(root / "plan" / "plan.md"), display_path(root / "tasks" / "tasks.md"), ".ai/engine/state-schema.md", *task["files"]]
     response = {
         "task": task["id"],
         "owner": role,
+        "operation": procedure["operation"],
+        "active_procedure": procedure,
         "tags": task["tags"],
         "role_contract": (Path(".ai") / "agents" / role).as_posix(),
         "skills": skills,
@@ -3988,8 +4094,9 @@ def cmd_route(args: argparse.Namespace) -> dict:
         "skill_details": all_details,
         "trigger_matches": trigger_matches,
         "loading_instructions": [
-            "Read each selected entrypoint first: technology skills start with overview.md, core skills start with SKILL.md.",
-            "Then load phase-specific documents in order: patterns.md -> best-practices.md -> pitfalls.md -> examples.md when needed for the assigned phase.",
+            procedure_instruction,
+            "Then read selected policy/core skill entrypoints and technology overviews.",
+            "Load technology patterns.md -> best-practices.md -> pitfalls.md -> examples.md only when needed for the assigned phase.",
             "Load only the selected skills listed in this route output; do not pull unrelated domains."
         ],
     }
@@ -4001,6 +4108,7 @@ def cmd_route(args: argparse.Namespace) -> dict:
             "selection_summary": {
                 "core_count": len(selected_core),
                 "technology_count": len(selected_tech),
+                "procedure": procedure["id"],
             },
         }
     return response
@@ -6798,11 +6906,16 @@ def _write_task_handoff(
             "assignment": task.get("assignment"),
         },
         "routing": {
+            "operation": route_payload.get("operation"),
+            "active_procedure": route_payload.get("active_procedure"),
             "skills": route_payload.get("skills", []),
             "skill_details": route_payload.get("skill_details", []),
             "loading_instructions": route_payload.get("loading_instructions", []),
         },
-        "instructions": instructions,
+        "instructions": (
+            "Follow routing.active_procedure before any policy or technology skill. "
+            + instructions
+        ),
     }
     handoff_path = workspace(state_path(state_arg)) / "handoffs" / f"{task['id']}.json"
     handoff_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7724,7 +7837,7 @@ def parser() -> argparse.ArgumentParser:
     dispatch = sub.add_parser("dispatch"); dispatch.add_argument("id"); dispatch.add_argument("--runner"); dispatch.add_argument("--model"); dispatch.add_argument("--agent-id"); dispatch.add_argument("--worktree-root"); dispatch.add_argument("--no-worktree", action="store_true"); dispatch.set_defaults(fn=cmd_dispatch)
     dispatch_ready = sub.add_parser("dispatch-ready"); dispatch_ready.add_argument("--runner"); dispatch_ready.add_argument("--model"); dispatch_ready.add_argument("--limit", type=int); dispatch_ready.add_argument("--context"); dispatch_ready.add_argument("--epic"); dispatch_ready.add_argument("--agent-id"); dispatch_ready.add_argument("--worktree-root"); dispatch_ready.add_argument("--no-worktree", action="store_true"); dispatch_ready.set_defaults(fn=cmd_dispatch_ready)
     pipeline = sub.add_parser("pipeline"); pipeline.add_argument("id"); pipeline.add_argument("--agent-id"); pipeline.set_defaults(fn=cmd_pipeline)
-    route = sub.add_parser("route"); route.add_argument("id"); route.add_argument("--explain", action="store_true"); route.set_defaults(fn=cmd_route)
+    route = sub.add_parser("route"); route.add_argument("id"); route.add_argument("--operation", choices=["plan", "assess", "contract", "implement", "migrate", "qa", "review", "delivery"], help="override the lifecycle-derived procedure for inspection"); route.add_argument("--explain", action="store_true"); route.set_defaults(fn=cmd_route)
     activate = sub.add_parser("activate", help="select an isolated workflow as the active workspace"); activate.add_argument("workflow_state"); activate.set_defaults(fn=cmd_activate)
     status = sub.add_parser("status"); status.add_argument("--context"); status.add_argument("--epic"); status.set_defaults(fn=cmd_status)
     timeline = sub.add_parser("timeline"); timeline.set_defaults(fn=cmd_timeline)

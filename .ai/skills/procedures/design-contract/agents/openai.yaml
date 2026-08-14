@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design Contract"
+  short_description: "Design compatible service contracts"
+  default_prompt: "Use $design-contract to design a versioned contract."

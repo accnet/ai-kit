@@ -18,6 +18,9 @@ Keep these v2 contracts stable:
   `backend/distributed`) is curated technology knowledge with
   `overview.md`, `patterns.md`, `best-practices.md`, `pitfalls.md`, and
   `examples.md`.
+- `.ai/skills/procedures/<name>/SKILL.md` is one of the eight mandatory
+  engineering SOPs. Every route selects exactly one procedure before loading
+  policy/core skills and technology knowledge.
 - `.ai/workflows/<intent>/workflow.md` defines the delivery path.
 - `.ai-work/` holds disposable work state, plans, tasks, reports, and logs.
 
@@ -67,6 +70,32 @@ by how many files a directory contains.
 Prefer the smallest change that makes one capability reliably usable. Add a
 new agent, skill, workflow, or automation only when it has a concrete owner,
 trigger, interface, and verification path.
+
+## Mandatory Procedure SOPs
+
+The procedure set is fixed: `plan-task`, `assess-architecture`,
+`design-contract`, `implement-change`, `migrate-data`, `validate-quality`,
+`review-change`, and `attest-delivery`. Procedures standardize execution;
+core skills provide policies/reference guidance and technology skills provide
+technology-specific knowledge. Do not create another delivery procedure when a
+policy or technology pack is sufficient.
+
+Every procedure `SKILL.md` contains exactly these sections, in this order:
+
+```text
+# INPUTS
+# PRECONDITIONS
+# ACTIONS
+# OUTPUTS
+# VALIDATION
+# FORBIDDEN
+```
+
+The registry, not prose, is authoritative for procedure operation, allowed
+actors, expected outputs, and lifecycle authority. Workers create code or
+recommendations; the control plane applies QA, review, and delivery state.
+`ACTIONS` must never claim a privileged transition. Run
+`bash .ai/scripts/check-skills.sh procedures` after changing a procedure.
 
 ## Workflow Engine Architecture
 
@@ -230,11 +259,13 @@ Before a component is marked implemented, provide:
 
 ## Skill And Concern Routing
 
-Use `route T<n>` as the authoritative runtime assignment. It returns the role
-contract, core skill entry points, stack-relevant technology knowledge,
+Use `route T<n>` as the authoritative runtime assignment. It returns the active
+procedure, role contract, core policy/reference entry points, stack-relevant technology knowledge,
 structured skill metadata (entrypoint + document list + selection reasons +
 loading phase/order), and minimal context. `route T<n> --explain` adds trigger
-match evidence and token-level selection diagnostics. `skills-for.sh <role>` is
+match evidence and token-level selection diagnostics. Use
+`route T<n> --operation <plan|assess|contract|implement|migrate|qa|review|delivery>`
+to inspect a lifecycle procedure explicitly. `skills-for.sh <role>` is
 the equivalent discovery command before a task exists. Read the returned
 `SKILL.md` or `overview.md`; do not load unrelated skill directories
 speculatively.

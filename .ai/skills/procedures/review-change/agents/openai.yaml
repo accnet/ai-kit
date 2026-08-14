@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Change"
+  short_description: "Submit an independent review recommendation"
+  default_prompt: "Use $review-change to review the assigned change."

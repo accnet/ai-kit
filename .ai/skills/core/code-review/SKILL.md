@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Structured review at Gate G3 — check scope, acceptance criteria, security/convention, and residual risk before a feature is marked complete. Use before completion or when reviewing a diff. Records the verdict in .ai-work/tasks/tasks.md and .ai-work/reports/.
+description: Structured review guidance at Gate G3 — check scope, acceptance criteria, security/convention, and residual risk before a feature is marked complete. Use with the review-change procedure to submit an independent recommendation.
 version: 0.2.0
 tier: core
 stack: [any]
@@ -38,10 +38,12 @@ Before a feature is marked complete, or when reviewing a diff/PR at Gate G3.
 - Rubber-stamping scope creep bundled into the diff
 
 ## Output
-A verdict in `tasks.md` (and `decisions.md` for anything binding future work):
+A recommendation artifact consumed by `ai-kit review apply` (and `decisions.md`
+for anything binding future work):
 ```
 Review: approve | changes-requested
 Blockers: <none | list>
 Residual risk: <one line + follow-up task IDs>
 ```
-G3 passes only with zero blockers.
+The reviewer does not apply the verdict or close the task; G3 passes only when
+the control plane validates a current recommendation with zero blockers.

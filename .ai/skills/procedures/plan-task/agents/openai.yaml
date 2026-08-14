@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan Task"
+  short_description: "Create an executable task plan"
+  default_prompt: "Use $plan-task to create a bounded task plan."
