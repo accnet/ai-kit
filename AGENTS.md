@@ -34,7 +34,6 @@ thin entry points and must not duplicate or override these rules:
 
 - GitHub: `.github/workflows/gates.yml` runs portable validation in CI.
 - GitHub Copilot: `.github/copilot-instructions.md` directs Copilot here.
-- Cursor: `.cursor/rules/ai-kit.mdc` applies this file to every workspace task.
 - Claude Code: `CLAUDE.md` and `.claude/commands/` direct Claude here.
 
 All tools use the same control plane, local skills, state schema, and gates.
@@ -141,16 +140,21 @@ the engine actually writes.
 | --- | --- | --- |
 | Project Analyzer | Detects stack, tooling, and container/database runtime from the repo | `ai-kit onboard [--apply]` |
 | Project Analyzer / Knowledge Graph Builder | Combines onboard's detection with contexts.yaml's module + ownership graph and static-analysis risk signals (unowned context, dangling dependency, no verification command); reuses a valid versioned project-context snapshot | `ai-kit analyze [--refresh]` -> `.ai-work/analysis/project-summary.json` |
+| Truth Registry | Resolves an architecture, module, contract, decision, migration, source, or test topic to its canonical project authority without copying that authority | `ai-kit truth resolve <topic>` |
+| Context Resolver | Selects deterministic L0-L3 minimum-sufficient references, upstream contexts, contract sources, governance inputs, reasons, and token estimates for free text or a task | `ai-kit context resolve <request> [--task T<n>]` |
 | Impact Analyzer | Direct/transitive dependents and affected tasks for a module | `ai-kit context impact <name>` |
 | Task DAG Builder | Task graph with waves, ready set, and critical path | `ai-kit artifact generate` -> `.ai-work/artifacts/project/dag.json`, rendered at `.visualizer/dag.html` |
 | Execution Contract Builder | Self-contained JSON handoff for a dispatched task (owner, acceptance, routing, instructions) | written by `ai-kit dispatch` / `dispatch-ready` / `pipeline` to `.ai-work/handoffs/<task-id>.json` |
 | Runtime Observer | Append-only audit history plus a bounded replay projection | `.ai-work/logs/events.jsonl`; `ai-kit artifact generate` -> `.ai-work/artifacts/project/events.json` |
 | Scheduler Advisor | What can run now vs. what is blocked and why | `ai-kit ready`, `ai-kit blocked`, `ai-kit dispatch-ready` |
 | Architecture / C4 / Module Graph | Versioned C4 L1-L3 projection plus contexts, modules, ownership, provenance, and dependency edges | `ai-kit artifact generate` -> `.ai-work/artifacts/project/architecture.json` |
+| Architecture Model Validator | Validates Truth Registry authorities, C4 references, context mappings, and per-entity multidimensional profiles without changing lifecycle state | `ai-kit architecture validate` |
 | Architecture Discovery | Read-only scan of the source tree for feature modules (NestJS/React/Python/generic) and internal import-based dependency edges, never mutating or publishing project state | `ai-kit architecture discover` |
 | Architecture Fitness | Configured dependency rules and executable fitness commands, also enforced by verify/QA | `ai-kit architecture fitness` |
 | Schema Contract Importer | Normalizes OpenAPI, AsyncAPI, Protobuf, or Prisma into a draft Contract Spine version | `ai-kit contract import` |
 | Contract DTO/Mock Generator | Generates typed interfaces and contract mocks with output hashes recorded for convergence checks | `ai-kit contract codegen` |
+| Contract Compatibility Checker | Compares two normalized imported contract versions for supported breaking changes; manual formats remain explicitly inconclusive | `ai-kit contract diff/check <id> <from> <to>` |
+| Project Scaffold | Installs opt-in documentation-only or Store pilot starters without changing workflow lifecycle state | `ai-kit scaffold minimal|store-pilot` |
 | Artifact Validator | Integrity, schema, cross-reference, freshness, and observation checks without lifecycle authority | `ai-kit artifact validate` |
 
 This map only lists capabilities with a working command behind them today. A
@@ -228,6 +232,16 @@ come from project-owned `architecture.json`; registered bounded contexts are
 projected as C4 components. Project-owned `architecture-fitness.json` defines
 dependency rules and optional executable fitness commands. Both
 `architecture fitness` and `verify` run them, so violations block QA.
+
+Project-owned `truth.yaml` is a schema-version-1 routing table, not a source
+of truth. It points topics at the existing canonical config, contract
+registry, decisions, migrations, implementation, and tests. Project-owned
+`architecture.json` may assign profiles per system, container, or context
+across the independent `domain`, `organization`, `dependency`, and
+`deployment` dimensions. `architecture validate` checks their references and
+allowed values before the artifact generator projects them into C4. `verify`
+repeats the architecture-model checks before fitness rules, so invalid model
+structure blocks QA.
 
 ### Required Runtime Evidence
 
@@ -474,6 +488,19 @@ the selected workflow, role contract, relevant skills, code, and tests. Keep
 session-specific notes in `.ai-work/`. Promote durable conventions or decisions
 only to the appropriate committed v2 documentation, never by treating
 `.ai-work/` as permanent truth.
+
+Use `context resolve` (or the `context_package` returned by `route`) before
+implementation. L0 locates authorities and task metadata, L1 contains direct
+scope, L2 adds upstream contexts/contracts/tests, and L3 adds policy, fitness,
+and durable decisions. Optimize for minimum sufficient context: correctness
+and completeness take precedence over reference count or estimated tokens.
+
+**Bootstrap Exception.** When no bounded context is registered, the resolver
+may return only configured source roots (or existing conventional roots such as
+`src`, `frontend`, `backend`, or `worker`) at L1 so the first boundaries can be
+established. It never returns the repository root or a recursive source dump;
+bootstrap discovery is not architecture authority. Register the resulting
+contexts before normal implementation work.
 
 ## Change Discipline
 

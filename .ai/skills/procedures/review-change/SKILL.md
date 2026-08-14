@@ -4,7 +4,7 @@ description: Submit an independent review recommendation for a QA-passed task. U
 ---
 
 # INPUTS
-- QA-passed task, current QA evidence, task diff, contract/design evidence, and reviewer identity.
+- QA-passed task, resolved review context, current QA evidence, task diff, contract/design evidence, and reviewer identity.
 
 # PRECONDITIONS
 - Confirm QA evidence is current and the reviewer identity differs from the executor.

@@ -104,12 +104,21 @@ CONFIG_FILES = {
     "delivery.json",
     "architecture.json",
     "architecture-fitness.json",
+    "truth.yaml",
 }
 TASK_KINDS = {"general", "contract", "implementation", "integration"}
 CONTRACT_RELATIONS = {"defines", "implements", "consumes", "verifies"}
 CONTRACT_KINDS = {"domain", "api", "event", "schema", "interface"}
 CONTRACT_STATUSES = {"draft", "proposed", "approved", "active", "deprecated", "removed"}
 CONTRACT_IMPORT_FORMATS = {"openapi", "asyncapi", "protobuf", "prisma"}
+SCAFFOLD_PROFILES = ("minimal", "store-pilot")
+TRUTH_KINDS = {"config", "contract-registry", "decisions", "migrations", "source", "tests"}
+ARCHITECTURE_PROFILE_DIMENSIONS = {
+    "domain": {"simple", "ddd"},
+    "organization": {"layered", "vertical-slice"},
+    "dependency": {"none", "hexagonal", "clean"},
+    "deployment": {"monolith", "modular-monolith", "service"},
+}
 STATUSES = ("todo", "in-progress", "implementation-complete", "qa-passed", "review-approved", "done", "blocked", "superseded", "cancelled")
 # Statuses that satisfy a downstream `needs`/plan dependency. `superseded`
 # and `cancelled` are terminal-but-not-`done`: the work was deliberately
@@ -359,6 +368,105 @@ def _load_contexts() -> dict:
     `/`) checked against each task's `files` when G6 module_boundary is on.
     """
     return _load_yaml_registry(".ai-config/contexts.yaml", "contexts")
+
+
+def _config_bool(value: object, *, label: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().strip("\"'").lower()
+    if normalized in {"true", "yes", "1", "on"}:
+        return True
+    if normalized in {"false", "no", "0", "off"}:
+        return False
+    raise EngineError(f"{label}: expected true or false, got {value!r}")
+
+
+def _load_truth_registry() -> dict[str, dict]:
+    """Load the project-owned map from topics to canonical authorities.
+
+    The registry only points at sources; resolving a topic never copies or
+    promotes data into workflow state or the derived artifact bundle.
+    """
+    path = _config_path("truth.yaml")
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8")
+    version_match = re.search(r"^schema_version:\s*(\d+)\s*$", text, re.MULTILINE)
+    if not version_match or int(version_match.group(1)) != 1:
+        raise EngineError(f"{display_path(path)}: truth registry must use schema_version 1")
+    raw = _parse_yaml_registry_text(text, path, "topics")
+    registry: dict[str, dict] = {}
+    for topic, payload in raw.items():
+        authority = str(payload.get("authority") or "").strip().strip("\"'")
+        kind = str(payload.get("kind") or "").strip().strip("\"'")
+        if not authority:
+            raise EngineError(f"{display_path(path)}: topics.{topic}.authority is required")
+        authority_path = Path(authority)
+        if authority_path.is_absolute() or ".." in authority_path.parts:
+            raise EngineError(f"{display_path(path)}: topics.{topic}.authority must stay inside the project")
+        if kind not in TRUTH_KINDS:
+            raise EngineError(
+                f"{display_path(path)}: topics.{topic}.kind must be one of {sorted(TRUTH_KINDS)}"
+            )
+        registry[topic] = {
+            "topic": topic,
+            "authority": authority,
+            "kind": kind,
+            "required": _config_bool(payload.get("required", "true"), label=f"topics.{topic}.required"),
+        }
+    return registry
+
+
+def _truth_authority_path(entry: dict) -> Path:
+    authority = str(entry["authority"])
+    config_prefix = ".ai-config/"
+    if authority.startswith(config_prefix):
+        name = authority[len(config_prefix):]
+        if name in CONFIG_FILES:
+            return _config_path(name)
+    return ROOT / authority
+
+
+def _truth_resolution(topic: str) -> dict:
+    registry = _load_truth_registry()
+    if topic not in registry:
+        raise EngineError(f"unknown truth topic: {topic}; available: {', '.join(sorted(registry)) or 'none'}")
+    entry = registry[topic]
+    path = _truth_authority_path(entry)
+    exists = path.exists()
+    return {
+        **entry,
+        "registry": display_path(_config_path("truth.yaml")),
+        "resolved_path": display_path(path),
+        "exists": exists,
+        "canonical": True,
+    }
+
+
+def _truth_registry_diagnostics() -> tuple[list[dict], dict[str, dict]]:
+    registry = _load_truth_registry()
+    checks: list[dict] = []
+    for topic in sorted(registry):
+        resolved = _truth_resolution(topic)
+        passed = resolved["exists"] or not resolved["required"]
+        checks.append({
+            "id": f"truth:{topic}",
+            "passed": passed,
+            "detail": (
+                f"{resolved['resolved_path']} exists"
+                if resolved["exists"]
+                else f"optional authority is absent: {resolved['resolved_path']}"
+                if not resolved["required"]
+                else f"required authority is absent: {resolved['resolved_path']}"
+            ),
+        })
+    if not registry:
+        checks.append({"id": "truth:registry", "passed": False, "detail": "truth registry has no topics"})
+    return checks, registry
+
+
+def cmd_truth_resolve(args: argparse.Namespace) -> dict:
+    return _truth_resolution(args.topic)
 
 
 def _load_epics() -> dict:
@@ -2308,10 +2416,147 @@ def _evidence_artifact(state_file: Path, state: dict | None) -> dict:
     return {"items": items, "counts": {"total": len(items), "current": sum(1 for item in items if item["current"]), "stale": sum(1 for item in items if not item["current"])}}
 
 
+def _architecture_model_diagnostics(config: dict | None = None) -> tuple[list[dict], dict]:
+    config = config or _load_json_config(
+        "architecture.json",
+        {"schema_version": 1, "systems": [], "external_systems": [], "containers": [], "context_mappings": {}, "relationships": [], "profiles": {}},
+    )
+    checks: list[dict] = []
+
+    def check(check_id: str, passed: bool, detail: str) -> None:
+        checks.append({"id": check_id, "passed": bool(passed), "detail": detail})
+
+    check("architecture:schema", config.get("schema_version") == 1, "architecture.json uses schema_version 1")
+    collection_names = ("systems", "external_systems", "containers", "relationships")
+    for name in collection_names:
+        check(f"architecture:{name}:type", isinstance(config.get(name, []), list), f"{name} is an array")
+    check("architecture:context-mappings:type", isinstance(config.get("context_mappings", {}), dict), "context_mappings is an object")
+    check("architecture:profiles:type", isinstance(config.get("profiles", {}), dict), "profiles is an object")
+    if not all(item["passed"] for item in checks):
+        return checks, config
+
+    contexts = _load_contexts()
+    ids: dict[str, str] = {}
+    names: set[str] = set()
+    for collection in ("systems", "external_systems", "containers"):
+        for index, item in enumerate(config.get(collection, [])):
+            valid_object = isinstance(item, dict)
+            check(f"architecture:{collection}:{index}:object", valid_object, f"{collection}[{index}] is an object")
+            if not valid_object:
+                continue
+            entity_id = str(item.get("id") or "").strip()
+            check(f"architecture:{collection}:{index}:id", bool(entity_id), f"{collection}[{index}] has an id")
+            if not entity_id:
+                continue
+            unique = entity_id not in ids
+            check(f"architecture:{collection}:{index}:unique", unique, f"{entity_id} is unique")
+            ids.setdefault(entity_id, collection)
+            if item.get("name"):
+                names.add(str(item["name"]))
+
+    system_ids = {
+        str(item.get("id")) for collection in ("systems", "external_systems")
+        for item in config.get(collection, []) if isinstance(item, dict) and item.get("id")
+    }
+    container_ids = {
+        str(item.get("id")) for item in config.get("containers", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    for index, container in enumerate(config.get("containers", [])):
+        if not isinstance(container, dict) or not container.get("system_ref"):
+            continue
+        ref = str(container["system_ref"])
+        check(f"architecture:container:{index}:system-ref", ref in system_ids, f"container system_ref {ref!r} resolves")
+
+    for context_name, container_ref in config.get("context_mappings", {}).items():
+        check(f"architecture:mapping:{context_name}:context", context_name in contexts, f"context {context_name!r} is registered")
+        check(f"architecture:mapping:{context_name}:container", str(container_ref) in container_ids, f"container {container_ref!r} resolves")
+
+    endpoint_ids = set(ids)
+    endpoint_ids.update(f"component:{name}" for name in contexts)
+    for index, relation in enumerate(config.get("relationships", [])):
+        valid_object = isinstance(relation, dict)
+        check(f"architecture:relationship:{index}:object", valid_object, f"relationships[{index}] is an object")
+        if not valid_object:
+            continue
+        for side in ("from", "to"):
+            ref = str(relation.get(side) or "")
+            check(f"architecture:relationship:{index}:{side}", bool(ref) and ref in endpoint_ids, f"relationship {side} {ref!r} resolves")
+
+    profile_refs = {"default", *ids, *names, *contexts, *(f"context:{name}" for name in contexts)}
+    for ref, profile in config.get("profiles", {}).items():
+        check(f"architecture:profile:{ref}:reference", ref in profile_refs, f"profile target {ref!r} resolves")
+        valid_object = isinstance(profile, dict)
+        check(f"architecture:profile:{ref}:object", valid_object, f"profile {ref!r} is an object")
+        if not valid_object:
+            continue
+        unknown = sorted(set(profile) - set(ARCHITECTURE_PROFILE_DIMENSIONS))
+        check(f"architecture:profile:{ref}:dimensions", not unknown, f"profile dimensions are recognized: {unknown or 'yes'}")
+        for dimension, value in profile.items():
+            if dimension not in ARCHITECTURE_PROFILE_DIMENSIONS:
+                continue
+            allowed = ARCHITECTURE_PROFILE_DIMENSIONS[dimension]
+            check(
+                f"architecture:profile:{ref}:{dimension}",
+                value in allowed,
+                f"{dimension}={value!r} is one of {sorted(allowed)}",
+            )
+    return checks, config
+
+
+def _load_architecture_model() -> dict:
+    checks, config = _architecture_model_diagnostics()
+    failures = [item for item in checks if not item["passed"]]
+    if failures:
+        raise EngineError("invalid architecture model: " + "; ".join(item["detail"] for item in failures[:5]))
+    return config
+
+
+def cmd_architecture_validate(args: argparse.Namespace) -> dict:
+    truth_checks, truth = _truth_registry_diagnostics()
+    architecture_checks, config = _architecture_model_diagnostics()
+    checks = [*truth_checks, *architecture_checks]
+    return {
+        "schema_version": 1,
+        "passed": all(item["passed"] for item in checks),
+        "checks": checks,
+        "summary": {
+            "truth_topics": len(truth),
+            "systems": len(config.get("systems") or []),
+            "external_systems": len(config.get("external_systems") or []),
+            "containers": len(config.get("containers") or []),
+            "contexts": len(_load_contexts()),
+            "profiles": len(config.get("profiles") or {}),
+        },
+    }
+
+
+def cmd_architecture_inspect(args: argparse.Namespace) -> dict:
+    validation = cmd_architecture_validate(args)
+    if not validation["passed"]:
+        raise EngineError("architecture inspection requires a valid model; run `ai-kit architecture validate`")
+    contexts = []
+    for name, info in sorted(_load_contexts().items()):
+        contexts.append({
+            "id": f"context:{name}",
+            "name": name,
+            "path": info.get("path"),
+            "owner": info.get("owner"),
+            "depends_on": [f"context:{dependency}" for dependency in info.get("depends_on") or []],
+            "observation": _architecture_observation("observed", "config", [".ai-config/contexts.yaml"], confidence=1.0),
+        })
+    return {
+        "schema_version": 1,
+        "valid": True,
+        "truth": {topic: _truth_resolution(topic) for topic in sorted(_load_truth_registry())},
+        "c4": _c4_projection(contexts),
+        "profiles": _load_architecture_model().get("profiles") or {},
+        "summary": validation["summary"],
+    }
+
+
 def _c4_projection(contexts: list[dict]) -> dict:
-    config = _load_json_config("architecture.json", {"schema_version": 1, "systems": [], "external_systems": [], "containers": [], "context_mappings": {}, "relationships": []})
-    if config.get("schema_version") != 1:
-        raise EngineError("architecture.json must use schema_version 1")
+    config = _load_architecture_model()
     systems = list(config.get("systems") or [])
     if not systems:
         kit_path = _config_path("kit.yaml")
@@ -2325,10 +2570,18 @@ def _c4_projection(contexts: list[dict]) -> dict:
         containers = [{"id": "container:application", "name": "Application", "technology": None, "system_ref": default_system, "description": "Default application container"}]
     default_container = containers[0]["id"]
     mappings = config.get("context_mappings") or {}
+    profiles = config.get("profiles") or {}
+
+    def profile_for(*references: object) -> dict:
+        for reference in references:
+            if reference is not None and str(reference) in profiles:
+                return dict(profiles[str(reference)])
+        return dict(profiles.get("default") or {})
+
     observation = _architecture_observation("observed", "config", [".ai-config/architecture.json"], confidence=1.0)
-    normalized_systems = [{**item, "type": "external-system" if item in external else "software-system", "observation": observation} for item in systems + external]
-    normalized_containers = [{**item, "system_ref": item.get("system_ref") or default_system, "observation": observation} for item in containers]
-    components = [{"id": f"component:{item['name']}", "name": item["name"], "description": item.get("path"), "owner": item.get("owner"), "container_ref": mappings.get(item["name"]) or default_container, "context_ref": item["id"], "observation": item["observation"]} for item in contexts]
+    normalized_systems = [{**item, "type": "external-system" if item in external else "software-system", "profile": profile_for(item.get("id"), item.get("name")), "observation": observation} for item in systems + external]
+    normalized_containers = [{**item, "system_ref": item.get("system_ref") or default_system, "profile": profile_for(item.get("id"), item.get("name"), item.get("system_ref")), "observation": observation} for item in containers]
+    components = [{"id": f"component:{item['name']}", "name": item["name"], "description": item.get("path"), "owner": item.get("owner"), "container_ref": mappings.get(item["name"]) or default_container, "context_ref": item["id"], "profile": profile_for(item.get("id"), item.get("name"), mappings.get(item["name"]) or default_container), "observation": item["observation"]} for item in contexts]
     relationships = []
     for index, item in enumerate(config.get("relationships") or [], 1):
         relationships.append({"id": item.get("id") or f"c4-relation:configured:{index}", "from": item.get("from"), "to": item.get("to"), "description": item.get("description"), "technology": item.get("technology"), "observation": observation})
@@ -2337,7 +2590,7 @@ def _c4_projection(contexts: list[dict]) -> dict:
         for target in item.get("depends_on", []):
             if target in context_by_ref:
                 relationships.append({"id": f"c4-relation:{item['name']}>{context_by_ref[target]['name']}", "from": f"component:{item['name']}", "to": f"component:{context_by_ref[target]['name']}", "description": "depends on", "technology": None, "observation": item["observation"]})
-    return {"levels": {"1": {"name": "System Context", "nodes": [item["id"] for item in normalized_systems]}, "2": {"name": "Containers", "nodes": [item["id"] for item in normalized_containers]}, "3": {"name": "Components", "nodes": [item["id"] for item in components]}}, "systems": normalized_systems, "containers": normalized_containers, "components": components, "relationships": relationships}
+    return {"levels": {"1": {"name": "System Context", "nodes": [item["id"] for item in normalized_systems]}, "2": {"name": "Containers", "nodes": [item["id"] for item in normalized_containers]}, "3": {"name": "Components", "nodes": [item["id"] for item in components]}}, "systems": normalized_systems, "containers": normalized_containers, "components": components, "relationships": relationships, "profiles": profiles}
 
 
 def _architecture_artifacts(state: dict | None) -> tuple[dict, dict, dict, list[dict], dict]:
@@ -3135,6 +3388,167 @@ def _auto_generate_visualizer_data(path: Path) -> None:
 
 def _auto_generate_for_args(args: argparse.Namespace) -> None:
     _auto_generate_visualizer_data(state_path(getattr(args, "state", None)))
+
+
+def _scaffold_template_sources(profile: str) -> list[tuple[Path, Path]]:
+    if profile not in SCAFFOLD_PROFILES:
+        raise EngineError(f"unknown scaffold profile {profile!r}; choose from {', '.join(SCAFFOLD_PROFILES)}")
+    template_root = ROOT / ".ai" / "install" / "project-templates"
+    profiles = ["minimal"] if profile == "minimal" else ["minimal", "store-pilot"]
+    selected: dict[Path, Path] = {}
+    for profile_name in profiles:
+        source_root = template_root / profile_name
+        if not source_root.is_dir():
+            raise EngineError(f"scaffold template is missing: {display_path(source_root)}")
+        for source in sorted(candidate for candidate in source_root.rglob("*") if candidate.is_file()):
+            relative = source.relative_to(source_root)
+            # A specialized profile may deliberately replace a minimal
+            # companion document (for example, the pilot topology).  Later
+            # profile layers therefore override the same relative template.
+            selected[relative] = source
+    return [(selected[relative], ROOT / relative) for relative in sorted(selected)]
+
+
+def _write_context_registry(contexts: dict[str, dict]) -> Path:
+    path = _writable_config_path("contexts.yaml")
+    lines = ["contexts:"]
+    for name, fields in sorted(contexts.items()):
+        lines.append(f"  {name}:")
+        lines.append(f"    path: {fields['path']}")
+        lines.append(f"    owner: {fields['owner']}")
+        lines.append(f"    revision: {fields.get('revision', 1)}")
+        if fields.get("depends_on"):
+            lines.append(f"    depends_on: {json.dumps(fields['depends_on'], ensure_ascii=False)}")
+    temporary = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+    return path
+
+
+def _store_pilot_architecture() -> dict:
+    return {
+        "schema_version": 1,
+        "systems": [{"id": "system:store-pilot", "name": "Store Pilot", "description": "Reference system for the Create Store boundary"}],
+        "external_systems": [],
+        "containers": [
+            {"id": "container:frontend", "name": "Frontend", "technology": "TypeScript", "system_ref": "system:store-pilot"},
+            {"id": "container:store-api", "name": "Store API", "technology": "Python", "system_ref": "system:store-pilot"},
+            {"id": "container:store-worker", "name": "Store Worker", "technology": "Python", "system_ref": "system:store-pilot"},
+            {"id": "container:postgres", "name": "PostgreSQL", "technology": "PostgreSQL", "system_ref": "system:store-pilot"},
+            {"id": "container:redis", "name": "Redis", "technology": "Redis", "system_ref": "system:store-pilot"},
+        ],
+        "context_mappings": {
+            "frontend": "container:frontend",
+            "backend": "container:store-api",
+            "worker": "container:store-worker",
+        },
+        "relationships": [
+            {"from": "container:frontend", "to": "container:store-api", "description": "uses Store API contract"},
+            {"from": "container:store-api", "to": "container:postgres", "description": "persists Store aggregate"},
+            {"from": "container:store-api", "to": "container:redis", "description": "publishes lifecycle event"},
+            {"from": "container:store-worker", "to": "container:redis", "description": "consumes lifecycle event"},
+        ],
+        "profiles": {
+            "default": {"domain": "ddd", "organization": "vertical-slice", "dependency": "hexagonal", "deployment": "modular-monolith"},
+            "frontend": {"domain": "simple", "organization": "vertical-slice", "dependency": "none", "deployment": "modular-monolith"},
+            "backend": {"domain": "ddd", "organization": "vertical-slice", "dependency": "hexagonal", "deployment": "modular-monolith"},
+            "worker": {"domain": "simple", "organization": "vertical-slice", "dependency": "hexagonal", "deployment": "service"},
+        },
+    }
+
+
+def _set_project_source_dirs(source_dirs: list[str]) -> Path:
+    """Update the bounded discovery scope in the project-owned kit config."""
+    path = _writable_config_path("kit.yaml")
+    text = path.read_text(encoding="utf-8")
+    replacement = "source_dirs: [" + ", ".join(source_dirs) + "]"
+    updated, count = re.subn(r"(?m)^\s*source_dirs:\s*\[[^\]]*\]\s*$", replacement, text, count=1)
+    if count != 1:
+        raise EngineError(f"{display_path(path)}: cannot update project.source_dirs")
+    temporary = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+    temporary.write_text(updated, encoding="utf-8")
+    os.replace(temporary, path)
+    return path
+
+
+def _scaffold_store_pilot(force: bool) -> dict:
+    contexts = {
+        "frontend": {"path": "frontend/*", "owner": "frontend", "revision": "1"},
+        "backend": {"path": "backend/*", "owner": "backend", "revision": "1"},
+        "worker": {"path": "worker/*", "owner": "backend", "revision": "1"},
+    }
+    existing_contexts = _load_contexts()
+    existing_registry = _load_contract_registry()
+    existing_architecture = _load_json_config("architecture.json", {})
+    configured = bool(existing_contexts or existing_registry.get("contracts") or existing_architecture.get("systems") or existing_architecture.get("containers") or existing_architecture.get("context_mappings"))
+    if configured and not force:
+        raise EngineError("store-pilot requires an empty context, contract, and architecture configuration; use --force to replace them")
+    _write_context_registry(contexts)
+    _write_json_config("architecture.json", _store_pilot_architecture())
+    # Keep later artifact generation and discovery within the three executable
+    # pilot boundaries instead of falling back to a broad project-root scan.
+    _set_project_source_dirs(["frontend", "backend", "worker"])
+    if force:
+        registry = _load_contract_registry()
+        for contract_id in ("store-api", "store-lifecycle"):
+            registry.get("contracts", {}).pop(contract_id, None)
+        _write_json_config("contracts.json", registry)
+
+    api_source = ROOT / "contracts" / "openapi" / "v1" / "store-api.yaml"
+    imported = cmd_contract_import(argparse.Namespace(
+        source=str(api_source), format="openapi", id="store-api", version="1.0.0",
+        owner="backend", kind="api", represents="store", output=str(ROOT / "contracts" / "generated" / "sdk"),
+        language="typescript", no_mocks=False, force=force, actor="scaffold", state=None,
+    ))
+    event_source = ROOT / "contracts" / "events" / "v1" / "store-lifecycle-changed.schema.json"
+    event = cmd_contract_add(argparse.Namespace(
+        id="store-lifecycle", version="1.0.0", owner="backend", kind="event", represents="store",
+        path=event_source.relative_to(ROOT).as_posix(), compatibility="backward-compatible", supersedes=None,
+        actor="scaffold", state=None,
+    ))
+    return {"contexts": sorted(contexts), "contracts": [f"{imported['contract']}@{imported['version']}", f"{event['contract']}@{event['version']}"]}
+
+
+def cmd_scaffold(args: argparse.Namespace) -> dict:
+    """Install an opt-in project starter without changing lifecycle state.
+
+    Templates are intentionally outside the runtime source tree.  The
+    `minimal` profile provides architecture documentation conventions only;
+    `store-pilot` layers a small executable boundary example on top and seeds
+    the project-owned registries that describe it.
+    """
+    profile = args.profile
+    source_targets = _scaffold_template_sources(profile)
+    conflicts = [
+        display_path(target)
+        for source, target in source_targets
+        if target.exists() and target.read_bytes() != source.read_bytes()
+    ]
+    if conflicts and not args.force:
+        raise EngineError("scaffold would overwrite existing files; use --force: " + ", ".join(conflicts[:5]))
+    written: list[str] = []
+    for source, target in source_targets:
+        if target.exists() and target.read_bytes() == source.read_bytes():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + f".{uuid.uuid4().hex}.tmp")
+        temporary.write_bytes(source.read_bytes())
+        os.replace(temporary, target)
+        written.append(display_path(target))
+    profile_result = _scaffold_store_pilot(args.force) if profile == "store-pilot" else {"contexts": [], "contracts": []}
+    validation = cmd_architecture_validate(argparse.Namespace(state=getattr(args, "state", None)))
+    _auto_generate_for_args(args)
+    return {
+        "profile": profile,
+        "written": written,
+        **profile_result,
+        "architecture_valid": validation["passed"],
+        "authority": {
+            "truth_registry": ".ai-config/truth.yaml",
+            "architecture": ".ai-config/architecture.json",
+            "contracts": ".ai-config/contracts.json",
+        },
+    }
 
 
 def cmd_init(args: argparse.Namespace) -> dict:
@@ -4075,7 +4489,19 @@ def cmd_route(args: argparse.Namespace) -> dict:
     )
     root = workspace(state_file)
     snapshot_path = _project_context_snapshot_path(state_file)
-    context_paths = [display_path(snapshot_path), display_path(root / "plan" / "plan.md"), display_path(root / "tasks" / "tasks.md"), ".ai/engine/state-schema.md", *task["files"]]
+    context_package = _resolve_context_package(
+        str(task.get("title") or task["id"]),
+        task=task,
+        state_file=state_file,
+        explain=getattr(args, "explain", False),
+    )
+    context_paths = [
+        display_path(snapshot_path),
+        display_path(root / "plan" / "plan.md"),
+        display_path(root / "tasks" / "tasks.md"),
+        ".ai/engine/state-schema.md",
+        *(item["path"] for item in context_package["references"]),
+    ]
     response = {
         "task": task["id"],
         "owner": role,
@@ -4091,6 +4517,7 @@ def cmd_route(args: argparse.Namespace) -> dict:
             "fingerprint": project_context["context_snapshot"]["fingerprint"],
             "cache_status": project_context_cache,
         },
+        "context_package": context_package,
         "skill_details": all_details,
         "trigger_matches": trigger_matches,
         "loading_instructions": [
@@ -4188,6 +4615,273 @@ def cmd_context_impact(args: argparse.Namespace) -> dict:
     validate(state)
     affected = [task["id"] for task in state["tasks"] if task.get("status") != "done" and task.get("context") in {args.name, *all_dependents}]
     return {"name": args.name, "direct_dependents": direct, "all_dependents": all_dependents, "affected_tasks": affected}
+
+
+CONTEXT_PACKAGE_SCHEMA_VERSION = 1
+CONTEXT_QUERY_STOP_WORDS = {
+    "add", "and", "change", "create", "fix", "for", "from", "implement", "into",
+    "the", "this", "update", "with", "without",
+}
+
+
+def _context_query_tokens(query: str) -> set[str]:
+    return {
+        token for token in re.findall(r"[a-z0-9][a-z0-9_-]{1,}", query.lower())
+        if token not in CONTEXT_QUERY_STOP_WORDS
+    }
+
+
+def _context_requested_level(query: str, task: dict | None, requested: int | None) -> int:
+    if requested is not None:
+        if requested not in {0, 1, 2, 3}:
+            raise EngineError("context level must be 0, 1, 2, or 3")
+        return requested
+    tokens = _context_query_tokens(query)
+    architectural = {
+        "architecture", "boundary", "container", "contract", "dependency", "deploy",
+        "deployment", "event", "integration", "migration", "module", "schema", "service",
+    }
+    if task and (
+        task.get("owner") == "architect"
+        or task.get("task_kind") in {"contract", "integration"}
+        or task.get("contract_refs")
+        or architectural & {str(tag).lower() for tag in task.get("tags") or []}
+    ):
+        return 3
+    return 3 if tokens & architectural else 2
+
+
+def _context_reference_stats(reference: str) -> dict:
+    path = Path(reference)
+    path = path if path.is_absolute() else ROOT / path
+    pattern = any(character in reference for character in "*?[")
+    if pattern and not Path(reference).is_absolute():
+        matches = 0
+        for candidate in ROOT.glob(reference):
+            if candidate.is_file() or candidate.is_dir():
+                matches += 1
+            if matches >= 100:
+                break
+        return {"exists": matches > 0, "pattern": True, "match_count": matches, "size_bytes": None, "estimated_tokens": None}
+    exists = path.exists()
+    size = path.stat().st_size if exists and path.is_file() else None
+    return {
+        "exists": exists,
+        "pattern": False,
+        "match_count": 1 if exists else 0,
+        "size_bytes": size,
+        "estimated_tokens": (size + 3) // 4 if size is not None else None,
+    }
+
+
+def _resolve_context_package(
+    query: str,
+    *,
+    task: dict | None,
+    state_file: Path,
+    max_level: int | None = None,
+    explain: bool = False,
+) -> dict:
+    """Resolve minimum sufficient references without reading source bodies."""
+    query = query.strip()
+    if not query:
+        raise EngineError("context resolve requires a non-empty task description or --task")
+    level = _context_requested_level(query, task, max_level)
+    tokens = _context_query_tokens(query)
+    contexts = _load_contexts()
+    selected_contexts: set[str] = set()
+    selection_trace: list[dict] = []
+
+    def select_context(name: str, reason: str) -> None:
+        if name in contexts:
+            selected_contexts.add(name)
+            selection_trace.append({"kind": "context", "ref": name, "reason": reason})
+
+    if task and task.get("context"):
+        select_context(str(task["context"]), "task.context")
+    task_files = [str(path) for path in (task.get("files") if task else []) or []]
+    for name, info in contexts.items():
+        path_pattern = str(info.get("path") or "")
+        if any(path_pattern and fnmatch.fnmatch(path, path_pattern) for path in task_files):
+            select_context(name, "declared task file matches context path")
+        searchable = {name.lower(), str(info.get("owner") or "").lower()}
+        searchable.update(_context_query_tokens(path_pattern.replace("/", " ")))
+        if tokens & searchable:
+            select_context(name, "query token matches context identity")
+
+    upstream_contexts: set[str] = set()
+
+    def add_upstreams(name: str) -> None:
+        for dependency in contexts.get(name, {}).get("depends_on") or []:
+            if dependency not in upstream_contexts:
+                upstream_contexts.add(dependency)
+                add_upstreams(dependency)
+
+    for name in list(selected_contexts):
+        add_upstreams(name)
+
+    entries: dict[str, dict] = {}
+
+    def add_reference(reference: str, item_level: int, source_kind: str, reason: str) -> None:
+        if item_level > level or not reference:
+            return
+        current = entries.get(reference)
+        if current:
+            if reason not in current["reasons"]:
+                current["reasons"].append(reason)
+            current["level"] = min(current["level"], item_level)
+            return
+        entries[reference] = {
+            "path": reference,
+            "level": item_level,
+            "level_name": f"L{item_level}",
+            "source_kind": source_kind,
+            "reasons": [reason],
+            **_context_reference_stats(reference),
+        }
+
+    truth_path = _config_path("truth.yaml")
+    add_reference(display_path(truth_path), 0, "truth-registry", "locate canonical authorities")
+    for topic in ("architecture", "modules"):
+        if topic in _load_truth_registry():
+            resolution = _truth_resolution(topic)
+            add_reference(resolution["resolved_path"], 0, resolution["kind"], f"truth topic: {topic}")
+    add_reference(display_path(_config_path("kit.yaml")), 0, "project-config", "project stack and source roots")
+    if task:
+        task_contract = workspace(state_file) / "tasks" / f"{task['id']}.json"
+        add_reference(display_path(task_contract), 0, "task", "task metadata and acceptance criteria")
+
+    for path in task_files:
+        add_reference(path, 1, "task-file", "declared task scope")
+    for name in sorted(selected_contexts):
+        add_reference(str(contexts[name].get("path") or ""), 1, "context", f"direct context: {name}")
+    for name in sorted(upstream_contexts):
+        add_reference(str(contexts[name].get("path") or ""), 2, "dependency", f"upstream context dependency: {name}")
+
+    # Bootstrap Exception: a genuinely new project has no context registry to
+    # select from, but an agent still needs a narrowly bounded place to begin
+    # discovering its first boundaries.  Deliberately return only configured
+    # source roots (or conventional *existing* roots), never `.` and never a
+    # recursive file listing.  Once contexts are registered, normal L1/L2
+    # selection resumes and this exception is no longer available.
+    bootstrap_roots: list[str] = []
+    bootstrap_active = False
+    bootstrap_reason = None
+    if not contexts:
+        configured_roots = [
+            value.strip().strip("/\\")
+            for value in configured_source_dirs()
+            if value.strip().strip("/\\") and value.strip().strip("/\\") != "."
+        ]
+        conventional_roots = ["apps", "services", "packages", "src", "frontend", "backend", "worker"]
+        candidates = configured_roots or conventional_roots
+        bootstrap_roots = [candidate for candidate in candidates if (ROOT / candidate).is_dir()]
+        if bootstrap_roots:
+            bootstrap_active = True
+            bootstrap_reason = "no bounded contexts are registered; inspect only source roots to establish the first boundaries"
+            for root in sorted(set(bootstrap_roots)):
+                add_reference(root, 1, "bootstrap-source-root", bootstrap_reason)
+                selection_trace.append({"kind": "bootstrap", "ref": root, "reason": bootstrap_reason})
+
+    contract_refs = []
+    registry = _load_contract_registry()
+    for ref in (task.get("contract_refs") if task else []) or []:
+        contract_refs.append(dict(ref))
+        try:
+            _contract, payload = _contract_version(registry, ref["id"], ref["version"])
+        except EngineError:
+            selection_trace.append({"kind": "contract", "ref": f"{ref['id']}@{ref['version']}", "reason": "referenced contract is unresolved"})
+            continue
+        add_reference(str(payload.get("path") or ""), 2, "contract", f"task contract ref: {ref['relation']}:{ref['id']}@{ref['version']}")
+
+    boundary_tokens = {"api", "contract", "endpoint", "event", "schema", "webhook"}
+    if tokens & boundary_tokens and "api" in _load_truth_registry():
+        resolution = _truth_resolution("api")
+        add_reference(resolution["resolved_path"], 2, resolution["kind"], "boundary-related query requires contract registry")
+    if tokens & {"database", "migration", "schema"} and "database" in _load_truth_registry():
+        resolution = _truth_resolution("database")
+        add_reference(resolution["resolved_path"], 2, resolution["kind"], "data-related query requires database authority")
+
+    if level >= 2 and task_files:
+        stems = {Path(path).stem.lower().removeprefix("test_").removesuffix("_test") for path in task_files}
+        tests_root = ROOT / "tests"
+        if tests_root.is_dir():
+            for test_path in sorted(tests_root.rglob("*")):
+                if not test_path.is_file() or not test_path.name.lower().startswith(("test", "spec")):
+                    continue
+                normalized_name = test_path.stem.lower()
+                if any(stem and stem in normalized_name for stem in stems):
+                    add_reference(display_path(test_path), 2, "test", "test filename matches a declared task file")
+
+    if level >= 3:
+        for config_name, reason in (
+            ("architecture-fitness.json", "architecture constraints"),
+            ("design-policy.json", "design governance"),
+        ):
+            add_reference(display_path(_config_path(config_name)), 3, "governance", reason)
+        if "decisions" in _load_truth_registry():
+            resolution = _truth_resolution("decisions")
+            add_reference(resolution["resolved_path"], 3, resolution["kind"], "architectural rationale")
+
+    flat_entries = sorted(entries.values(), key=lambda item: (item["level"], item["path"]))
+    levels = {f"L{index}": [item for item in flat_entries if item["level"] == index] for index in range(4)}
+    selected_bytes = sum(item["size_bytes"] or 0 for item in flat_entries)
+    estimated_tokens = sum(item["estimated_tokens"] or 0 for item in flat_entries)
+    excluded_contexts = sorted(set(contexts) - selected_contexts - upstream_contexts)
+    package = {
+        "schema_version": CONTEXT_PACKAGE_SCHEMA_VERSION,
+        "query": query,
+        "task": task.get("id") if task else None,
+        "max_level": level,
+        "levels": levels,
+        "references": flat_entries,
+        "contexts": {
+            "direct": sorted(selected_contexts),
+            "dependencies": sorted(upstream_contexts),
+            "excluded": excluded_contexts,
+        },
+        "bootstrap": {
+            "active": bootstrap_active,
+            "reason": bootstrap_reason,
+            "source_roots": sorted(set(bootstrap_roots)),
+            "policy": (
+                "May inspect only the listed source roots to establish first contexts; "
+                "do not recursively load the repository or treat bootstrap discovery as architecture authority."
+            ),
+        },
+        "contracts": contract_refs,
+        "metrics": {
+            "references_selected": len(flat_entries),
+            "existing_references": sum(1 for item in flat_entries if item["exists"]),
+            "missing_references": sum(1 for item in flat_entries if not item["exists"]),
+            "selected_bytes": selected_bytes,
+            "estimated_tokens": estimated_tokens,
+            "contexts_selected": len(selected_contexts) + len(upstream_contexts),
+            "contexts_excluded": len(excluded_contexts),
+        },
+        "principle": "minimum-sufficient-context",
+    }
+    if explain:
+        package["selection_trace"] = selection_trace
+        package["token_matches"] = sorted(tokens)
+    return package
+
+
+def cmd_context_resolve(args: argparse.Namespace) -> dict:
+    state_file = state_path(getattr(args, "state", None))
+    task = None
+    if getattr(args, "task", None):
+        state = load(state_file)
+        validate(state)
+        task = _resolve_task_definition(args.task, state, state_file)
+    query = getattr(args, "query", None) or (task.get("title") if task else "")
+    return _resolve_context_package(
+        query,
+        task=task,
+        state_file=state_file,
+        max_level=getattr(args, "level", None),
+        explain=getattr(args, "explain", False),
+    )
 
 
 def cmd_runner_add(args: argparse.Namespace) -> dict:
@@ -4923,7 +5617,19 @@ def _json_schema_fields(schema: dict) -> list[dict]:
     for name, value in (schema.get("properties") or {}).items():
         if not isinstance(value, dict):
             value = {}
-        fields.append({"name": name, "type": value.get("type") or ("array" if "items" in value else "object"), "format": value.get("format"), "required": name in required, "ref": value.get("$ref")})
+        fields.append({
+            "name": name,
+            "type": value.get("type") or ("array" if "items" in value else "object"),
+            "format": value.get("format"),
+            "required": name in required,
+            "ref": value.get("$ref"),
+            # An enum can only safely narrow a consumer's accepted values when
+            # the old value set is a subset of the new one.  Preserve it in the
+            # normalized import so the compatibility checker can make that
+            # limited, deterministic assertion instead of inspecting YAML/JSON
+            # ad hoc at approval time.
+            "enum": list(value.get("enum") or []) if isinstance(value.get("enum"), list) else None,
+        })
     return fields
 
 
@@ -5171,6 +5877,17 @@ def _transition_contract(registry: dict, contract_id: str, version_name: str, ac
         current_hash = _sha256_required_file(_registry_contract_path(version))
         if current_hash != version.get("content_hash"):
             raise EngineError("contract content changed since registration; update draft before approval")
+        if version.get("supersedes"):
+            compatibility = _contract_compatibility_check(
+                contract_id, str(version["supersedes"]), version_name, registry
+            )
+            # A manual contract has no normalized semantic representation. Its
+            # configured verifier remains the authority in that case; only
+            # block approval when the imported formats gave us a conclusive
+            # compatibility failure.
+            if compatibility["status"] == "fail":
+                failed = ", ".join(check["name"] for check in compatibility["checks"] if check["status"] == "fail")
+                raise EngineError(f"semantic contract compatibility failed: {failed}")
         if version.get("compatibility") == "breaking":
             if not version.get("supersedes") or not migration:
                 raise EngineError("breaking contract approval requires supersedes and migration evidence")
@@ -5282,6 +5999,174 @@ def _contract_verification(contract_id: str, version_name: str, cwd: Path | None
 
 def cmd_contract_verify(args: argparse.Namespace) -> dict:
     return _contract_verification(args.id, args.version)
+
+
+def _imported_contract_payload(version: dict) -> tuple[dict | None, str | None]:
+    """Return a normalized imported contract, or explain why it is unavailable.
+
+    The semantic compatibility check intentionally operates only on the
+    normalized representation produced by `contract import`.  A manually
+    registered JSON/YAML file can still be verified by its hash or configured
+    verifier, but AI-Kit must not claim to understand an arbitrary format.
+    """
+    import_info = version.get("import") or {}
+    fmt = import_info.get("format")
+    if fmt not in CONTRACT_IMPORT_FORMATS:
+        return None, "contract version was not created by `ai-kit contract import`"
+    path = _registry_contract_path(version)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None, "normalized imported contract is not valid JSON"
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None, "normalized imported contract must use schema_version 1"
+    if payload.get("source_format") != fmt:
+        return None, "normalized import format does not match registry metadata"
+    return payload, None
+
+
+def _indexed_contract_items(payload: dict, key: str) -> dict[str, dict]:
+    return {
+        str(item.get("name")): item
+        for item in payload.get(key) or []
+        if isinstance(item, dict) and item.get("name")
+    }
+
+
+def _contract_field_breaks(entity: str, previous: dict, current: dict) -> list[dict]:
+    findings: list[dict] = []
+    old_fields = _indexed_contract_items({"fields": previous.get("fields") or []}, "fields")
+    new_fields = _indexed_contract_items({"fields": current.get("fields") or []}, "fields")
+    for name, old_field in sorted(old_fields.items()):
+        candidate = new_fields.get(name)
+        location = f"{entity}.{name}"
+        if not candidate:
+            findings.append({"kind": "field-removed", "severity": "breaking", "entity": location, "detail": "field was removed"})
+            continue
+        if tuple(old_field.get(key) for key in ("type", "format", "ref")) != tuple(candidate.get(key) for key in ("type", "format", "ref")):
+            findings.append({"kind": "field-shape-changed", "severity": "breaking", "entity": location, "detail": "type, format, or reference changed"})
+        if not old_field.get("required") and candidate.get("required"):
+            findings.append({"kind": "field-now-required", "severity": "breaking", "entity": location, "detail": "optional field became required"})
+        old_enum = old_field.get("enum")
+        new_enum = candidate.get("enum")
+        if isinstance(old_enum, list) and old_enum and isinstance(new_enum, list) and not set(old_enum).issubset(set(new_enum)):
+            findings.append({"kind": "enum-narrowed", "severity": "breaking", "entity": location, "detail": "new enum excludes one or more previous values"})
+    for name, candidate in sorted(new_fields.items()):
+        if name not in old_fields and candidate.get("required"):
+            findings.append({"kind": "required-field-added", "severity": "breaking", "entity": f"{entity}.{name}", "detail": "new required field was added"})
+    return findings
+
+
+def _contract_semantic_diff(
+    contract_id: str,
+    from_version: str,
+    to_version: str,
+    registry: dict | None = None,
+) -> dict:
+    registry = registry or _load_contract_registry()
+    _contract, previous = _contract_version(registry, contract_id, from_version)
+    _contract, current = _contract_version(registry, contract_id, to_version)
+    old_payload, old_reason = _imported_contract_payload(previous)
+    new_payload, new_reason = _imported_contract_payload(current)
+    if old_payload is None or new_payload is None:
+        return {
+            "schema_version": 1,
+            "contract": contract_id,
+            "from_version": from_version,
+            "to_version": to_version,
+            "applicable": False,
+            "breaking": None,
+            "findings": [],
+            "reason": old_reason or new_reason,
+        }
+
+    findings: list[dict] = []
+    old_format = old_payload.get("source_format")
+    new_format = new_payload.get("source_format")
+    if old_format != new_format:
+        findings.append({"kind": "source-format-changed", "severity": "breaking", "entity": contract_id, "detail": f"{old_format} changed to {new_format}"})
+
+    for collection in ("definitions", "models"):
+        previous_items = _indexed_contract_items(old_payload, collection)
+        current_items = _indexed_contract_items(new_payload, collection)
+        for name, previous_item in sorted(previous_items.items()):
+            if name not in current_items:
+                findings.append({"kind": f"{collection[:-1]}-removed", "severity": "breaking", "entity": name, "detail": f"{collection[:-1]} was removed"})
+                continue
+            findings.extend(_contract_field_breaks(name, previous_item, current_items[name]))
+
+    def operation_key(item: dict) -> str:
+        return f"{item.get('method', '')}:{item.get('path', '')}" if item.get("method") or item.get("path") else str(item.get("id"))
+
+    old_operations = {operation_key(item): item for item in old_payload.get("operations") or [] if isinstance(item, dict)}
+    new_operations = {operation_key(item): item for item in new_payload.get("operations") or [] if isinstance(item, dict)}
+    for key in sorted(set(old_operations) - set(new_operations)):
+        findings.append({"kind": "operation-removed", "severity": "breaking", "entity": key, "detail": "operation was removed"})
+
+    def event_key(item: dict) -> str:
+        return f"{item.get('direction', '')}:{item.get('channel', '')}"
+
+    old_events = {event_key(item): item for item in old_payload.get("events") or [] if isinstance(item, dict)}
+    new_events = {event_key(item): item for item in new_payload.get("events") or [] if isinstance(item, dict)}
+    for key in sorted(set(old_events) - set(new_events)):
+        findings.append({"kind": "event-removed", "severity": "breaking", "entity": key, "detail": "event channel/direction was removed"})
+
+    findings.sort(key=lambda item: (item["kind"], item["entity"], item["detail"]))
+    return {
+        "schema_version": 1,
+        "contract": contract_id,
+        "from_version": from_version,
+        "to_version": to_version,
+        "applicable": True,
+        "source_format": old_format,
+        "breaking": bool(findings),
+        "findings": findings,
+        "summary": {
+            "breaking_findings": len(findings),
+            "previous_source_hash": old_payload.get("source_hash"),
+            "current_source_hash": new_payload.get("source_hash"),
+        },
+    }
+
+
+def _contract_compatibility_check(
+    contract_id: str,
+    from_version: str,
+    to_version: str,
+    registry: dict | None = None,
+) -> dict:
+    registry = registry or _load_contract_registry()
+    _contract, target = _contract_version(registry, contract_id, to_version)
+    diff = _contract_semantic_diff(contract_id, from_version, to_version, registry)
+    if not diff["applicable"]:
+        return {
+            **diff,
+            "status": "inconclusive",
+            "passed": False,
+            "checks": [{"name": "semantic-diff", "status": "inconclusive", "detail": diff["reason"]}],
+        }
+    checks: list[dict] = [{"name": "semantic-diff", "status": "pass", "detail": "breaking changes detected" if diff["breaking"] else "no supported breaking changes detected"}]
+    if diff["breaking"]:
+        declared_breaking = target.get("compatibility") == "breaking"
+        checks.append({"name": "compatibility-declared", "status": "pass" if declared_breaking else "fail", "detail": "target declares breaking compatibility"})
+        previous_semver = _semver(from_version)
+        target_semver = _semver(to_version)
+        checks.append({"name": "major-version", "status": "pass" if target_semver[0] > previous_semver[0] else "fail", "detail": "breaking change increments major version"})
+        checks.append({"name": "supersedes", "status": "pass" if target.get("supersedes") == from_version else "fail", "detail": "target explicitly supersedes the compared version"})
+    return {
+        **diff,
+        "status": "pass" if all(item["status"] == "pass" for item in checks) else "fail",
+        "passed": all(item["status"] == "pass" for item in checks),
+        "checks": checks,
+    }
+
+
+def cmd_contract_diff(args: argparse.Namespace) -> dict:
+    return _contract_semantic_diff(args.id, args.from_version, args.to_version)
+
+
+def cmd_contract_check(args: argparse.Namespace) -> dict:
+    return _contract_compatibility_check(args.id, args.from_version, args.to_version)
 
 
 def _contract_convergence(task: dict, cwd: Path | None = None) -> dict:
@@ -5629,6 +6514,8 @@ PROJECT_CONTEXT_SNAPSHOT_SCHEMA_VERSION = 1
 ANALYSIS_INPUT_PATHS = (
     ".ai-config/kit.yaml",
     ".ai-config/contexts.yaml",
+    ".ai-config/truth.yaml",
+    ".ai-config/architecture.json",
     "package.json",
     "composer.json",
     "pyproject.toml",
@@ -5807,6 +6694,9 @@ def _build_project_context_snapshot(fingerprint: str, inputs: dict) -> dict:
     if not onboard_proposal.get("verification"):
         risks.append({"kind": "no_verification_command", "detail": "no test/lint/build command detected; verify will report inconclusive"})
 
+    truth = _load_truth_registry()
+    architecture = _load_architecture_model()
+
     return {
         "schema_version": ANALYZE_SCHEMA_VERSION,
         "generated_at": now(),
@@ -5819,6 +6709,8 @@ def _build_project_context_snapshot(fingerprint: str, inputs: dict) -> dict:
         "container_runtime": onboard_proposal["container_runtime"],
         "modules": modules,
         "ownership": ownership,
+        "truth": {topic: {"authority": entry["authority"], "kind": entry["kind"]} for topic, entry in sorted(truth.items())},
+        "architecture_profiles": architecture.get("profiles") or {},
         "risks": risks,
     }
 
@@ -6910,6 +7802,7 @@ def _write_task_handoff(
             "active_procedure": route_payload.get("active_procedure"),
             "skills": route_payload.get("skills", []),
             "skill_details": route_payload.get("skill_details", []),
+            "context_package": route_payload.get("context_package"),
             "loading_instructions": route_payload.get("loading_instructions", []),
         },
         "instructions": (
@@ -7724,6 +8617,15 @@ def cmd_verify(args: argparse.Namespace) -> dict:
             check["stderr"] = result.stderr[-500:] if result.stderr else ""
             report["passed"] = False
         report["checks"].append(check)
+    architecture_checks, _architecture_config = _architecture_model_diagnostics()
+    architecture_passed = all(item["passed"] for item in architecture_checks)
+    report["checks"].append({
+        "name": "architecture-model",
+        "status": "pass" if architecture_passed else "fail",
+        "checks": architecture_checks,
+    })
+    if not architecture_passed:
+        report["passed"] = False
     print("  Running architecture fitness functions...", file=sys.stderr)
     fitness = _architecture_fitness(run_root)
     report["checks"].append({
@@ -7788,6 +8690,7 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--json", action="store_true", help="always print JSON")
     sub = root.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init"); init.add_argument("--title", required=True); init.add_argument("--workflow", required=True); init.add_argument("--actor", default="planner"); init.add_argument("--force", action="store_true"); init.set_defaults(fn=cmd_init)
+    scaffold = sub.add_parser("scaffold", help="install an opt-in architecture/project starter"); scaffold.add_argument("profile", choices=SCAFFOLD_PROFILES); scaffold.add_argument("--force", action="store_true", help="replace scaffold-owned files and store-pilot configuration"); scaffold.set_defaults(fn=cmd_scaffold)
     add = sub.add_parser("add-task"); add.add_argument("id"); add.add_argument("--title", required=True); add.add_argument("--owner", required=True); add.add_argument("--phase", required=True); add.add_argument("--needs", nargs="*"); add.add_argument("--depends-on", action="append", default=[], metavar="PATH"); add.add_argument("--acceptance", nargs="+", action="append", required=True); add.add_argument("--files", nargs="*"); add.add_argument("--tags", nargs="*"); add.add_argument("--context"); add.add_argument("--epic"); add.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); add.add_argument("--required-capability", action="append", default=[]); add.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); add.add_argument("--actor", default="planner"); add.set_defaults(fn=cmd_add_task)
     update = sub.add_parser("update-task"); update.add_argument("id"); update.add_argument("--add-acceptance", nargs="+", action="append"); update.add_argument("--add-files", nargs="*"); update.add_argument("--add-tags", nargs="*"); update.add_argument("--actor", default="planner"); update.set_defaults(fn=cmd_update_task)
     ready = sub.add_parser("ready"); ready.add_argument("--context"); ready.add_argument("--epic"); ready.set_defaults(fn=cmd_ready)
@@ -7830,6 +8733,8 @@ def parser() -> argparse.ArgumentParser:
     contract_generate = contract_sub.add_parser("generate"); contract_generate.add_argument("id"); contract_generate.add_argument("version"); contract_generate.add_argument("--generator"); contract_generate.set_defaults(fn=cmd_contract_generate)
     contract_codegen = contract_sub.add_parser("codegen", help="generate built-in DTO/interface and contract mocks"); contract_codegen.add_argument("id"); contract_codegen.add_argument("version"); contract_codegen.add_argument("--output", required=True); contract_codegen.add_argument("--language", choices=["typescript", "python"], default="typescript"); contract_codegen.add_argument("--no-mocks", action="store_true"); contract_codegen.set_defaults(fn=cmd_contract_codegen)
     contract_verify = contract_sub.add_parser("verify"); contract_verify.add_argument("id"); contract_verify.add_argument("version"); contract_verify.set_defaults(fn=cmd_contract_verify)
+    contract_diff = contract_sub.add_parser("diff", help="compare two normalized imported contract versions"); contract_diff.add_argument("id"); contract_diff.add_argument("from_version"); contract_diff.add_argument("to_version"); contract_diff.set_defaults(fn=cmd_contract_diff)
+    contract_check = contract_sub.add_parser("check", help="enforce semantic compatibility/versioning for two imported versions"); contract_check.add_argument("id"); contract_check.add_argument("from_version"); contract_check.add_argument("to_version"); contract_check.set_defaults(fn=cmd_contract_check)
     delivery = sub.add_parser("delivery", help="integration commit attestation"); delivery_sub = delivery.add_subparsers(dest="delivery_command", required=True)
     delivery_check = delivery_sub.add_parser("check"); delivery_check.add_argument("id"); delivery_check.add_argument("--commit", required=True); delivery_check.set_defaults(fn=cmd_delivery_check)
     delivery_attest = delivery_sub.add_parser("attest"); delivery_attest.add_argument("id"); delivery_attest.add_argument("--commit", required=True); delivery_attest.set_defaults(fn=cmd_delivery_attest)
@@ -7848,6 +8753,10 @@ def parser() -> argparse.ArgumentParser:
     context_add = context_sub.add_parser("add"); context_add.add_argument("name"); context_add.add_argument("--path", required=True); context_add.add_argument("--owner", required=True); context_add.add_argument("--depends-on", action="append", default=None, metavar="MODULE"); context_add.add_argument("--force", action="store_true", help="update an existing context, bumping its revision"); context_add.set_defaults(fn=cmd_context_add)
     context_list = context_sub.add_parser("list"); context_list.set_defaults(fn=cmd_context_list)
     context_impact = context_sub.add_parser("impact"); context_impact.add_argument("name"); context_impact.set_defaults(fn=cmd_context_impact)
+    context_resolve = context_sub.add_parser("resolve", help="select a minimum sufficient context package"); context_resolve.add_argument("query", nargs="?"); context_resolve.add_argument("--task"); context_resolve.add_argument("--level", type=int, choices=[0, 1, 2, 3]); context_resolve.add_argument("--explain", action="store_true"); context_resolve.set_defaults(fn=cmd_context_resolve)
+    context_explain = context_sub.add_parser("explain", help="resolve context with selection diagnostics"); context_explain.add_argument("query", nargs="?"); context_explain.add_argument("--task"); context_explain.add_argument("--level", type=int, choices=[0, 1, 2, 3]); context_explain.set_defaults(fn=cmd_context_resolve, explain=True)
+    truth = sub.add_parser("truth", help="resolve a topic to its canonical project authority"); truth_sub = truth.add_subparsers(dest="truth_command", required=True)
+    truth_resolve = truth_sub.add_parser("resolve"); truth_resolve.add_argument("topic"); truth_resolve.set_defaults(fn=cmd_truth_resolve)
     artifact = sub.add_parser("artifact", help="derived project artifact projection"); artifact_sub = artifact.add_subparsers(dest="artifact_command", required=True)
     artifact_generate = artifact_sub.add_parser("generate"); artifact_generate.add_argument("--refresh", action="store_true"); artifact_generate.set_defaults(fn=cmd_artifact_generate)
     artifact_validate = artifact_sub.add_parser("validate"); artifact_validate.set_defaults(fn=cmd_artifact_validate)
@@ -7868,6 +8777,8 @@ def parser() -> argparse.ArgumentParser:
     onboard = sub.add_parser("onboard"); onboard.add_argument("--apply", action="store_true"); onboard.set_defaults(fn=cmd_onboard)
     analyze = sub.add_parser("analyze"); analyze.add_argument("--refresh", action="store_true", help="rebuild the project context snapshot even when its fingerprint is valid"); analyze.set_defaults(fn=cmd_analyze)
     architecture = sub.add_parser("architecture"); architecture_sub = architecture.add_subparsers(dest="architecture_command", required=True)
+    architecture_validate = architecture_sub.add_parser("validate", help="validate truth, C4 references, and architecture profiles"); architecture_validate.set_defaults(fn=cmd_architecture_validate)
+    architecture_inspect = architecture_sub.add_parser("inspect", help="inspect the normalized architecture model"); architecture_inspect.set_defaults(fn=cmd_architecture_inspect)
     architecture_discover = architecture_sub.add_parser("discover"); architecture_discover.set_defaults(fn=cmd_architecture_discover)
     architecture_fitness = architecture_sub.add_parser("fitness", help="run configured architecture dependency rules"); architecture_fitness.add_argument("--workdir"); architecture_fitness.set_defaults(fn=cmd_architecture_fitness)
     show = sub.add_parser("show"); show.add_argument("id", nargs="?", help="task id to show full detail for; omit to dump the whole workflow state"); show.set_defaults(fn=cmd_show)
@@ -7887,7 +8798,7 @@ def main() -> int:
         # is still printed either way; only the exit status changes, so a
         # caller reading stdout is unaffected while `if !`/`&&`/`set -e` now
         # behave the way any shell author would assume.
-        if isinstance(output, dict) and args.fn in {cmd_verify, cmd_qa_run, cmd_design_validate, cmd_contract_verify, cmd_delivery_check, cmd_architecture_fitness} and not output.get("passed"):
+        if isinstance(output, dict) and args.fn in {cmd_verify, cmd_qa_run, cmd_design_validate, cmd_contract_verify, cmd_contract_check, cmd_delivery_check, cmd_architecture_fitness, cmd_architecture_validate} and not output.get("passed"):
             return 1
         return 0
     except EngineError as exc:

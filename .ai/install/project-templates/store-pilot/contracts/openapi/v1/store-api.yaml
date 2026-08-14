@@ -1,0 +1,34 @@
+openapi: 3.1.0
+info:
+  title: Store API
+  version: 1.0.0
+x-contract:
+  provider: backend
+  consumers: [frontend]
+  compatibility: backward-compatible
+paths:
+  /stores:
+    post:
+      operationId: createStore
+      responses:
+        "201":
+          description: Store created
+components:
+  schemas:
+    CreateStoreRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+    Store:
+      type: object
+      required: [id, name, status]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        status:
+          type: string
+          enum: [active]

@@ -199,6 +199,8 @@ class VisualizerPayloadKeysTests(unittest.TestCase):
         index = (REPO_ROOT / ".visualizer" / "index.html").read_text(encoding="utf-8")
         self.assertIn("data.c4", app)
         self.assertIn("renderC4Canvas", app)
+        self.assertIn("c4ProfileText(item.profile)", app)
+        self.assertIn("<div class=\"ib-k\">Profile</div>", app)
         for level in ("1", "2", "3"):
             self.assertIn(f'data-c4-level="{level}"', index)
 

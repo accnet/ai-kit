@@ -1,7 +1,0 @@
----
-alwaysApply: true
----
-
-Read and follow `AGENTS.md`. It is the canonical source for the v2 workflow
-engine, planning gates, local skill routing, state lifecycle, and verification.
-Do not duplicate or override its rules in Cursor-specific instructions.

@@ -1,0 +1,35 @@
+# Truth Registry points to canonical authorities; it is not an authority itself.
+schema_version: 1
+topics:
+  architecture:
+    authority: .ai-config/architecture.json
+    kind: config
+    required: true
+  modules:
+    authority: .ai-config/contexts.yaml
+    kind: config
+    required: true
+  api:
+    authority: .ai-config/contracts.json
+    kind: contract-registry
+    required: true
+  events:
+    authority: .ai-config/contracts.json
+    kind: contract-registry
+    required: true
+  database:
+    authority: migrations
+    kind: migrations
+    required: false
+  decisions:
+    authority: .ai/memory
+    kind: decisions
+    required: true
+  implementation:
+    authority: .
+    kind: source
+    required: true
+  tests:
+    authority: tests
+    kind: tests
+    required: false

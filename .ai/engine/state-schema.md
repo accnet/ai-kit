@@ -401,6 +401,24 @@ systems, containers, context mappings, and relationships. The resulting C4
 L1-L3 graph is a field of the existing architecture artifact, not a thirteenth
 payload or a new source of truth.
 
+Project-owned `truth.yaml` is a schema-version-1 registry of `topics`, each
+with a project-relative `authority`, `kind`, and `required` flag. It is a
+resolver map only; the referenced architecture, contexts, contracts,
+decisions, migrations, source, and tests remain authoritative. Project-owned
+`architecture.json` may also contain `profiles`, keyed by `default` or a known
+system/container/context reference. A profile combines any of the independent
+`domain`, `organization`, `dependency`, and `deployment` dimensions.
+`architecture validate` checks truth existence, graph references, mappings,
+and profile values without producing gate evidence. `verify` repeats the
+architecture-model portion and records it in deterministic QA evidence.
+
+`context resolve` returns context-package schema version 1. Its L0-L3
+references carry path, source kind, reason, existence/pattern state, byte size,
+and estimated tokens. The package also records direct/dependency/excluded
+contexts, contract refs, selection metrics, and optional explanation trace.
+It is a read-only execution input embedded by `route`; it is not workflow
+state, evidence, or a fourteenth project artifact.
+
 Project-owned `delivery.json` defines the integration branch, optional
 pre-integration commands, and an optional non-authoritative local CI
 approximation (for example `act`). `delivery attest` verifies commit reachability,

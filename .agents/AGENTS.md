@@ -34,7 +34,6 @@ thin entry points and must not duplicate or override these rules:
 
 - GitHub: `.github/workflows/gates.yml` runs portable validation in CI.
 - GitHub Copilot: `.github/copilot-instructions.md` directs Copilot here.
-- Cursor: `.cursor/rules/ai-kit.mdc` applies this file to every workspace task.
 - Claude Code: `CLAUDE.md` and `.claude/commands/` direct Claude here.
 
 All tools use the same control plane, local skills, state schema, and gates.

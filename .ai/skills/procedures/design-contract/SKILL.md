@@ -4,10 +4,10 @@ description: Design versioned API, event, schema, and interface contracts. Use w
 ---
 
 # INPUTS
-- Approved boundary, provider, consumer, current contract registry, and compatibility policy.
+- Approved boundary, provider, consumer, resolved context package, current contract registry, and compatibility policy.
 
 # PRECONDITIONS
-- Confirm the boundary and participating services exist; inspect any active contract version.
+- Resolve architecture/API truth topics, confirm the boundary and participating services exist, and inspect any active contract version.
 
 # ACTIONS
 - Inspect contract consumers and providers.

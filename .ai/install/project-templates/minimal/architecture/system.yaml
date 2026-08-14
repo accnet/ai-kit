@@ -1,0 +1,9 @@
+schema_version: 1
+purpose: Human-readable topology companion for the project architecture model.
+machine_authority: .ai-config/architecture.json
+truth_registry: .ai-config/truth.yaml
+systems: []
+containers: []
+notes:
+  - Add systems and containers to .ai-config/architecture.json first.
+  - Keep this document aligned with that model and link major choices to ADRs.

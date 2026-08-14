@@ -1,0 +1,7 @@
+schema_version: 1
+architecture_version: 0.1.0
+compatibility:
+  policy: semantic-versioning
+  breaking_change_requires: ADR and migration plan
+machine_authority: .ai-config/architecture.json
+truth_registry: .ai-config/truth.yaml

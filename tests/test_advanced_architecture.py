@@ -70,6 +70,7 @@ class AdvancedArchitectureTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertEqual(result["checks"][0]["violations"][0]["to"], "src/database/models.py")
         self.assertIn("_architecture_fitness(run_root)", inspect.getsource(ai_kit.cmd_verify))
+        self.assertIn("_architecture_model_diagnostics()", inspect.getsource(ai_kit.cmd_verify))
 
     def test_c4_projection_contains_three_levels(self) -> None:
         observation = ai_kit._architecture_observation("observed", "config", ["contexts.yaml"], confidence=1.0)

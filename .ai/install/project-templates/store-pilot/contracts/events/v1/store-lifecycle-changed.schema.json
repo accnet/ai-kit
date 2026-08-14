@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/contracts/events/v1/store-lifecycle-changed.schema.json",
+  "title": "StoreLifecycleChanged",
+  "type": "object",
+  "required": ["event_id", "store_id", "status"],
+  "properties": {
+    "event_id": {"type": "string"},
+    "store_id": {"type": "string"},
+    "status": {"type": "string", "enum": ["active"]}
+  },
+  "additionalProperties": false
+}

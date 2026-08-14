@@ -26,7 +26,7 @@ PROJECT_OWNED_CONFIGS = ("contexts.yaml", "epics.yaml")
 EXPECTED_CONFIGS = {
     "automation.yaml", "contexts.yaml", "epics.yaml", "kit.yaml",
     "registry.yaml", "rules.yaml", "runners.yaml", "design-policy.json", "contracts.json", "delivery.json",
-    "architecture.json", "architecture-fitness.json",
+    "architecture.json", "architecture-fitness.json", "truth.yaml",
 }
 
 
@@ -47,6 +47,13 @@ def run_capture(command, *, cwd=None):
 class InstallConfigTests(unittest.TestCase):
     def test_source_repository_has_no_project_config_directory(self) -> None:
         self.assertFalse((REPO_ROOT / ".ai-config").exists())
+
+    def test_cursor_adapter_is_not_shipped(self) -> None:
+        self.assertFalse((REPO_ROOT / ".cursor").exists())
+        self.assertFalse((REPO_ROOT / ".ai" / "install" / "templates" / ".cursor").exists())
+        for path in (REPO_ROOT / "AGENTS.md", REPO_ROOT / ".ai" / "install" / "AGENTS.md"):
+            with self.subTest(document=path):
+                self.assertNotIn("Cursor", path.read_text(encoding="utf-8"))
 
     def test_templates_are_the_complete_canonical_seed_set(self) -> None:
         self.assertEqual({p.name for p in TEMPLATE_CONFIG.iterdir() if p.is_file()}, EXPECTED_CONFIGS)
@@ -99,6 +106,24 @@ class InstallConfigTests(unittest.TestCase):
                 cwd=project,
             )
             self.assertEqual(validated.returncode, 0, validated.stderr)
+
+    def test_installed_project_can_create_store_pilot_from_shipped_templates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            installed = run_capture(
+                ["bash", str(REPO_ROOT / ".ai" / "install" / "install.sh"), "--target", str(project)],
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            scaffolded = run_capture(
+                [sys.executable, ".ai/engine/ai_kit.py", "scaffold", "store-pilot"],
+                cwd=project,
+            )
+            self.assertEqual(scaffolded.returncode, 0, scaffolded.stderr)
+            self.assertTrue((project / "architecture" / "VERSION.yaml").is_file())
+            self.assertFalse((project / "architecture" / "truth.yaml").exists())
+            self.assertTrue((project / "contracts" / "generated" / "sdk" / "contracts.ts").is_file())
+            self.assertTrue((project / "worker" / "store_lifecycle.py").is_file())
 
     def test_automation_seed_has_manual_roles_with_valid_runner_models(self) -> None:
         """A fresh install must not dispatch QA/review until enabled, and its

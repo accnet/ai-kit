@@ -4,10 +4,10 @@ description: Assess project boundaries, dependencies, C4 structure, and design-p
 ---
 
 # INPUTS
-- Project artifact bundle, context registry, source discovery, design policy, and decisions.
+- Resolved L0-L3 context package, project artifact bundle, context registry, source discovery, design policy, and decisions.
 
 # PRECONDITIONS
-- Read the current artifact manifest and identify the requested architectural boundary.
+- Resolve the architecture authority, read the current artifact manifest, and identify the requested architectural boundary.
 
 # ACTIONS
 - Inspect canonical sources and classify every finding as observed, inferred, or proposed.
@@ -18,7 +18,7 @@ description: Assess project boundaries, dependencies, C4 structure, and design-p
 - Architecture assessment or decision proposal with classified observations and risks.
 
 # VALIDATION
-- Run artifact validation and design-policy validation; ensure proposed relationships do not enter active gating.
+- Run architecture and artifact validation plus design-policy validation; ensure proposed relationships do not enter active gating.
 
 # FORBIDDEN
 - Do not present an inference as observed, modify business implementation, approve design exceptions, or create lifecycle verdicts.

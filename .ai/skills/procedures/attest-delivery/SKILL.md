@@ -4,7 +4,7 @@ description: Attest that a reviewed task is present in an integration commit. Us
 ---
 
 # INPUTS
-- Review-approved task, integration commit SHA, delivery configuration, and current QA/review/design/contract evidence.
+- Review-approved task, resolved delivery context, integration commit SHA, delivery configuration, and current QA/review/design/contract evidence.
 
 # PRECONDITIONS
 - Confirm the integration commit exists and is reachable from the configured integration branch.

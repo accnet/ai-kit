@@ -4,5 +4,13 @@
   "external_systems": [],
   "containers": [],
   "context_mappings": {},
-  "relationships": []
+  "relationships": [],
+  "profiles": {
+    "default": {
+      "domain": "simple",
+      "organization": "layered",
+      "dependency": "none",
+      "deployment": "monolith"
+    }
+  }
 }

@@ -4,13 +4,13 @@ description: Create a bounded, dependency-aware task plan. Use for requirements 
 ---
 
 # INPUTS
-- User request, project context snapshot, existing workflow, and relevant decisions.
+- User request, resolved L0-L3 context package, project context snapshot, existing workflow, and relevant decisions.
 
 # PRECONDITIONS
 - Identify a user goal, a project root, and the role that owns each proposed task.
 
 # ACTIONS
-- Inspect canonical requirements and affected boundaries.
+- Resolve truth topics and inspect only the canonical requirements and affected boundaries selected by the context package.
 - Decompose work into independently verifiable tasks with explicit dependencies.
 - State acceptance criteria, declared file scope, contract references, and assumptions.
 - Produce or update a plan draft through the control-plane command.

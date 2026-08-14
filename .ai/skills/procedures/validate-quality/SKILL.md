@@ -4,7 +4,7 @@ description: Produce deterministic quality evidence from an implementation task.
 ---
 
 # INPUTS
-- Implementation-complete task, current worktree, configured verification commands, and current governance baseline.
+- Implementation-complete task, resolved verification context, current worktree, configured verification commands, and current governance baseline.
 
 # PRECONDITIONS
 - Ensure the task is implementation-complete and its worktree and evidence inputs are current.

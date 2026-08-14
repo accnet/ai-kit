@@ -28,6 +28,13 @@ python .ai/engine/ai_kit.py transition T1 reject --actor qa --detail "Ceiling co
 python .ai/engine/ai_kit.py update-task T1 --add-acceptance "Bird hitting the ceiling ends the game" --actor qa
 python .ai/engine/ai_kit.py verify T1
 python .ai/engine/ai_kit.py context add ordering --path "src/ordering/*" --owner backend
+python .ai/engine/ai_kit.py context resolve "change order tax" --explain
+python .ai/engine/ai_kit.py context resolve --task T1
+python .ai/engine/ai_kit.py truth resolve architecture
+python .ai/engine/ai_kit.py architecture validate
+python .ai/engine/ai_kit.py architecture inspect
+python .ai/engine/ai_kit.py scaffold minimal
+python .ai/engine/ai_kit.py scaffold store-pilot
 python .ai/engine/ai_kit.py runner add local --command 'true {prompt}' --description "Local test runner"
 python .ai/engine/ai_kit.py runner list
 python .ai/engine/ai_kit.py add-task T3 --title "Ship order API" --owner backend --phase build --acceptance "..." --context ordering --epic checkout-revamp
@@ -106,6 +113,44 @@ tracked raw working-tree diff; it refreshes after a commit, configuration edit, 
 tracked source edit. Use `analyze --refresh` when relevant untracked files
 have been added. The route response includes `project_context` and places the
 snapshot path first in its minimal `context` list.
+
+`truth resolve <topic>` reads schema-version-1 `.ai-config/truth.yaml` and
+returns the canonical project authority for that topic. The registry is only
+a map: it does not copy architecture, contract, migration, source, decision,
+or test content into workflow state. Project-relative paths are mandatory.
+
+`architecture validate` checks required Truth Registry authorities, C4 entity
+and relationship references, context-to-container mappings, and architecture
+profiles. Profiles combine independent `domain`, `organization`, `dependency`,
+and `deployment` dimensions per default/system/container/context.
+`architecture inspect` returns the validated normalized C4/profile model;
+both commands are read-only and only `artifact generate` publishes it.
+`verify` includes the same model checks before architecture fitness, so an
+invalid profile or graph reference cannot receive authoritative QA pass.
+
+`context resolve <request>` (or `--task T<n>`) returns a schema-version-1
+minimum-sufficient context package without reading source bodies. L0 identifies
+authorities and task metadata, L1 direct scope, L2 upstream contexts/contracts/
+related tests, and L3 architecture decisions and governance. `--level` caps
+the package and `--explain` (also `context explain`) includes deterministic
+token matches and selection reasons. Metrics are reference/file byte estimates,
+not claims about hallucination reduction. `route` embeds this same package in
+runner handoffs, so procedures consume one resolver rather than independently
+scanning the repository.
+
+When the context registry is empty, a bounded Bootstrap Exception may return
+only configured source roots (or existing conventional roots such as `src`,
+`frontend`, `backend`, and `worker`) at L1 to establish first boundaries. It
+never returns `.` or recursively enumerates the repository; bootstrap discovery
+does not become architecture authority. Register contexts before normal work.
+
+`contract diff <id> <from> <to>` compares normalized versions produced by
+`contract import`; `contract check` turns supported breaking findings into a
+major-version, `supersedes`, and compatibility-declaration gate. Arbitrary
+manually registered sources are reported as inconclusive instead of being
+misclassified as compatible. `scaffold minimal` creates human architecture
+companions, while `scaffold store-pilot` also seeds a Create Store contract and
+frontend/backend/worker reference boundary; both leave lifecycle state alone.
 
 `artifact generate` is the only publisher of project observation data. It
 normalizes workflow, project configuration, contract registry, evidence, Git,

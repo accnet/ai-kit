@@ -29,7 +29,7 @@ CONFIG_TEMPLATE_ROOT="$AI_ROOT/install/config"
 PROJECT_ROOT="$(cd "$AI_ROOT/.." && pwd)"
 SOURCES=()
 DESTINATIONS=()
-CONFIG_FILES=(runners.yaml automation.yaml registry.yaml contexts.yaml epics.yaml rules.yaml kit.yaml design-policy.json contracts.json delivery.json architecture.json architecture-fitness.json)
+CONFIG_FILES=(runners.yaml automation.yaml registry.yaml contexts.yaml epics.yaml rules.yaml kit.yaml design-policy.json contracts.json delivery.json architecture.json architecture-fitness.json truth.yaml)
 
 add_entry() {
   SOURCES+=("$1")

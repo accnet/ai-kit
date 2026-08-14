@@ -4,7 +4,7 @@ description: Make safe, reversible database schema and data changes. Use for mig
 ---
 
 # INPUTS
-- Approved migration task, confirmed target database, schema contract, and rollout constraints.
+- Approved migration task, resolved database context, confirmed target database, schema contract, and rollout constraints.
 
 # PRECONDITIONS
 - Identify the actual target host/port or container; have a tested rollback; obtain explicit confirmation for destructive work.

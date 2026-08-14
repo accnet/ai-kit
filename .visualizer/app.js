@@ -908,6 +908,10 @@
     };
 
     // ── RENDER CANVAS ─────────────────────────────────────────
+    function c4ProfileText(profile) {
+      return Object.entries(profile || {}).map(([dimension, value]) => `${dimension}: ${value}`).join(' · ');
+    }
+
     function renderC4Canvas() {
       const source = c4Level === '1' ? c4Data.systems : c4Level === '2' ? c4Data.containers : c4Data.components;
       if (!source.length) return false;
@@ -924,10 +928,10 @@
         archSvg.appendChild(path);
       });
       source.forEach(item => {
-        const card = document.createElement('div'), point = positions[item.id], classification = item.observation?.classification || 'observed';
+        const card = document.createElement('div'), point = positions[item.id], classification = item.observation?.classification || 'observed', profile = c4ProfileText(item.profile);
         card.className = `node-card c4-node node-observation-${classification}${selectedC4Id===item.id?' selected':''}`;
         card.dataset.mod = item.id; card.style.left = point.x+'px'; card.style.top = point.y+'px';
-        card.innerHTML = `<div class="node-top"><span class="chip-status bg-cyan">C4 L${c4Level}</span><span class="mod-src-tag" style="margin-left:auto">${classification}</span></div><div class="node-name">${escapeHtml(item.name||item.id)}</div><div class="node-path">${escapeHtml(item.technology||item.owner||item.type||'')}</div><div class="obs-label obs-${classification}">${escapeHtml(item.description||'')}</div>`;
+        card.innerHTML = `<div class="node-top"><span class="chip-status bg-cyan">C4 L${c4Level}</span><span class="mod-src-tag" style="margin-left:auto">${classification}</span></div><div class="node-name">${escapeHtml(item.name||item.id)}</div><div class="node-path">${escapeHtml(item.technology||item.owner||item.type||'')}</div>${profile?`<div class="node-path c4-profile">${escapeHtml(profile)}</div>`:''}<div class="obs-label obs-${classification}">${escapeHtml(item.description||'')}</div>`;
         card.addEventListener('click', () => { selectedC4Id=item.id; renderCanvas(); renderInspector(); });
         nodesLayer.appendChild(card);
       });
@@ -1081,7 +1085,7 @@
     function renderInspector() {
       if (activeView === 'architecture' && selectedC4Id && c4Level !== 'modules') {
         const item = [...(c4Data.systems||[]), ...(c4Data.containers||[]), ...(c4Data.components||[])].find(value=>value.id===selectedC4Id);
-        if (item) { inspBody.innerHTML = `<div class="ib"><div class="ib-k">C4 element</div><div class="ib-v">${escapeHtml(item.name||item.id)}</div></div><div class="ib"><div class="ib-k">Level</div><div class="ib-v">${escapeHtml(c4Level)}</div></div><div class="ib ib-full"><div class="ib-k">Description</div><div class="ib-v">${escapeHtml(item.description||'—')}</div></div>`; return; }
+        if (item) { const profile = c4ProfileText(item.profile) || '—'; inspBody.innerHTML = `<div class="ib"><div class="ib-k">C4 element</div><div class="ib-v">${escapeHtml(item.name||item.id)}</div></div><div class="ib"><div class="ib-k">Level</div><div class="ib-v">${escapeHtml(c4Level)}</div></div><div class="ib ib-full"><div class="ib-k">Profile</div><div class="ib-v">${escapeHtml(profile)}</div></div><div class="ib ib-full"><div class="ib-k">Description</div><div class="ib-v">${escapeHtml(item.description||'—')}</div></div>`; return; }
       }
       if (currentTab === 'risks') {
         const risks = risksData.items || [];

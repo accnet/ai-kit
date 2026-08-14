@@ -40,11 +40,34 @@ Import a schema-first contract and generate DTOs plus test mocks:
 ```bash
 python .ai/engine/ai_kit.py contract import contracts/openapi.yaml --owner architect --output src/generated/contracts --language typescript
 python .ai/engine/ai_kit.py contract codegen order-api 1.0.0 --output src/generated/contracts --language typescript
+python .ai/engine/ai_kit.py contract diff order-api 1.0.0 2.0.0
+python .ai/engine/ai_kit.py contract check order-api 1.0.0 2.0.0
 ```
 
 OpenAPI, AsyncAPI, Protobuf, and Prisma sources are normalized into immutable
 AI-Kit contract versions. Generated outputs are hashed into the contract
 registry, so `contract verify` and authoritative QA detect drift.
+
+`contract diff` and `contract check` add deterministic compatibility evidence
+for versions created by `contract import`: they detect removed operations,
+schemas/fields, optional-to-required changes, type/reference changes, and enum
+narrowing. A breaking diff requires an explicit `breaking` declaration,
+`supersedes` link, and major version bump. Manually registered formats return
+an explicit **inconclusive** result rather than a false semantic verdict; use a
+configured external verifier for those formats.
+
+For a new project, start with an opt-in scaffold instead of copying a sample
+domain into every installation:
+
+```bash
+python .ai/engine/ai_kit.py scaffold minimal
+python .ai/engine/ai_kit.py scaffold store-pilot
+```
+
+`minimal` adds human-readable `architecture/` companions (version, topology,
+ADR, and plan convention) while keeping `.ai-config/truth.yaml` as the one
+truth registry. `store-pilot` additionally seeds a Create Store OpenAPI/event
+boundary, generated SDK/mocks, and small frontend/backend/worker examples.
 
 Move a governed task through worker `start`/`complete`, authoritative
 `qa run`, `review submit`/`review apply`, and `delivery attest`/`delivery close`;
@@ -91,7 +114,12 @@ Generate and inspect the read-only project architecture projection with:
 python .ai/engine/ai_kit.py artifact generate
 python .ai/engine/ai_kit.py artifact validate
 python .ai/engine/ai_kit.py artifact show architecture
+python .ai/engine/ai_kit.py truth resolve architecture
+python .ai/engine/ai_kit.py architecture validate
+python .ai/engine/ai_kit.py architecture inspect
 python .ai/engine/ai_kit.py architecture fitness
+python .ai/engine/ai_kit.py context resolve "change order tax" --explain
+python .ai/engine/ai_kit.py context resolve --task T1
 python .ai/engine/ai_kit.py visualizer serve --host 127.0.0.1 --port 8080
 ```
 
@@ -108,6 +136,18 @@ Configure declared systems, external systems, containers, mappings, and
 relationships in `.ai-config/architecture.json`. Configure dependency rules
 and optional executable ArchUnit/Dep-Guard commands in
 `.ai-config/architecture-fitness.json`; `verify` runs them automatically.
+`.ai-config/truth.yaml` only maps topics to those canonical authorities; it
+does not duplicate their contents. Architecture profiles are independent
+dimensions (`domain`, `organization`, `dependency`, `deployment`) and may be
+assigned to a system, container, or bounded context instead of forcing one
+project-wide style. `context resolve` turns these authorities, task scope,
+upstream contexts, contracts, tests, policies, and decisions into an explained
+L0-L3 minimum-sufficient reference package with byte/token estimates.
+When no context exists yet, the Bootstrap Exception returns only configured or
+existing conventional source roots at L1, never a repository-wide source dump;
+register the first contexts before implementation continues.
+`verify` also validates the architecture model itself before running fitness
+functions, so invalid graph references or profiles block QA.
 
 ```json
 {
@@ -224,7 +264,7 @@ external dependencies (no PyYAML required).
 Copy this repository's `.ai/` directory into the target project root (so the
 project ends up with a top-level `.ai/` folder), then run the installer from
 inside that project. It materializes root-level adapter files (`AGENTS.md`,
-`CLAUDE.md`, `.cursor/`, etc.) from `.ai/install/templates/` and
+`CLAUDE.md`, GitHub/Copilot adapters, etc.) from `.ai/install/templates/` and
 seeds `.ai-config/` from `.ai/install/config/`, without touching the kit's
 `.ai-work` session state:
 

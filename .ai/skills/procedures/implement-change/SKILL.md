@@ -4,13 +4,13 @@ description: Implement a scoped task in an isolated worktree. Use for backend, f
 ---
 
 # INPUTS
-- Assigned task, declared file scope, approved contract references, policy skills, and selected technology packs.
+- Assigned task, resolved minimum-sufficient context package, declared file scope, approved contract references, policy skills, and selected technology packs.
 
 # PRECONDITIONS
 - Hold a valid worker lease; dependencies and required contracts must be runnable.
 
 # ACTIONS
-- Read the task handoff and selected procedure, policy, and technology entrypoints.
+- Read the task handoff context package and selected procedure, policy, and technology entrypoints; load no unrelated repository areas.
 - Implement only the accepted scope in the assigned worktree.
 - Add or update focused tests and record implementation completion through the allowed worker transition.
 

@@ -1,0 +1,16 @@
+schema_version: 1
+purpose: Create Store pilot topology; the executable model is .ai-config/architecture.json.
+machine_authority: .ai-config/architecture.json
+truth_registry: .ai-config/truth.yaml
+systems:
+  - Store Pilot
+containers:
+  - Frontend (TypeScript)
+  - Store API (Python)
+  - Store Worker (Python)
+  - PostgreSQL
+  - Redis
+relationships:
+  - Frontend uses Store API through contracts/openapi/v1/store-api.yaml.
+  - Store API persists the Store aggregate and emits StoreLifecycleChanged.
+  - Store Worker consumes StoreLifecycleChanged.

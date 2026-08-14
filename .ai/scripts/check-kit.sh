@@ -10,7 +10,7 @@ ok() { printf '  ok   %s\n' "$1"; }
 
 [[ -f .ai/engine/ai_kit.py ]] || bad ".ai/engine/ai_kit.py missing"
 [[ -f .ai/engine/state-schema.md ]] || bad ".ai/engine/state-schema.md missing"
-for adapter in .github/copilot-instructions.md .github/workflows/gates.yml .cursor/rules/ai-kit.mdc .agents/AGENTS.md .githooks/pre-commit CLAUDE.md; do
+for adapter in .github/copilot-instructions.md .github/workflows/gates.yml .agents/AGENTS.md .githooks/pre-commit CLAUDE.md; do
   [[ -s "$adapter" ]] || bad "$adapter missing or empty"
 done
 
