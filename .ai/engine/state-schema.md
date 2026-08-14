@@ -360,6 +360,22 @@ and configured generators/verifiers remain tool-agnostic shell commands.
 Task refs use `defines|implements|consumes|verifies` and are emitted in
 `.ai-work/artifacts/project/contracts.json` alongside `represents` edges.
 
+`contract import` accepts OpenAPI, AsyncAPI, Protobuf, and Prisma sources and
+writes a normalized schema-version-1 draft under
+`.ai-contracts/imported/<id>/<version>.json`. The registry records import
+format/source hash. Built-in `contract codegen` writes TypeScript or Python
+DTOs/interfaces and optional mocks, then records every output hash in the
+existing `generated_output_hashes` convergence contract.
+
+Project-owned `architecture-fitness.json` is schema version 1 with `rules`
+(`forbid-dependency` source/target glob arrays) and optional executable
+`commands`. `architecture fitness` is read-only; `verify` embeds its checks,
+so failures flow into QA evidence without giving the validator lifecycle
+authority. Project-owned `architecture.json` declares C4 systems, external
+systems, containers, context mappings, and relationships. The resulting C4
+L1-L3 graph is a field of the existing architecture artifact, not a thirteenth
+payload or a new source of truth.
+
 Project-owned `delivery.json` defines the integration branch, optional
 pre-integration commands, and an optional non-authoritative local CI
 approximation (for example `act`). `delivery attest` verifies commit reachability,

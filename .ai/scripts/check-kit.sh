@@ -25,7 +25,7 @@ while IFS= read -r tech; do
   for doc in overview patterns best-practices pitfalls examples; do
     [[ -s "$tech/$doc.md" ]] || bad "$tech/$doc.md missing or empty"
   done
-done < <(find .ai/skills -mindepth 2 -maxdepth 2 -type d | sort)
+done < <(find .ai/skills -type f -name skill.meta.yaml ! -path '.ai/skills/core/*' -print | sed 's#/skill.meta.yaml$##' | sort)
 
 for skill in .ai/skills/core/*; do
   [[ -d "$skill" ]] || continue

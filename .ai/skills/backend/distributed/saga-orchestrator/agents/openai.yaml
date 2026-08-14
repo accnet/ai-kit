@@ -1,0 +1,4 @@
+interface:
+  display_name: "Saga Orchestrator"
+  short_description: "Design compensating distributed transactions"
+  default_prompt: "Use $saga-orchestrator to design an orchestrated saga with compensation."

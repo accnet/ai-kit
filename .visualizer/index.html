@@ -123,6 +123,11 @@
     <section class="center">
       <!-- Toolbar chips -->
       <div class="canvas-bar" id="canvasBar">
+        <button class="chip" data-c4-level="1">C4 L1</button>
+        <button class="chip on" data-c4-level="2">C4 L2</button>
+        <button class="chip" data-c4-level="3">C4 L3</button>
+        <button class="chip" data-c4-level="modules">Modules</button>
+        <div class="chip-sep"></div>
         <button class="chip on" data-chip="deps">Deps</button>
         <button class="chip on" data-chip="labels">Labels</button>
         <button class="chip" data-chip="heatmap">Heatmap</button>
@@ -187,13 +192,8 @@
         </table>
       </div>
 
-      <!-- DAG view: task-dependency graph from dag.json, deliberately kept
-           as its own standalone page (not a layer on the Architecture
-           canvas below, which graphs contexts/modules, not tasks) so each
-           answers one question without the other's controls in the way. -->
       <div class="view-panel" id="viewDag" style="padding:0;">
-        <iframe src="dag.html" title="Task dependency DAG"
-                style="width:100%; height:100%; border:0; display:block;"></iframe>
+        <div id="dagMount" class="dag-mount" aria-label="Task dependency DAG"></div>
       </div>
 
       <!-- CANVAS (Architecture view) -->
@@ -273,6 +273,7 @@
   </div>
 
   <!-- ═══════════ SCRIPT ═══════════ -->
+  <script src="dag-view.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

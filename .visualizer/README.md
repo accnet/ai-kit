@@ -29,11 +29,19 @@ Các tab có ý nghĩa:
 
 - **Project**: identity, stack, freshness, Git, ownership, risk, evidence.
 - **Architecture**: contexts, modules, dependency/ownership graph và provenance.
+- **Architecture C4**: chuyển giữa System Context, Containers, Components và
+  module graph từ trường `architecture.json.data.c4` canonical.
 - **Contracts**: lifecycle và `represents/implements/consumes/verifies` graph.
 - **Evolution**: board projection từ `tasks.json`.
 - **Runtime**: assignment và gate/evidence state.
 - **Replay**: cửa sổ tối đa 200 lifecycle event từ `events.json`.
 - **DAG**: waves, ready set, critical path và dependency unlock state.
+
+`dag-view.js` là renderer DAG dùng chung. Dashboard chuyển `dag.json` đã tải
+từ canonical bundle vào renderer, nên chuyển tab hay refresh không tạo thêm
+một loader độc lập. `dag.html` chỉ là compatibility shell (canonical-first,
+legacy fallback) và cũng gọi cùng renderer. Deep-link dùng
+`#view=dag&task=T1`; selection của DAG đồng bộ với inspector của dashboard.
 
 Observation luôn có label và line style riêng: `observed` nét liền,
 `inferred` nét đứt, `proposed` nét chấm. Proposed edge chỉ hiển thị; nó không

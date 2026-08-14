@@ -114,7 +114,7 @@ class DagBrowserTests(unittest.TestCase):
         payload = json.loads((cls.serve_dir / "dag.json").read_text(encoding="utf-8"))
         cls.payload = payload
         assert len(payload["tasks"]) == 6, payload
-        for page in ("dag.html", "index.html", "app.js", "style.css"):
+        for page in ("dag.html", "dag-view.js", "index.html", "app.js", "style.css"):
             (cls.serve_dir / page).write_bytes((REPO_ROOT / ".visualizer" / page).read_bytes())
 
         handler = type("Handler", (QuietHandler,), {"directory": str(cls.serve_dir)})
@@ -286,12 +286,21 @@ class DagBrowserTests(unittest.TestCase):
             self.assertEqual(page.locator(".node").count(), len(self.payload["tasks"]))
             self.assertEqual(filled(), 6, "returning to live should restore T0 to done")
 
-    def test_dag_tab_in_index_html_loads_the_page(self) -> None:
+    def test_dag_tab_in_index_html_mounts_the_shared_renderer(self) -> None:
         with self.page_at("index.html") as (page, errors):
             page.click('.view-tab[data-view="dag"]')
             page.wait_for_timeout(600)
-            frame = page.frame_locator("#viewDag iframe")
-            self.assertEqual(frame.locator(".node").count(), len(self.payload["tasks"]))
+            self.assertEqual(page.locator("#viewDag .node").count(), len(self.payload["tasks"]))
+            self.assertEqual([e for e in errors if is_real_error(e)], [])
+
+    def test_dag_deep_link_and_selection_sync_with_dashboard_inspector(self) -> None:
+        with self.page_at("index.html#view=dag&task=T1") as (page, errors):
+            self.assertEqual(page.locator("#viewDag .node.selected").count(), 1)
+            self.assertIn("T1", page.locator("#selCard").inner_text())
+            page.click('#viewDag .node[data-id="T2"]')
+            page.wait_for_timeout(100)
+            self.assertIn("task=T2", page.url)
+            self.assertIn("T2", page.locator("#selCard").inner_text())
             self.assertEqual([e for e in errors if is_real_error(e)], [])
 
 

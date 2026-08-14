@@ -13,7 +13,9 @@ Keep these v2 contracts stable:
 
 - `.ai/agents/<role>/` is a six-document role contract: `role.md`, `input.md`,
   `rules.md`, `prompt.md`, `checklist.md`, and `output.md`.
-- `.ai/skills/<domain>/<technology>/` is curated technology knowledge with
+- `.ai/skills/<domain>/<technology>/` (or
+  `.ai/skills/<domain>/<family>/<technology>/` for a named family such as
+  `backend/distributed`) is curated technology knowledge with
   `overview.md`, `patterns.md`, `best-practices.md`, `pitfalls.md`, and
   `examples.md`.
 - `.ai/workflows/<intent>/workflow.md` defines the delivery path.
@@ -115,8 +117,11 @@ the engine actually writes.
 | Execution Contract Builder | Self-contained JSON handoff for a dispatched task (owner, acceptance, routing, instructions) | written by `ai-kit dispatch` / `dispatch-ready` / `pipeline` to `.ai-work/handoffs/<task-id>.json` |
 | Runtime Observer | Append-only audit history plus a bounded replay projection | `.ai-work/logs/events.jsonl`; `ai-kit artifact generate` -> `.ai-work/artifacts/project/events.json` |
 | Scheduler Advisor | What can run now vs. what is blocked and why | `ai-kit ready`, `ai-kit blocked`, `ai-kit dispatch-ready` |
-| Architecture / Module Graph | Versioned projection of contexts, modules, ownership, provenance, and dependency edges | `ai-kit artifact generate` -> `.ai-work/artifacts/project/architecture.json` |
+| Architecture / C4 / Module Graph | Versioned C4 L1-L3 projection plus contexts, modules, ownership, provenance, and dependency edges | `ai-kit artifact generate` -> `.ai-work/artifacts/project/architecture.json` |
 | Architecture Discovery | Read-only scan of the source tree for feature modules (NestJS/React/Python/generic) and internal import-based dependency edges, never mutating or publishing project state | `ai-kit architecture discover` |
+| Architecture Fitness | Configured dependency rules and executable fitness commands, also enforced by verify/QA | `ai-kit architecture fitness` |
+| Schema Contract Importer | Normalizes OpenAPI, AsyncAPI, Protobuf, or Prisma into a draft Contract Spine version | `ai-kit contract import` |
+| Contract DTO/Mock Generator | Generates typed interfaces and contract mocks with output hashes recorded for convergence checks | `ai-kit contract codegen` |
 | Artifact Validator | Integrity, schema, cross-reference, freshness, and observation checks without lifecycle authority | `ai-kit artifact validate` |
 
 This map only lists capabilities with a working command behind them today. A
@@ -187,6 +192,13 @@ a rationale; proposed facts cite a proposer/decision and never participate in
 impact, ownership, QA, or dependency gates. Promotion requires changing a
 canonical source and regenerating. `artifact validate` checks these rules but
 cannot create evidence or advance lifecycle state.
+
+The C4 projection remains inside `architecture.json`; it is not a new artifact
+or authority. Declared systems, containers, external systems, and relationships
+come from project-owned `architecture.json`; registered bounded contexts are
+projected as C4 components. Project-owned `architecture-fitness.json` defines
+dependency rules and optional executable fitness commands. Both
+`architecture fitness` and `verify` run them, so violations block QA.
 
 ### Required Runtime Evidence
 

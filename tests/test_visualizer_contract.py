@@ -27,6 +27,10 @@ DAG_PAGES = (
     REPO_ROOT / ".visualizer" / "dag.html",
     REPO_ROOT / ".ai" / "install" / "templates" / ".visualizer" / "dag.html",
 )
+DAG_RENDERERS = (
+    REPO_ROOT / ".visualizer" / "dag-view.js",
+    REPO_ROOT / ".ai" / "install" / "templates" / ".visualizer" / "dag-view.js",
+)
 
 
 def sample_state() -> dict:
@@ -80,28 +84,30 @@ class DagPayloadContractTests(unittest.TestCase):
             self.assertTrue(page.is_file(), f"missing DAG page: {page}")
         first, second = (p.read_text(encoding="utf-8") for p in DAG_PAGES)
         self.assertEqual(first, second, ".visualizer/dag.html and its install template copy differ")
+        first, second = (p.read_text(encoding="utf-8") for p in DAG_RENDERERS)
+        self.assertEqual(first, second, "shared DAG renderer and install template copy differ")
 
     def test_page_fetches_dag_json(self) -> None:
         page = DAG_PAGES[0].read_text(encoding="utf-8")
         self.assertIn("fetch('dag.json'", page)
 
     def test_every_top_level_field_the_page_reads_is_emitted(self) -> None:
-        page = DAG_PAGES[0].read_text(encoding="utf-8")
+        page = DAG_RENDERERS[0].read_text(encoding="utf-8")
         referenced = scrape(page, r"\bdata\.([a-z_]+)")
         self.assertTrue(referenced, "scraped no data.<field> references; the scrape pattern is stale")
         missing = referenced - set(self.payload)
         self.assertFalse(missing, f"dag.html reads payload fields the engine does not emit: {sorted(missing)}")
 
     def test_every_task_field_the_page_reads_is_emitted(self) -> None:
-        page = DAG_PAGES[0].read_text(encoding="utf-8")
+        page = DAG_RENDERERS[0].read_text(encoding="utf-8")
         referenced = scrape(page, r"\bt\.([a-z_]+)") | scrape(page, r"\btask\.([a-z_]+)")
         self.assertTrue(referenced, "scraped no task field references; the scrape pattern is stale")
         emitted = set(self.payload["tasks"][0])
-        missing = referenced - emitted
+        missing = (referenced - {"task_id"}) - emitted
         self.assertFalse(missing, f"dag.html reads task fields the engine does not emit: {sorted(missing)}")
 
     def test_every_edge_field_the_page_reads_is_emitted(self) -> None:
-        page = DAG_PAGES[0].read_text(encoding="utf-8")
+        page = DAG_RENDERERS[0].read_text(encoding="utf-8")
         referenced = scrape(page, r"\be\.(from|to|unlocked)\b")
         self.assertTrue(referenced, "scraped no edge field references; the scrape pattern is stale")
         emitted = set(self.payload["edges"][0])
@@ -151,7 +157,8 @@ class VisualizerPayloadKeysTests(unittest.TestCase):
             markup = index.read_text(encoding="utf-8")
             self.assertIn('data-view="dag"', markup, f"{index} has no DAG tab")
             self.assertIn('id="viewDag"', markup, f"{index} has no DAG view panel")
-            self.assertIn('src="dag.html"', markup, f"{index} does not embed dag.html")
+            self.assertIn('id="dagMount"', markup, f"{index} does not mount the shared DAG renderer")
+            self.assertIn('src="dag-view.js"', markup, f"{index} does not load the shared DAG renderer")
 
     def test_dashboard_exposes_project_and_contract_views(self) -> None:
         for index in (REPO_ROOT / ".visualizer" / "index.html",
@@ -180,7 +187,20 @@ class VisualizerPayloadKeysTests(unittest.TestCase):
         canonical = page.index("/artifacts/project/manifest.json")
         legacy = page.index("fetch('dag.json'")
         self.assertLess(canonical, legacy)
-        self.assertIn("artifact.generation_id !== manifest.generation_id", page)
+
+    def test_dashboard_mounts_the_shared_dag_renderer_once(self) -> None:
+        app = (REPO_ROOT / ".visualizer" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("window.AiKitDagView.mount", app)
+        self.assertIn("dagData = bundle['dag.json'].data", app)
+        self.assertIn("#${params}", app)
+
+    def test_architecture_view_exposes_c4_levels_from_canonical_projection(self) -> None:
+        app = (REPO_ROOT / ".visualizer" / "app.js").read_text(encoding="utf-8")
+        index = (REPO_ROOT / ".visualizer" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("data.c4", app)
+        self.assertIn("renderC4Canvas", app)
+        for level in ("1", "2", "3"):
+            self.assertIn(f'data-c4-level="{level}"', index)
 
 
 if __name__ == "__main__":

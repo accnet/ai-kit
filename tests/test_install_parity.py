@@ -26,6 +26,7 @@ PROJECT_OWNED_CONFIGS = ("contexts.yaml", "epics.yaml")
 EXPECTED_CONFIGS = {
     "automation.yaml", "contexts.yaml", "epics.yaml", "kit.yaml",
     "registry.yaml", "rules.yaml", "runners.yaml", "design-policy.json", "contracts.json", "delivery.json",
+    "architecture.json", "architecture-fitness.json",
 }
 
 

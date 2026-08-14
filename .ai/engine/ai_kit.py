@@ -102,11 +102,14 @@ CONFIG_FILES = {
     "design-policy.json",
     "contracts.json",
     "delivery.json",
+    "architecture.json",
+    "architecture-fitness.json",
 }
 TASK_KINDS = {"general", "contract", "implementation", "integration"}
 CONTRACT_RELATIONS = {"defines", "implements", "consumes", "verifies"}
 CONTRACT_KINDS = {"domain", "api", "event", "schema", "interface"}
 CONTRACT_STATUSES = {"draft", "proposed", "approved", "active", "deprecated", "removed"}
+CONTRACT_IMPORT_FORMATS = {"openapi", "asyncapi", "protobuf", "prisma"}
 STATUSES = ("todo", "in-progress", "implementation-complete", "qa-passed", "review-approved", "done", "blocked", "superseded", "cancelled")
 # Statuses that satisfy a downstream `needs`/plan dependency. `superseded`
 # and `cancelled` are terminal-but-not-`done`: the work was deliberately
@@ -2210,6 +2213,38 @@ def _evidence_artifact(state_file: Path, state: dict | None) -> dict:
     return {"items": items, "counts": {"total": len(items), "current": sum(1 for item in items if item["current"]), "stale": sum(1 for item in items if not item["current"])}}
 
 
+def _c4_projection(contexts: list[dict]) -> dict:
+    config = _load_json_config("architecture.json", {"schema_version": 1, "systems": [], "external_systems": [], "containers": [], "context_mappings": {}, "relationships": []})
+    if config.get("schema_version") != 1:
+        raise EngineError("architecture.json must use schema_version 1")
+    systems = list(config.get("systems") or [])
+    if not systems:
+        kit_path = _config_path("kit.yaml")
+        kit_text = kit_path.read_text(encoding="utf-8") if kit_path.exists() else ""
+        kit_id = _schema_scalar(kit_text, "id") or ROOT.name
+        systems = [{"id": f"system:{_contract_identifier(kit_id)}", "name": kit_id, "description": "Project software system"}]
+    external = list(config.get("external_systems") or [])
+    containers = list(config.get("containers") or [])
+    default_system = systems[0]["id"]
+    if not containers:
+        containers = [{"id": "container:application", "name": "Application", "technology": None, "system_ref": default_system, "description": "Default application container"}]
+    default_container = containers[0]["id"]
+    mappings = config.get("context_mappings") or {}
+    observation = _architecture_observation("observed", "config", [".ai-config/architecture.json"], confidence=1.0)
+    normalized_systems = [{**item, "type": "external-system" if item in external else "software-system", "observation": observation} for item in systems + external]
+    normalized_containers = [{**item, "system_ref": item.get("system_ref") or default_system, "observation": observation} for item in containers]
+    components = [{"id": f"component:{item['name']}", "name": item["name"], "description": item.get("path"), "owner": item.get("owner"), "container_ref": mappings.get(item["name"]) or default_container, "context_ref": item["id"], "observation": item["observation"]} for item in contexts]
+    relationships = []
+    for index, item in enumerate(config.get("relationships") or [], 1):
+        relationships.append({"id": item.get("id") or f"c4-relation:configured:{index}", "from": item.get("from"), "to": item.get("to"), "description": item.get("description"), "technology": item.get("technology"), "observation": observation})
+    context_by_ref = {item["id"]: item for item in contexts}
+    for item in contexts:
+        for target in item.get("depends_on", []):
+            if target in context_by_ref:
+                relationships.append({"id": f"c4-relation:{item['name']}>{context_by_ref[target]['name']}", "from": f"component:{item['name']}", "to": f"component:{context_by_ref[target]['name']}", "description": "depends on", "technology": None, "observation": item["observation"]})
+    return {"levels": {"1": {"name": "System Context", "nodes": [item["id"] for item in normalized_systems]}, "2": {"name": "Containers", "nodes": [item["id"] for item in normalized_containers]}, "3": {"name": "Components", "nodes": [item["id"] for item in components]}}, "systems": normalized_systems, "containers": normalized_containers, "components": components, "relationships": relationships}
+
+
 def _architecture_artifacts(state: dict | None) -> tuple[dict, dict, dict, list[dict], dict]:
     discovery = _discovered_architecture_with_tasks(state)
     workflow_id = state.get("workflow_id") if state else None
@@ -2307,6 +2342,7 @@ def _architecture_artifacts(state: dict | None) -> tuple[dict, dict, dict, list[
         })
     architecture = {
         "contexts": contexts,
+        "c4": _c4_projection(contexts),
         "module_refs": [item["id"] for item in modules],
         "dependency_refs": [item["id"] for item in dependency_items],
         "active_dependency_refs": [item["id"] for item in dependency_items if item.get("active")],
@@ -2579,6 +2615,24 @@ def _validate_artifact_payloads(payloads: dict[str, dict], manifest: dict | None
             raise EngineError(f"{context.get('id')}: unknown context dependency")
         if set(context.get("module_refs", [])) - module_ids:
             raise EngineError(f"{context.get('id')}: unknown module reference")
+    c4 = architecture.get("c4") or {}
+    c4_system_ids = unique_ids(c4.get("systems", []), "C4 systems")
+    c4_container_ids = unique_ids(c4.get("containers", []), "C4 containers")
+    c4_component_ids = unique_ids(c4.get("components", []), "C4 components")
+    c4_node_ids = c4_system_ids | c4_container_ids | c4_component_ids
+    for item in c4.get("systems", []) + c4.get("containers", []) + c4.get("components", []):
+        _validate_architecture_observation(item.get("observation"), str(item.get("id")))
+    for item in c4.get("containers", []):
+        if item.get("system_ref") not in c4_system_ids:
+            raise EngineError(f"{item.get('id')}: unknown C4 system reference")
+    for item in c4.get("components", []):
+        if item.get("container_ref") not in c4_container_ids or item.get("context_ref") not in context_ids:
+            raise EngineError(f"{item.get('id')}: unknown C4 container/context reference")
+    unique_ids(c4.get("relationships", []), "C4 relationships")
+    for relation in c4.get("relationships", []):
+        _validate_architecture_observation(relation.get("observation"), str(relation.get("id")))
+        if relation.get("from") not in c4_node_ids or relation.get("to") not in c4_node_ids:
+            raise EngineError(f"{relation.get('id')}: unknown C4 relationship endpoint")
     if proposed_ids.intersection(architecture.get("active_dependency_refs", [])):
         raise EngineError("proposed dependencies cannot participate in active architecture")
     expected_active = {edge["id"] for edge in dependencies if edge.get("active")}
@@ -3858,7 +3912,7 @@ def cmd_route(args: argparse.Namespace) -> dict:
         folder = skill_root / domain
         if not folder.exists():
             continue
-        domain_candidates.extend(sorted(path for path in folder.iterdir() if path.is_dir()))
+        domain_candidates.extend(sorted(path.parent for path in folder.rglob("skill.meta.yaml")))
 
     stack_skills = _load_stack_skills()
     for skill_dir in domain_candidates:
@@ -4709,6 +4763,234 @@ def _contract_record(args: argparse.Namespace, existing: dict | None = None) -> 
         "lifecycle_history": record.get("lifecycle_history", []),
     })
     return record
+
+
+def _schema_scalar(text: str, key: str) -> str | None:
+    match = re.search(rf"(?m)^\s*{re.escape(key)}\s*:\s*['\"]?([^\n#'\"]+)", text)
+    return match.group(1).strip() if match else None
+
+
+def _load_schema_source(path: Path) -> tuple[dict | None, str]:
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".json" or text.lstrip().startswith(("{", "[")):
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise EngineError(f"invalid JSON schema source: {exc}") from exc
+        if not isinstance(value, dict):
+            raise EngineError("schema source must contain an object")
+        return value, text
+    try:
+        import yaml  # type: ignore
+        value = yaml.safe_load(text)
+        if isinstance(value, dict):
+            return value, text
+    except (ImportError, ValueError, TypeError):
+        pass
+    return None, text
+
+
+def _detect_contract_import_format(path: Path, document: dict | None, text: str, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    if document and "openapi" in document:
+        return "openapi"
+    if document and "asyncapi" in document:
+        return "asyncapi"
+    suffix = path.suffix.lower()
+    if suffix == ".proto" or re.search(r"(?m)^\s*syntax\s*=\s*['\"]proto", text):
+        return "protobuf"
+    if suffix == ".prisma" or re.search(r"(?m)^\s*(model|enum)\s+\w+\s*\{", text):
+        return "prisma"
+    if re.search(r"(?m)^\s*openapi\s*:", text):
+        return "openapi"
+    if re.search(r"(?m)^\s*asyncapi\s*:", text):
+        return "asyncapi"
+    raise EngineError("cannot detect schema format; use --format openapi|asyncapi|protobuf|prisma")
+
+
+def _json_schema_fields(schema: dict) -> list[dict]:
+    required = set(schema.get("required") or [])
+    fields = []
+    for name, value in (schema.get("properties") or {}).items():
+        if not isinstance(value, dict):
+            value = {}
+        fields.append({"name": name, "type": value.get("type") or ("array" if "items" in value else "object"), "format": value.get("format"), "required": name in required, "ref": value.get("$ref")})
+    return fields
+
+
+def _yaml_component_schemas(text: str) -> dict:
+    """Parse the bounded OpenAPI/AsyncAPI schema subset needed for DTOs.
+
+    This keeps the engine dependency-free when PyYAML is unavailable; unknown
+    YAML constructs remain in the source hash but are not guessed into types.
+    """
+    schemas: dict[str, dict] = {}; in_components = in_schemas = False
+    current_schema = current_field = None; in_properties = False
+    for raw in text.splitlines():
+        stripped = raw.strip(); indent = len(raw) - len(raw.lstrip(" "))
+        if not stripped or stripped.startswith("#"): continue
+        if indent == 0:
+            in_components = stripped == "components:"; in_schemas = False; current_schema = None
+            continue
+        if in_components and indent == 2:
+            in_schemas = stripped == "schemas:"; current_schema = None
+            continue
+        if not in_schemas: continue
+        schema_match = re.match(r"^\s{4}([A-Za-z_][\w.-]*):\s*$", raw)
+        if schema_match:
+            current_schema = schema_match.group(1); schemas[current_schema] = {"properties": {}, "required": []}; in_properties = False; continue
+        if not current_schema: continue
+        if indent == 6 and stripped == "properties:": in_properties = True; continue
+        if indent == 6 and stripped.startswith("required:"):
+            inline = stripped.split(":", 1)[1].strip()
+            if inline.startswith("[") and inline.endswith("]"):
+                schemas[current_schema]["required"] = [value.strip().strip("'\"") for value in inline[1:-1].split(",") if value.strip()]
+            in_properties = False; continue
+        if indent == 8 and stripped.startswith("- "):
+            schemas[current_schema]["required"].append(stripped[2:].strip("'\"")); continue
+        field_match = re.match(r"^\s{8}([A-Za-z_][\w.-]*):\s*$", raw) if in_properties else None
+        if field_match:
+            current_field = field_match.group(1); schemas[current_schema]["properties"][current_field] = {}; continue
+        value_match = re.match(r"^\s{10}(type|format|\$ref):\s*['\"]?([^#'\"]+)", raw) if current_field else None
+        if value_match:
+            schemas[current_schema]["properties"][current_field][value_match.group(1)] = value_match.group(2).strip()
+    return schemas
+
+
+def _normalize_imported_contract(fmt: str, document: dict | None, text: str, source: Path) -> dict:
+    normalized = {"schema_version": 1, "source_format": fmt, "source": display_path(source), "source_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "definitions": [], "operations": [], "events": [], "models": []}
+    if fmt in {"openapi", "asyncapi"}:
+        info = (document or {}).get("info") or {}
+        normalized["name"] = info.get("title") or _schema_scalar(text, "title") or source.stem
+        normalized["source_version"] = info.get("version") or _schema_scalar(text, "version")
+        schemas = (((document or {}).get("components") or {}).get("schemas") or {}) if document else _yaml_component_schemas(text)
+        for name, schema in schemas.items():
+            normalized["definitions"].append({"name": name, "fields": _json_schema_fields(schema if isinstance(schema, dict) else {})})
+        if document:
+            if fmt == "openapi":
+                for route, path_item in (document.get("paths") or {}).items():
+                    if not isinstance(path_item, dict): continue
+                    for method, operation in path_item.items():
+                        if method.lower() not in {"get","post","put","patch","delete","options","head"}: continue
+                        normalized["operations"].append({"id": (operation or {}).get("operationId") or f"{method}:{route}", "method": method.upper(), "path": route})
+            else:
+                for channel, item in (document.get("channels") or {}).items():
+                    if not isinstance(item, dict): continue
+                    for direction in ("publish", "subscribe"):
+                        if direction in item:
+                            operation = item[direction] or {}
+                            normalized["events"].append({"id": operation.get("operationId") or f"{direction}:{channel}", "channel": channel, "direction": direction})
+        else:
+            if fmt == "openapi":
+                current = None
+                for line in text.splitlines():
+                    route = re.match(r"^\s{2}(/[^:]+):\s*$", line)
+                    if route: current = route.group(1); continue
+                    method = re.match(r"^\s{4}(get|post|put|patch|delete):\s*$", line, re.I)
+                    if current and method: normalized["operations"].append({"id": f"{method.group(1).lower()}:{current}", "method": method.group(1).upper(), "path": current})
+            else:
+                for match in re.finditer(r"(?m)^\s{2}([^\s:][^:]*):\s*$", text):
+                    normalized["events"].append({"id": f"channel:{match.group(1)}", "channel": match.group(1), "direction": "unspecified"})
+    elif fmt == "protobuf":
+        normalized["name"] = re.search(r"(?m)^\s*package\s+([\w.]+)\s*;", text).group(1) if re.search(r"(?m)^\s*package\s+([\w.]+)\s*;", text) else source.stem
+        normalized["source_version"] = None
+        for match in re.finditer(r"(?ms)^\s*message\s+(\w+)\s*\{(.*?)^\s*\}", text):
+            fields = [{"name": f.group(2), "type": f.group(1), "required": False, "number": int(f.group(3))} for f in re.finditer(r"(?m)^\s*(?:repeated\s+)?([\w.<>]+)\s+(\w+)\s*=\s*(\d+)\s*;", match.group(2))]
+            normalized["definitions"].append({"name": match.group(1), "fields": fields})
+        for service in re.finditer(r"(?ms)^\s*service\s+(\w+)\s*\{(.*?)^\s*\}", text):
+            for rpc in re.finditer(r"rpc\s+(\w+)\s*\(([^)]+)\)\s*returns\s*\(([^)]+)\)", service.group(2)):
+                normalized["operations"].append({"id": f"{service.group(1)}.{rpc.group(1)}", "request": rpc.group(2).strip(), "response": rpc.group(3).strip()})
+    else:
+        normalized["name"] = source.stem; normalized["source_version"] = None
+        for match in re.finditer(r"(?ms)^\s*(model|enum)\s+(\w+)\s*\{(.*?)^\s*\}", text):
+            fields = []
+            for line in match.group(3).splitlines():
+                field = re.match(r"\s*(\w+)\s+([\w\[\]?]+)", line)
+                if field: fields.append({"name": field.group(1), "type": field.group(2), "required": not field.group(2).endswith("?")})
+            normalized["models"].append({"kind": match.group(1), "name": match.group(2), "fields": fields})
+    return normalized
+
+
+def _contract_identifier(value: str) -> str:
+    identifier = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return identifier or "imported-contract"
+
+
+def _code_type(value: str, language: str) -> str:
+    key = str(value or "object").rstrip("?")
+    if language == "python":
+        return {"string":"str","integer":"int","number":"float","boolean":"bool","array":"list[Any]","object":"dict[str, Any]","Int":"int","String":"str","Boolean":"bool","Float":"float","DateTime":"str","Json":"dict[str, Any]"}.get(key, key)
+    return {"string":"string","integer":"number","number":"number","boolean":"boolean","array":"unknown[]","object":"Record<string, unknown>","Int":"number","String":"string","Boolean":"boolean","Float":"number","DateTime":"string","Json":"Record<string, unknown>"}.get(key, key)
+
+
+def _builtin_contract_codegen(contract_id: str, version_name: str, output: Path, language: str, mocks: bool) -> list[Path]:
+    registry = _load_contract_registry(); _contract, version = _contract_version(registry, contract_id, version_name)
+    source = _registry_contract_path(version)
+    try: payload = json.loads(source.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc: raise EngineError("built-in codegen requires a contract imported by 'contract import'") from exc
+    definitions = list(payload.get("definitions") or []) + list(payload.get("models") or [])
+    output.mkdir(parents=True, exist_ok=True); written = []
+    if language == "typescript":
+        lines = ["// Generated by AI-Kit. Do not edit."]
+        for item in definitions:
+            lines.append(f"export interface {item['name']} {{")
+            for field in item.get("fields", []): lines.append(f"  {field['name']}{'' if field.get('required') else '?'}: {_code_type(field.get('type'), language)};")
+            lines.append("}\n")
+        dto = output / "contracts.ts"; dto.write_text("\n".join(lines) + "\n", encoding="utf-8"); written.append(dto)
+        if mocks:
+            names = ", ".join(item["name"] for item in definitions)
+            imports = f"import type {{ {names} }} from './contracts';\n" if names else ""
+            mock = output / "mocks.ts"; mock.write_text("// Generated by AI-Kit. Replace values in test setup only.\n" + imports + "\n".join(f"export const mock{item['name']}: {item['name']} = {{}} as {item['name']};" for item in definitions) + "\n", encoding="utf-8"); written.append(mock)
+    else:
+        lines = ["# Generated by AI-Kit. Do not edit.", "from typing import Any, TypedDict", ""]
+        for item in definitions:
+            lines.append(f"class {item['name']}(TypedDict, total=False):")
+            lines.extend([f"    {field['name']}: {_code_type(field.get('type'), language)}" for field in item.get("fields", [])] or ["    pass"]); lines.append("")
+        dto = output / "contracts.py"; dto.write_text("\n".join(lines), encoding="utf-8"); written.append(dto)
+        if mocks:
+            mock = output / "mocks.py"; mock.write_text("# Generated by AI-Kit.\n" + "\n".join(f"mock_{item['name'].lower()}: dict = {{}}" for item in definitions) + "\n", encoding="utf-8"); written.append(mock)
+    for path in written:
+        relative = path.relative_to(ROOT).as_posix() if path.is_relative_to(ROOT) else str(path.resolve())
+        version.setdefault("generated_output_hashes", {})[relative] = _sha256_required_file(path)
+    _write_json_config("contracts.json", registry)
+    return written
+
+
+def cmd_contract_import(args: argparse.Namespace) -> dict:
+    source = Path(args.source).resolve()
+    if not source.is_file(): raise EngineError(f"schema source not found: {source}")
+    document, text = _load_schema_source(source)
+    fmt = _detect_contract_import_format(source, document, text, args.format)
+    normalized = _normalize_imported_contract(fmt, document, text, source)
+    contract_id = args.id or _contract_identifier(str(normalized.get("name") or source.stem))
+    version_name = args.version or str(normalized.get("source_version") or "1.0.0")
+    try: _semver(version_name)
+    except EngineError: version_name = "1.0.0"
+    destination = ROOT / ".ai-contracts" / "imported" / contract_id / f"{version_name}.json"
+    registry = _load_contract_registry()
+    existing = registry["contracts"].get(contract_id)
+    existing_version = (existing or {}).get("versions", {}).get(version_name)
+    if existing_version and existing_version.get("status") not in {"draft", "proposed"}:
+        raise EngineError("approved/active contract content is immutable; import a new semantic version")
+    if (destination.exists() or existing_version) and not args.force:
+        raise EngineError(f"contract version already exists: {contract_id}@{version_name}")
+    _atomic_write_json(destination, normalized)
+    contract = existing or {"owner": args.owner, "kind": args.kind or ("event" if fmt == "asyncapi" else "schema" if fmt in {"protobuf","prisma"} else "api"), "represents": args.represents or normalized.get("name") or contract_id, "versions": {}}
+    record = {"path": destination.relative_to(ROOT).as_posix(), "status": "draft", "content_hash": _sha256_required_file(destination), "compatibility": "backward-compatible", "supersedes": None, "generators": [], "generated_output_hashes": {}, "lifecycle_history": [{"ts":now(),"from":None,"to":"draft","actor":args.actor,"detail":f"imported from {fmt}"}], "import": {"format":fmt,"source":str(source),"source_hash":normalized["source_hash"]}}
+    contract["versions"][version_name] = record; registry["contracts"][contract_id] = contract; _write_json_config("contracts.json", registry)
+    generated = []
+    if args.output:
+        generated = _builtin_contract_codegen(contract_id, version_name, Path(args.output).resolve(), args.language, not args.no_mocks)
+    _auto_generate_for_args(args)
+    return {"contract":contract_id,"version":version_name,"format":fmt,"path":display_path(destination),"generated":[display_path(path) for path in generated]}
+
+
+def cmd_contract_codegen(args: argparse.Namespace) -> dict:
+    output = Path(args.output).resolve()
+    written = _builtin_contract_codegen(args.id, args.version, output, args.language, not args.no_mocks)
+    _auto_generate_for_args(args)
+    return {"contract":args.id,"version":args.version,"language":args.language,"generated":[display_path(path) for path in written]}
 
 
 def cmd_contract_add(args: argparse.Namespace) -> dict:
@@ -5897,6 +6179,106 @@ def cmd_architecture_discover(args: argparse.Namespace) -> dict:
         state = load(state_path_value)
         validate(state)
     return _discovered_architecture_with_tasks(state)
+
+
+def _architecture_fitness_config() -> dict:
+    config = _load_json_config("architecture-fitness.json", {"schema_version": 1, "rules": [], "commands": []})
+    if config.get("schema_version") != 1 or not isinstance(config.get("rules"), list) or not isinstance(config.get("commands"), list):
+        raise EngineError("architecture-fitness.json must use schema_version 1 with rules/commands arrays")
+    for rule in config["rules"]:
+        if not isinstance(rule, dict) or not str(rule.get("id") or "").strip():
+            raise EngineError("every architecture fitness rule requires an id")
+        if rule.get("type", "forbid-dependency") != "forbid-dependency":
+            raise EngineError(f"unsupported architecture fitness rule type: {rule.get('type')}")
+        if not isinstance(rule.get("from"), list) or not isinstance(rule.get("to"), list):
+            raise EngineError(f"architecture fitness rule {rule['id']} requires from/to glob arrays")
+    return config
+
+
+def _architecture_source_files(root: Path) -> list[Path]:
+    configured = configured_source_dirs()
+    source_roots = [root / value for value in configured] if configured else [root]
+    files = []
+    for source_root in source_roots:
+        if not source_root.exists():
+            continue
+        for path in source_root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+                continue
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                continue
+            if any(part in DISCOVERY_IGNORE_DIRS for part in relative.parts):
+                continue
+            files.append(path)
+    return sorted(set(files))
+
+
+def _architecture_import_edges(root: Path) -> list[dict]:
+    files = _architecture_source_files(root)
+    lookup: dict[str, str] = {}
+    for path in files:
+        relative = path.relative_to(root).as_posix()
+        stem = relative[: -len(path.suffix)]
+        lookup[stem] = relative
+        if stem.endswith("/__init__") or stem.endswith("/index"):
+            lookup[stem.rsplit("/", 1)[0]] = relative
+    edges = []
+    for path in files:
+        relative = path.relative_to(root).as_posix()
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        specs = []
+        if path.suffix.lower() == ".py":
+            specs.extend(match.group(1) for match in re.finditer(r"(?m)^\s*from\s+([.\w]+)\s+import\s+", text))
+            specs.extend(match.group(1) for match in re.finditer(r"(?m)^\s*import\s+([\w.]+)", text))
+        else:
+            for match in re.finditer(r"(?:from\s*|import\s*)['\"]([^'\"]+)['\"]|require\(\s*['\"]([^'\"]+)['\"]\s*\)", text):
+                specs.append(match.group(1) or match.group(2))
+        for spec in specs:
+            if path.suffix.lower() == ".py":
+                leading = len(spec) - len(spec.lstrip(".")); module = spec.lstrip(".").replace(".", "/")
+                base = path.parent
+                for _ in range(max(0, leading - 1)):
+                    base = base.parent
+                try:
+                    candidate = ((base / module).relative_to(root).as_posix() if leading else module)
+                except ValueError:
+                    continue
+            elif spec.startswith("."):
+                try:
+                    candidate = os.path.normpath((path.parent / spec).relative_to(root)).replace("\\", "/")
+                except ValueError:
+                    continue
+            else:
+                candidate = spec
+            target = lookup.get(candidate) or next((value for key, value in lookup.items() if key.endswith("/" + candidate)), None)
+            if target and target != relative:
+                edges.append({"from": relative, "to": target, "import": spec})
+    unique = {(edge["from"], edge["to"], edge["import"]): edge for edge in edges}
+    return [unique[key] for key in sorted(unique)]
+
+
+def _architecture_fitness(root: Path) -> dict:
+    config = _architecture_fitness_config()
+    if not config["rules"] and not config["commands"]:
+        return {"schema_version": 1, "passed": True, "not_applicable": True, "files_scanned": 0, "dependency_edges": 0, "checks": []}
+    edges = _architecture_import_edges(root)
+    checks = []
+    for rule in config["rules"]:
+        violations = [edge for edge in edges if any(fnmatch.fnmatch(edge["from"], pattern) for pattern in rule["from"]) and any(fnmatch.fnmatch(edge["to"], pattern) for pattern in rule["to"])]
+        checks.append({"name": f"fitness:{rule['id']}", "rule_id": rule["id"], "status": "fail" if violations else "pass", "message": rule.get("message"), "violations": violations})
+    for command in config["commands"]:
+        if not isinstance(command, dict) or not str(command.get("command") or "").strip():
+            raise EngineError("architecture fitness commands require name and command")
+        run = _run_captured(str(command["command"]), shell=True, cwd=root)
+        checks.append({"name": f"fitness-command:{command.get('name') or 'unnamed'}", "command": command["command"], "status": "pass" if run.returncode == 0 else "fail", "exit_code": run.returncode, "stderr": run.stderr[-500:]})
+    return {"schema_version": 1, "passed": all(check["status"] == "pass" for check in checks), "not_applicable": not checks, "files_scanned": len(_architecture_source_files(root)), "dependency_edges": len(edges), "checks": checks}
+
+
+def cmd_architecture_fitness(args: argparse.Namespace) -> dict:
+    root = Path(getattr(args, "workdir", None) or ROOT).resolve()
+    return _architecture_fitness(root)
 
 
 def cmd_approve(args: argparse.Namespace) -> dict:
@@ -7229,6 +7611,17 @@ def cmd_verify(args: argparse.Namespace) -> dict:
             check["stderr"] = result.stderr[-500:] if result.stderr else ""
             report["passed"] = False
         report["checks"].append(check)
+    print("  Running architecture fitness functions...", file=sys.stderr)
+    fitness = _architecture_fitness(run_root)
+    report["checks"].append({
+        "name": "architecture-fitness",
+        "status": "skipped" if fitness.get("not_applicable") else "pass" if fitness.get("passed") else "fail",
+        "files_scanned": fitness.get("files_scanned"),
+        "dependency_edges": fitness.get("dependency_edges"),
+        "checks": fitness.get("checks", []),
+    })
+    if not fitness.get("passed"):
+        report["passed"] = False
     verdict = "PASS" if report["passed"] else ("INCONCLUSIVE" if report.get("inconclusive") else "FAIL")
     report["workdir"] = str(run_root)
     print(f"Verification {verdict}. Use 'ai-kit qa run {task['id']}' for authoritative QA.", file=sys.stderr)
@@ -7312,6 +7705,7 @@ def parser() -> argparse.ArgumentParser:
     design_validate = design_sub.add_parser("validate"); design_validate.add_argument("id"); design_validate.add_argument("--evidence"); design_validate.set_defaults(fn=cmd_design_validate)
     design_exception = design_sub.add_parser("exception"); design_exception.add_argument("id"); design_exception.add_argument("rule"); design_exception.add_argument("--reason", required=True); design_exception.add_argument("--actor", required=True); design_exception.add_argument("--decision"); design_exception.add_argument("--confirmed-by-user", action="store_true"); design_exception.set_defaults(fn=cmd_design_exception)
     contract = sub.add_parser("contract", help="contract registry and lifecycle"); contract_sub = contract.add_subparsers(dest="contract_command", required=True)
+    contract_import = contract_sub.add_parser("import", help="import OpenAPI, AsyncAPI, Protobuf, or Prisma schema"); contract_import.add_argument("source"); contract_import.add_argument("--format", choices=["auto", *sorted(CONTRACT_IMPORT_FORMATS)], default="auto"); contract_import.add_argument("--id"); contract_import.add_argument("--version"); contract_import.add_argument("--owner", default="architect"); contract_import.add_argument("--kind", choices=sorted(CONTRACT_KINDS)); contract_import.add_argument("--represents"); contract_import.add_argument("--output", help="also generate DTOs and mocks into this directory"); contract_import.add_argument("--language", choices=["typescript", "python"], default="typescript"); contract_import.add_argument("--no-mocks", action="store_true"); contract_import.add_argument("--force", action="store_true"); contract_import.add_argument("--actor", default="architect"); contract_import.set_defaults(fn=cmd_contract_import)
     contract_add = contract_sub.add_parser("add"); contract_add.add_argument("id"); contract_add.add_argument("version"); contract_add.add_argument("--owner", required=True); contract_add.add_argument("--kind", choices=sorted(CONTRACT_KINDS), required=True); contract_add.add_argument("--represents", required=True); contract_add.add_argument("--path", required=True); contract_add.add_argument("--compatibility", choices=["backward-compatible", "breaking"], default="backward-compatible"); contract_add.add_argument("--supersedes"); contract_add.add_argument("--actor", default="architect"); contract_add.set_defaults(fn=cmd_contract_add)
     contract_update = contract_sub.add_parser("update"); contract_update.add_argument("id"); contract_update.add_argument("version"); contract_update.add_argument("--path"); contract_update.add_argument("--represents"); contract_update.add_argument("--compatibility", choices=["backward-compatible", "breaking"]); contract_update.add_argument("--supersedes"); contract_update.set_defaults(fn=cmd_contract_update)
     contract_list = contract_sub.add_parser("list"); contract_list.set_defaults(fn=cmd_contract_list)
@@ -7321,6 +7715,7 @@ def parser() -> argparse.ArgumentParser:
     contract_generator = contract_sub.add_parser("generator"); contract_generator_sub = contract_generator.add_subparsers(dest="generator_command", required=True)
     contract_generator_add = contract_generator_sub.add_parser("add"); contract_generator_add.add_argument("id"); contract_generator_add.add_argument("version"); contract_generator_add.add_argument("--name", required=True); contract_generator_add.add_argument("--command", required=True); contract_generator_add.add_argument("--output", action="append", default=[]); contract_generator_add.add_argument("--verify-command"); contract_generator_add.set_defaults(fn=cmd_contract_generator_add)
     contract_generate = contract_sub.add_parser("generate"); contract_generate.add_argument("id"); contract_generate.add_argument("version"); contract_generate.add_argument("--generator"); contract_generate.set_defaults(fn=cmd_contract_generate)
+    contract_codegen = contract_sub.add_parser("codegen", help="generate built-in DTO/interface and contract mocks"); contract_codegen.add_argument("id"); contract_codegen.add_argument("version"); contract_codegen.add_argument("--output", required=True); contract_codegen.add_argument("--language", choices=["typescript", "python"], default="typescript"); contract_codegen.add_argument("--no-mocks", action="store_true"); contract_codegen.set_defaults(fn=cmd_contract_codegen)
     contract_verify = contract_sub.add_parser("verify"); contract_verify.add_argument("id"); contract_verify.add_argument("version"); contract_verify.set_defaults(fn=cmd_contract_verify)
     delivery = sub.add_parser("delivery", help="integration commit attestation"); delivery_sub = delivery.add_subparsers(dest="delivery_command", required=True)
     delivery_check = delivery_sub.add_parser("check"); delivery_check.add_argument("id"); delivery_check.add_argument("--commit", required=True); delivery_check.set_defaults(fn=cmd_delivery_check)
@@ -7361,6 +7756,7 @@ def parser() -> argparse.ArgumentParser:
     analyze = sub.add_parser("analyze"); analyze.add_argument("--refresh", action="store_true", help="rebuild the project context snapshot even when its fingerprint is valid"); analyze.set_defaults(fn=cmd_analyze)
     architecture = sub.add_parser("architecture"); architecture_sub = architecture.add_subparsers(dest="architecture_command", required=True)
     architecture_discover = architecture_sub.add_parser("discover"); architecture_discover.set_defaults(fn=cmd_architecture_discover)
+    architecture_fitness = architecture_sub.add_parser("fitness", help="run configured architecture dependency rules"); architecture_fitness.add_argument("--workdir"); architecture_fitness.set_defaults(fn=cmd_architecture_fitness)
     show = sub.add_parser("show"); show.add_argument("id", nargs="?", help="task id to show full detail for; omit to dump the whole workflow state"); show.set_defaults(fn=cmd_show)
     valid = sub.add_parser("validate"); valid.set_defaults(fn=lambda args: (validate(load(state_path(args.state))) or {"valid": True}))
     return root
@@ -7378,7 +7774,7 @@ def main() -> int:
         # is still printed either way; only the exit status changes, so a
         # caller reading stdout is unaffected while `if !`/`&&`/`set -e` now
         # behave the way any shell author would assume.
-        if isinstance(output, dict) and args.fn in {cmd_verify, cmd_qa_run, cmd_design_validate, cmd_contract_verify, cmd_delivery_check} and not output.get("passed"):
+        if isinstance(output, dict) and args.fn in {cmd_verify, cmd_qa_run, cmd_design_validate, cmd_contract_verify, cmd_delivery_check, cmd_architecture_fitness} and not output.get("passed"):
             return 1
         return 0
     except EngineError as exc:

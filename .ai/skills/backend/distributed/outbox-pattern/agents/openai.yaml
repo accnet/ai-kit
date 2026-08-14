@@ -1,0 +1,4 @@
+interface:
+  display_name: "Outbox Pattern"
+  short_description: "Design reliable database-backed event delivery"
+  default_prompt: "Use $outbox-pattern to design an atomic database and event publishing flow."

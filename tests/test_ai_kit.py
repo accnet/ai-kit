@@ -37,7 +37,14 @@ def bash_command(script: Path, *args: str) -> list[str]:
         if candidate.exists():
             executable = str(candidate)
     executable = executable or "bash"
-    script_arg = script.as_posix() if os.name == "nt" else str(script)
+    if os.name == "nt":
+        raw = str(script).replace("\\", "/")
+        drive = re.match(r"^([A-Za-z]):/(.*)$", raw)
+        # Git Bash accepts /c/Users/... consistently. C:/... works in some
+        # setups but fails when bash receives it through a Python subprocess.
+        script_arg = f"/{drive.group(1).lower()}/{drive.group(2)}" if drive else raw
+    else:
+        script_arg = str(script)
     return [executable, script_arg, *args]
 
 
@@ -1334,14 +1341,7 @@ class SkillMetadataTests(unittest.TestCase):
                        "documents", "entrypoint", "path")
 
     def _tech_dirs(self) -> list[Path]:
-        dirs = []
-        for domain_dir in self.SKILLS_ROOT.iterdir():
-            if not domain_dir.is_dir() or domain_dir.name == "core":
-                continue
-            for tech_dir in domain_dir.iterdir():
-                if tech_dir.is_dir():
-                    dirs.append(tech_dir)
-        return sorted(dirs)
+        return sorted(path.parent for path in self.SKILLS_ROOT.rglob("skill.meta.yaml") if "core" not in path.relative_to(self.SKILLS_ROOT).parts)
 
     def test_all_tech_skills_have_meta(self) -> None:
         missing = [d for d in self._tech_dirs() if not (d / "skill.meta.yaml").exists()]
@@ -1363,7 +1363,7 @@ class SkillMetadataTests(unittest.TestCase):
 
     def test_domain_matches_directory(self) -> None:
         for tech_dir in self._tech_dirs():
-            expected_domain = tech_dir.parent.name
+            expected_domain = tech_dir.relative_to(self.SKILLS_ROOT).parts[0]
             meta = (tech_dir / "skill.meta.yaml").read_text(encoding="utf-8")
             m = re.search(r"^domain:\s*['\"]?(\S+?)['\"]?\s*$", meta, re.MULTILINE)
             self.assertIsNotNone(m, f"{tech_dir.name}: domain field not found")
@@ -1388,16 +1388,12 @@ class SkillContentTests(unittest.TestCase):
 
     def _tech_docs(self) -> list[Path]:
         docs = []
-        for domain_dir in self.SKILLS_ROOT.iterdir():
-            if not domain_dir.is_dir() or domain_dir.name == "core":
+        for meta in self.SKILLS_ROOT.rglob("skill.meta.yaml"):
+            if "core" in meta.relative_to(self.SKILLS_ROOT).parts:
                 continue
-            for tech_dir in domain_dir.iterdir():
-                if not tech_dir.is_dir():
-                    continue
-                for doc in ("overview", "patterns", "best-practices", "pitfalls", "examples"):
-                    path = tech_dir / f"{doc}.md"
-                    if path.exists():
-                        docs.append(path)
+            for doc in ("overview", "patterns", "best-practices", "pitfalls", "examples"):
+                path = meta.parent / f"{doc}.md"
+                if path.exists(): docs.append(path)
         return sorted(docs)
 
     def test_no_placeholder_in_skill_docs(self) -> None:
@@ -1872,6 +1868,12 @@ class LocalScriptContractTests(unittest.TestCase):
 
     SCRIPTS = REPO_ROOT / ".ai" / "scripts"
 
+    def test_bash_command_uses_git_bash_drive_syntax_on_windows(self) -> None:
+        script = Path("C:/Users/Example/project/.ai/scripts/doctor.sh")
+        with mock.patch("os.name", "nt"):
+            command = bash_command(script)
+        self.assertEqual(command[1], "/c/Users/Example/project/.ai/scripts/doctor.sh")
+
     def test_python_selector_prefers_python_on_windows_shells(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             binary_dir = Path(directory)
@@ -1892,7 +1894,7 @@ class LocalScriptContractTests(unittest.TestCase):
             project = Path(directory) / "project"
             project.mkdir()
             shutil.copytree(REPO_ROOT / ".ai", project / ".ai")
-            shutil.copy2(REPO_ROOT / "AGENTS.md", project / "AGENTS.md")
+            shutil.copy2(REPO_ROOT / ".ai" / "install" / "AGENTS.md", project / "AGENTS.md")
             config = project / ".ai-config"
             config.mkdir()
             for name in ("kit.yaml", "rules.yaml", "registry.yaml"):

@@ -35,6 +35,17 @@ python .ai/engine/ai_kit.py delivery attest T3 --commit <integration-sha>
 python .ai/engine/ai_kit.py delivery close T3
 ```
 
+Import a schema-first contract and generate DTOs plus test mocks:
+
+```bash
+python .ai/engine/ai_kit.py contract import contracts/openapi.yaml --owner architect --output src/generated/contracts --language typescript
+python .ai/engine/ai_kit.py contract codegen order-api 1.0.0 --output src/generated/contracts --language typescript
+```
+
+OpenAPI, AsyncAPI, Protobuf, and Prisma sources are normalized into immutable
+AI-Kit contract versions. Generated outputs are hashed into the contract
+registry, so `contract verify` and authoritative QA detect drift.
+
 Move a governed task through worker `start`/`complete`, authoritative
 `qa run`, `review submit`/`review apply`, and `delivery attest`/`delivery close`;
 the engine rejects illegal transitions. All transitions are persisted
@@ -80,6 +91,7 @@ Generate and inspect the read-only project architecture projection with:
 python .ai/engine/ai_kit.py artifact generate
 python .ai/engine/ai_kit.py artifact validate
 python .ai/engine/ai_kit.py artifact show architecture
+python .ai/engine/ai_kit.py architecture fitness
 python .ai/engine/ai_kit.py visualizer serve --host 127.0.0.1 --port 8080
 ```
 
@@ -89,6 +101,27 @@ architecture, modules, dependencies, contracts, tasks, DAG, ownership, risks,
 Git, evidence, and replay events. It is a derived canonical projection, never
 lifecycle authority. `.visualizer/*.json` remains a generated compatibility
 mirror during this phase.
+
+The Architecture tab reads the C4 projection embedded in `architecture.json`
+and switches between System Context, Container, Component, and module views.
+Configure declared systems, external systems, containers, mappings, and
+relationships in `.ai-config/architecture.json`. Configure dependency rules
+and optional executable ArchUnit/Dep-Guard commands in
+`.ai-config/architecture-fitness.json`; `verify` runs them automatically.
+
+```json
+{
+  "schema_version": 1,
+  "rules": [{
+    "id": "no-presentation-database",
+    "type": "forbid-dependency",
+    "from": ["src/**/presentation/**"],
+    "to": ["src/**/database/**"],
+    "message": "Call the domain/application boundary"
+  }],
+  "commands": [{"name": "archunit", "command": "./gradlew archTest"}]
+}
+```
 
 The kit is tool-agnostic. `AGENTS.md` is the authoritative instruction file.
 
@@ -188,6 +221,8 @@ Both installers stop before replacing a different managed file. Use
   lifecycle, router, and audit events.
 - `.ai/agents/`: v2 role contracts, split into six concise documents.
 - `.ai/skills/`: technology reference material, grouped by domain.
+- `.ai/skills/backend/distributed/`: transactional outbox, saga orchestration,
+  and circuit-breaker/fallback guardrails routed by distributed-system terms.
 - `.ai/workflows/`: feature, bugfix, migration, release, and research paths.
 - `.ai/modules/`: gates and operating standards.
 - `.ai/scripts/`: v2 adapters for v1 bootstrap, scheduling, state, context,

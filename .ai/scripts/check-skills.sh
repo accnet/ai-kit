@@ -53,7 +53,8 @@ validate_technology_skill() {
   local rel="${folder#./}"
   local domain name meta path_field entrypoint_field docs_field status_field deprecated_field
 
-  domain="$(basename "$(dirname "$folder")")"
+  domain="${rel#.ai/skills/}"
+  domain="${domain%%/*}"
   name="$(basename "$folder")"
 
   for doc in overview patterns best-practices pitfalls examples; do
@@ -124,7 +125,7 @@ collect_core() {
 }
 
 collect_tech_all() {
-  find .ai/skills -mindepth 2 -maxdepth 2 -type d ! -path '.ai/skills/core/*' | sort
+  find .ai/skills -type f -name skill.meta.yaml ! -path '.ai/skills/core/*' -print | sed 's#/skill.meta.yaml$##' | sort
 }
 
 collect_tech_ai() {

@@ -35,7 +35,11 @@ ENGINE_DIR = REPO_ROOT / ".ai" / "engine"
 sys.path.insert(0, str(ENGINE_DIR))
 import ai_kit  # noqa: E402
 
-AGENTS_MD = REPO_ROOT / "AGENTS.md"
+# The root file is a convenience symlink in POSIX checkouts. Git for Windows
+# may materialize it as an inaccessible reparse point when symlink privilege
+# is unavailable, while the installer always copies this canonical template
+# as a regular project-root file.
+AGENTS_MD = REPO_ROOT / ".ai" / "install" / "AGENTS.md"
 MANDATORY_MARKER = "These concerns are mandatory when their trigger is present:"
 AI_MARKER = "AI trigger routing (registry-backed) is mandatory when matched by task content:"
 

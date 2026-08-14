@@ -1,0 +1,4 @@
+interface:
+  display_name: "Circuit Breaker and Fallback"
+  short_description: "Design dependency failure containment flows"
+  default_prompt: "Use $circuit-breaker-and-fallback to design resilient dependency handling."

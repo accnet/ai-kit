@@ -8,6 +8,7 @@
     let discovered = null; // discovered-architecture.json — optional, may not exist yet
     let discoveryWarnings = [];
     let architectureEdges = [];
+    let c4Data = {levels:{}, systems:[], containers:[], components:[], relationships:[]};
     let taskModuleMap = {};
     let projectData = {};
     let contractsData = {items:[], edges:[]};
@@ -15,6 +16,7 @@
     let risksData = {items:[]};
     let evidenceData = {items:[]};
     let taskItemsData = [];
+    let dagData = {tasks:[], edges:[], waves:0, ready:[], critical_path:[]};
     let gitData = {};
     let artifactManifest = null;
     let artifactMode = 'loading';
@@ -81,12 +83,14 @@
         // Commit only after the whole generation validates. A failed refresh
         // leaves the previous render intact until a complete manifest appears.
         artifactManifest = manifest;
+        c4Data = bundle['architecture.json'].data.c4 || c4Data;
         projectData = bundle['project.json'].data;
         contractsData = bundle['contracts.json'].data;
         ownershipData = bundle['ownership.json'].data;
         risksData = bundle['risks.json'].data;
         evidenceData = bundle['evidence.json'].data;
         taskItemsData = bundle['tasks.json'].data.items || [];
+        dagData = bundle['dag.json'].data;
         gitData = bundle['git.json'].data;
         board = bundle['tasks.json'].data.board;
         events = bundle['events.json'].data.events || [];
@@ -110,11 +114,12 @@
 
     async function loadLegacyArtifacts() {
       try {
-        const [b,a,im,ev,discoveryResponse] = await Promise.all([
+        const [b,a,im,ev,legacyDag,discoveryResponse] = await Promise.all([
           fetch('board.json').then(r=>r.json()),
           fetch('architecture.json').then(r=>r.json()),
           fetch('impact.json').then(r=>r.json()),
           fetch('events.json').then(r=>r.json()),
+          fetch('dag.json').then(r=>r.json()),
           fetch('discovered-architecture.json').catch(()=>null),
         ]);
         board = b; arch = a; impact = im; events = ev;
@@ -122,7 +127,7 @@
         architectureEdges = []; taskModuleMap = {};
         mergeDiscoveredArchitecture();
         projectData = {}; contractsData = {items:[],edges:[]}; ownershipData = {owners:{},unowned:[]}; taskItemsData = [];
-        risksData = {items:[]}; evidenceData = {items:[]}; gitData = {};
+        risksData = {items:[]}; evidenceData = {items:[]}; gitData = {}; dagData = legacyDag; c4Data = {levels:{},systems:[],containers:[],components:[],relationships:[]};
         artifactManifest = null; artifactMode = 'legacy'; hasLoaded = true;
         return true;
       } catch(error) {
@@ -171,6 +176,11 @@
 
     // ── STATE ──────────────────────────────────────────────────
     let selectedMod = null;
+    let selectedTaskId = null;
+    let selectedC4Id = null;
+    let c4Level = '2';
+    let activeView = 'project';
+    let dagView = null;
     let currentTab = 'info';
     let inspMini = false;
     let zoomScale = 1.0;
@@ -225,6 +235,7 @@
     const contractSummary = document.getElementById('contractSummary');
     const contractGraph = document.getElementById('contractGraph');
     const contractBody = document.getElementById('contractBody');
+    const dagMount = document.getElementById('dagMount');
 
     // ── HELPERS ────────────────────────────────────────────────
     const ownerColors = { backend: '#60a5fa', frontend: '#a78bfa', devops: '#2dd4bf', qa: '#f59e0b' };
@@ -425,15 +436,45 @@
     }
 
     // ── VIEW TABS ─────────────────────────────────────────────
-    document.querySelectorAll('.view-tab').forEach(tab => {
-      tab.addEventListener('click', () => {
-        document.querySelectorAll('.view-tab').forEach(t=>t.classList.remove('active'));
-        tab.classList.add('active');
-        document.querySelectorAll('.view-panel').forEach(p=>p.classList.remove('active'));
-        const id = 'view'+tab.dataset.view.charAt(0).toUpperCase()+tab.dataset.view.slice(1);
-        document.getElementById(id)?.classList.add('active');
+    function urlState() {
+      const params = new URLSearchParams(location.hash.replace(/^#/, ''));
+      return {view: params.get('view'), task: params.get('task')};
+    }
+    function writeUrlState() {
+      const params = new URLSearchParams();
+      params.set('view', activeView);
+      if (selectedTaskId) params.set('task', selectedTaskId);
+      history.replaceState(null, '', `#${params}`);
+    }
+    function renderDagTaskInspector(task) {
+      if (!task) return;
+      selCard.innerHTML = `<div class="sel-name">${escapeHtml(task.id)}</div><div class="sel-path">${escapeHtml(task.title)}</div>`;
+      inspBody.innerHTML = `<div class="ib"><div class="ib-k">Task</div><div class="ib-v">${escapeHtml(task.id)}</div></div><div class="ib"><div class="ib-k">Owner</div><div class="ib-v">${escapeHtml(task.owner)}</div></div><div class="ib"><div class="ib-k">Status</div><div class="ib-v">${escapeHtml(task.status)}</div></div><div class="ib ib-full"><div class="ib-k">Needs</div><div class="ib-v">${(task.needs||[]).map(escapeHtml).join(', ')||'None'}</div></div>`;
+    }
+    function ensureDagView() {
+      if (!dagMount || !window.AiKitDagView) return;
+      if (!dagView) dagView = window.AiKitDagView.mount(dagMount, {data:dagData,
+        selected:selectedTaskId,
+        onRefresh: async () => { await loadData(); renderAll(); },
+        onSelect: task => { selectedTaskId = task?.id || null; if (task) renderDagTaskInspector(task); writeUrlState(); },
       });
+      else dagView.setData(dagData);
+      if (selectedTaskId) dagView.selectTask(selectedTaskId);
+    }
+    function setActiveView(view, updateUrl = true) {
+      activeView = view;
+      document.querySelectorAll('.view-tab').forEach(t=>t.classList.toggle('active', t.dataset.view === view));
+      document.querySelectorAll('.view-panel').forEach(p=>p.classList.remove('active'));
+      document.getElementById('view'+view.charAt(0).toUpperCase()+view.slice(1))?.classList.add('active');
+      canvasWrap.classList.toggle('canvas-hidden', view !== 'architecture');
+      document.querySelector('.canvas-bar')?.classList.toggle('canvas-hidden', view !== 'architecture');
+      if (view === 'dag') ensureDagView();
+      if (updateUrl) writeUrlState();
+    }
+    document.querySelectorAll('.view-tab').forEach(tab => {
+      tab.addEventListener('click', () => setActiveView(tab.dataset.view));
     });
+    window.addEventListener('hashchange', () => { const state=urlState(); if (state.task) selectedTaskId=state.task; if (state.view) setActiveView(state.view, false); });
 
     // ── LAYER STATE (shared by canvas chips + sidebar toggles) ─
     const chipLayerMap = { deps: 'arch', heatmap: 'rev', labels: 'labels' };
@@ -451,6 +492,7 @@
     // ── CANVAS CHIPS ─────────────────────────────────────────
     document.querySelectorAll('.chip').forEach(chip => {
       chip.addEventListener('click', () => {
+        if (chip.dataset.c4Level) return;
         const c = chip.dataset.chip;
         if (c==='ltr' || c==='radial') {
           currentLayout = c;
@@ -466,6 +508,13 @@
         }
       });
     });
+    document.querySelectorAll('[data-c4-level]').forEach(chip => chip.addEventListener('click', () => {
+      c4Level = chip.dataset.c4Level;
+      selectedC4Id = null;
+      document.querySelectorAll('[data-c4-level]').forEach(item => item.classList.toggle('on', item === chip));
+      renderCanvas();
+      renderInspector();
+    }));
 
     // ── LAYER TOGGLES ─────────────────────────────────────────
     document.querySelectorAll('.layer-toggle').forEach(tog => {
@@ -859,7 +908,36 @@
     };
 
     // ── RENDER CANVAS ─────────────────────────────────────────
+    function renderC4Canvas() {
+      const source = c4Level === '1' ? c4Data.systems : c4Level === '2' ? c4Data.containers : c4Data.components;
+      if (!source.length) return false;
+      nodesLayer.innerHTML = ''; archSvg.innerHTML = '';
+      const positions = {};
+      source.forEach((item, index) => { positions[item.id] = {x:70 + (index % 3) * 250, y:80 + Math.floor(index / 3) * 150}; });
+      (c4Data.relationships || []).forEach(relation => {
+        const from = positions[relation.from], to = positions[relation.to];
+        if (!from || !to) return;
+        const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+        const mx = (from.x + to.x + 186) / 2;
+        path.setAttribute('d', `M ${from.x+186} ${from.y+45} C ${mx} ${from.y+45}, ${mx} ${to.y+45}, ${to.x} ${to.y+45}`);
+        path.setAttribute('class', `edge-path edge-dep edge-${relation.observation?.classification||'observed'}`);
+        archSvg.appendChild(path);
+      });
+      source.forEach(item => {
+        const card = document.createElement('div'), point = positions[item.id], classification = item.observation?.classification || 'observed';
+        card.className = `node-card c4-node node-observation-${classification}${selectedC4Id===item.id?' selected':''}`;
+        card.dataset.mod = item.id; card.style.left = point.x+'px'; card.style.top = point.y+'px';
+        card.innerHTML = `<div class="node-top"><span class="chip-status bg-cyan">C4 L${c4Level}</span><span class="mod-src-tag" style="margin-left:auto">${classification}</span></div><div class="node-name">${escapeHtml(item.name||item.id)}</div><div class="node-path">${escapeHtml(item.technology||item.owner||item.type||'')}</div><div class="obs-label obs-${classification}">${escapeHtml(item.description||'')}</div>`;
+        card.addEventListener('click', () => { selectedC4Id=item.id; renderCanvas(); renderInspector(); });
+        nodesLayer.appendChild(card);
+      });
+      minimapCanvas.querySelectorAll('.minimap-node').forEach(node=>node.remove());
+      applyZoom();
+      return true;
+    }
+
     function renderCanvas() {
+      if (c4Level !== 'modules' && renderC4Canvas()) return;
       const pos = getPositions();
       const mods = allMods().filter(moduleVisibleAtReplay);
 
@@ -1001,6 +1079,10 @@
 
     // ── RENDER INSPECTOR ──────────────────────────────────────
     function renderInspector() {
+      if (activeView === 'architecture' && selectedC4Id && c4Level !== 'modules') {
+        const item = [...(c4Data.systems||[]), ...(c4Data.containers||[]), ...(c4Data.components||[])].find(value=>value.id===selectedC4Id);
+        if (item) { inspBody.innerHTML = `<div class="ib"><div class="ib-k">C4 element</div><div class="ib-v">${escapeHtml(item.name||item.id)}</div></div><div class="ib"><div class="ib-k">Level</div><div class="ib-v">${escapeHtml(c4Level)}</div></div><div class="ib ib-full"><div class="ib-k">Description</div><div class="ib-v">${escapeHtml(item.description||'—')}</div></div>`; return; }
+      }
       if (currentTab === 'risks') {
         const risks = risksData.items || [];
         inspBody.innerHTML = `<div class="ib ib-full"><div class="ib-k">Projected risks</div>${risks.length ? risks.map(risk=>`
@@ -1160,10 +1242,17 @@
       renderRuntime();
       renderReplay();
       renderCanvas();
-      renderInspector();
+      if (activeView === 'dag') {
+        ensureDagView();
+        const selected = (dagData.tasks || []).find(task => (task.task_id || String(task.id).split(':').at(-1)) === selectedTaskId);
+        if (selected) renderDagTaskInspector(window.AiKitDagView.normalize(dagData).tasks.find(task => task.id === selectedTaskId) || selected);
+      } else renderInspector();
       updateTimecode();
     }
 
+    const initialState = urlState();
+    if (initialState.task) selectedTaskId = initialState.task;
+    setActiveView(initialState.view || 'project', false);
     renderAll();
 
   })();

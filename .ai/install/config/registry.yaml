@@ -27,6 +27,9 @@ stack_skills:
   docker-compose-local: {path: .ai/skills/devops/docker-compose-local, stack: [docker, compose]}
   backend-python: {path: .ai/skills/backend/python, stack: [python]}
   backend-fastapi: {path: .ai/skills/backend/fastapi, stack: [python, fastapi]}
+  backend-outbox-pattern: {path: .ai/skills/backend/distributed/outbox-pattern, stack: [distributed, outbox, events]}
+  backend-saga-orchestrator: {path: .ai/skills/backend/distributed/saga-orchestrator, stack: [distributed, saga, orchestration]}
+  backend-circuit-breaker: {path: .ai/skills/backend/distributed/circuit-breaker-and-fallback, stack: [distributed, resilience, circuit-breaker]}
   frontend-typescript: {path: .ai/skills/frontend/typescript, stack: [typescript]}
   frontend-nextjs: {path: .ai/skills/frontend/nextjs, stack: [nextjs, react]}
   frontend-tailwind: {path: .ai/skills/frontend/tailwind, stack: [tailwind]}
@@ -137,6 +140,11 @@ skill_triggers:
     core_skills: ["integration-contracts", "contract-testing", "webhooks-and-retries"]
     technology_skills: ["ai/llm-application"]
     reason: "Provider and callback boundaries require contract safety and retry discipline."
+  distributed-reliability:
+    match: ["transactional outbox", "outbox pattern", "event relay", "distributed transaction", "compensating transaction", "saga orchestrator", "circuit breaker", "bulkhead", "fallback policy", "dependency outage"]
+    core_skills: ["integration-contracts", "architecture-decisions"]
+    technology_skills: ["backend/distributed/outbox-pattern", "backend/distributed/saga-orchestrator", "backend/distributed/circuit-breaker-and-fallback"]
+    reason: "Distributed consistency and failure containment require explicit delivery, compensation, idempotency, and degradation rules."
   architecture-pipeline:
     match: ["architecture", "pipeline", "orchestration", "multi-agent", "state machine"]
     core_skills: ["architecture-decisions"]

@@ -1,0 +1,13 @@
+name: outbox-pattern
+domain: backend
+version: 1.0.0
+status: active
+owner: backend
+reviewed_at: 2026-08-14
+reviewers: []
+depends_on: []
+triggers: [outbox, transactional outbox, event relay, cdc]
+documents: [overview.md, patterns.md, best-practices.md, pitfalls.md, examples.md]
+entrypoint: .ai/skills/backend/distributed/outbox-pattern/overview.md
+path: .ai/skills/backend/distributed/outbox-pattern
+deprecated: false
