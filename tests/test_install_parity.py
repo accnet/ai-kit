@@ -6,6 +6,7 @@ or recreate a source-repository `.ai-config/` tree.
 """
 from __future__ import annotations
 
+import argparse
 import re
 import os
 import subprocess
@@ -24,7 +25,7 @@ TEMPLATE_VISUALIZER = REPO_ROOT / ".ai" / "install" / "templates" / ".visualizer
 
 PROJECT_OWNED_CONFIGS = ("contexts.yaml", "epics.yaml")
 EXPECTED_CONFIGS = {
-    "automation.yaml", "contexts.yaml", "epics.yaml", "kit.yaml",
+    "config.yaml", "automation.yaml", "contexts.yaml", "epics.yaml", "kit.yaml",
     "registry.yaml", "rules.yaml", "runners.yaml", "design-policy.json", "contracts.json", "delivery.json",
     "architecture.json", "architecture-fitness.json", "truth.yaml",
 }
@@ -125,24 +126,17 @@ class InstallConfigTests(unittest.TestCase):
             self.assertTrue((project / "contracts" / "generated" / "sdk" / "contracts.ts").is_file())
             self.assertTrue((project / "worker" / "store_lifecycle.py").is_file())
 
-    def test_automation_seed_has_manual_roles_with_valid_runner_models(self) -> None:
-        """A fresh install must not dispatch QA/review until enabled, and its
-        configured primary/backup runner:model pairs must resolve."""
+    def test_runtime_seed_uses_local_qa_and_explicit_review_waiver(self) -> None:
+        """The centralized seed automates deterministic QA without fabricating
+        an independent reviewer identity."""
         roles = ai_kit._load_automation_roles()
-        self.assertFalse(roles["qa"]["enabled"])
+        self.assertTrue(roles["qa"]["enabled"])
+        self.assertEqual(roles["qa"]["mode"], "local")
         self.assertFalse(roles["reviewer"]["enabled"])
-        self.assertFalse(
-            ai_kit._load_post_completion_config()["enabled"],
-            "fresh installs must not auto-run QA/review/retry while both roles are manual",
-        )
-        for role in ("qa", "reviewer"):
-            config = roles[role]
-            for runner_key, model_key in (("runner", "model"), ("backup_runner", "backup_model")):
-                runner = config.get(runner_key)
-                if runner:
-                    resolved_name, _entry, resolved_model = ai_kit._resolve_runner(runner, config.get(model_key))
-                    self.assertEqual(resolved_name, runner)
-                    self.assertEqual(resolved_model, config.get(model_key))
+        self.assertEqual(roles["reviewer"]["mode"], "not-required")
+        self.assertTrue(ai_kit._load_post_completion_config()["enabled"])
+        validated = ai_kit.cmd_config_validate(argparse.Namespace())
+        self.assertTrue(validated["passed"])
 
     def test_project_owned_configs_ship_empty(self) -> None:
         """contexts.yaml and epics.yaml describe one specific project. The

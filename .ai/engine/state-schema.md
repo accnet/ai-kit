@@ -20,7 +20,9 @@ independent verification. The
 dict (`task`, `checks`, `passed`), and never mutates task status, phase
 state, or any lifecycle field. `qa run` is the deterministic QA authority;
 `review submit` stores a recommendation and `review apply` is the review
-authority; `delivery close` is the only governed path to `done`.
+authority. A recommendation must identify its reviewer with non-empty
+`runner`, `model`, and `agent_id`; `review apply` rejects incomplete or
+self-review identities. `delivery close` is the only governed path to `done`.
 
 Legal task statuses are `todo`, `in-progress`, `implementation-complete`,
 `qa-passed`, `review-approved`, `done`, and `blocked`.
@@ -76,7 +78,7 @@ source-code vector store.
 ## Collaborative plan draft schema
 
 Chat/planning state lives separately at
-`.ai-work/requirements/plans/<plan-id>.json` (schema version `2`). It has
+`.ai-work/requirements/plans/<plan-id>.json` (schema version `3`). It has
 `id`, `title`, `workflow`, `status` (`drafting`, `ready`, or
 `materialized`), an optimistic `revision`, a structured `brief`, proposed
 `tasks`, append-only `history`, and optional `materialization` metadata. The
@@ -88,7 +90,10 @@ A draft is not lifecycle state and is never read by `ready`, `dispatch`, or
 `pipeline`. `plan-draft finalize` rejects incomplete briefs, unresolved open
 questions, invalid owners/contexts, missing acceptance criteria, unknown task
 dependencies, and dependency cycles; it also requires the explicit
-`--confirmed-by-user` acknowledgement. `plan-draft materialize` additionally
+`--confirmed-by-user` acknowledgement. When runtime auto-execution is enabled,
+`plan-draft authorize-execution` records a second explicit confirmation bound
+to the exact definition digest and execution mode; any definition edit makes
+it stale. `plan-draft materialize` additionally
 requires a separate `--create-tasks` acknowledgement and is the sole
 bridge into execution: it writes a new `workflow.json` with the draft's tasks
 and a top-level `source_plan` object (`id`, source `revision`, definition
@@ -101,9 +106,12 @@ to bypass G1/G2/G3 lifecycle gates.
 
 `add-task` and `plan` write `.ai-work/tasks/<task-id>.json` alongside the
 task's entry in `workflow.json` -- a self-contained snapshot of the task's
-*definitional* fields: `schema_version` (currently `2`,
+*definitional* fields: `schema_version` (currently `3`,
 `TASK_CONTRACT_SCHEMA_VERSION`), `task_id`, `revision` (starts at `1`),
 `title`, `owner`, `phase`, `needs`, `depends_on`, `acceptance`, `files`,
+`scope` (`allowed_files`, `forbidden_files`), `constraints`, `qa_contract`
+(`required_checks`, `commands`), `output_contract` (`changed_files`, `exports`,
+`evidence_kinds`),
 `tags`, `context`, `epic`, `base_commit`, `task_kind`,
 `required_capabilities`, `contract_refs`, `governance_baseline`, `created_at`, `updated_at`.
 *Lifecycle* fields (`status`, `attempts`, `claimed_by`, `evidence`,
@@ -111,6 +119,27 @@ task's entry in `workflow.json` -- a self-contained snapshot of the task's
 the contract file is not a second lifecycle source, only a stable
 description of what the task is, independent of `workflow.json`'s size and
 lifecycle churn.
+
+`files` remains the compatibility field and is normalized into
+`scope.allowed_files`. The scope gate rejects both changes outside the allowed
+patterns and changes matching a forbidden pattern. Task-specific QA commands
+are executed by the deterministic verifier, while `required_checks` prevents a
+missing configured check from becoming a green verdict.
+
+On `complete`, the control plane writes `.ai-work/results/<task-id>.json`
+(`schema_version: 1`). It records the task-contract revision/hash, assignment,
+base/head identity, changed paths, declared exports, evidence references, and
+upstream task-result references. This is a bounded result projection, not a
+lifecycle authority. Context packages and handoffs reference dependency
+results by portable path and SHA-256 instead of copying implementation output.
+
+Failed or inconclusive authoritative QA writes
+`.ai-work/recovery/<task-id>.json` (`schema_version: 1`). Its deterministic
+taxonomy is `implementation_failure`, `test_regression`,
+`architecture_violation`, `contract_drift`, `dependency_conflict`, or
+`environment_inconclusive`; each maps to `retry-worker`, `replan-required`, or
+`manual-investigation`. Automated retry is allowed only for a current
+recommendation marked retryable.
 
 ## Procedure routing and handoffs
 
@@ -133,14 +162,15 @@ complete a valid lease, reviewers only submit recommendations, and the control
 plane applies QA, review, and delivery transitions.
 
 Executor handoffs under `.ai-work/handoffs/<task-id>.json` use
-`schema_version: 2`. Their prompt carries the handoff's absolute canonical
+`schema_version: 3`. Their prompt carries the handoff's absolute canonical
 path because the runner executes inside a linked worktree while `.ai-work`
 remains outside that worktree as gitignored control-plane state.
 
-The `routing` object in a handoff additionally carries `operation` and
+The `routing` object in a handoff additionally carries `operation`,
+`task_result_refs`, and
 `active_procedure` (procedure ID, actor roles, outputs, and authority) before
 the selected policy/core and technology skill details. This is an additive
-schema-v2 field; older handoff readers can ignore it safely.
+schema-v3 field; older handoff readers can ignore it safely.
 
 `routing.context_package` uses context-package schema version 3. In addition to
 L0-L3 references it may contain a bounded `contract_impact` graph slice with
@@ -351,14 +381,19 @@ it is never an independent source of lifecycle truth.
 
 ## Runner registry
 
-`.ai-config/runners.yaml` is the versioned runner registry. A canonical CLI/provider
-entry has a `command` template containing `{prompt}` and `{model}`, a
+`.ai-config/config.yaml` version 1 is the runtime authority for runner profiles,
+aliases/defaults, plan auto-execution, scheduler/isolation, quality, completion,
+and failure policy. `runners.yaml` plus `automation.yaml` are a legacy fallback
+only when project-owned runtime config is absent; they are never merged with it.
+Use `config migrate`, `config validate`, and `config show` for the transition.
+A canonical CLI/provider entry has a `command` template containing `{prompt}` and `{model}`, a
 `models` allowlist, and optional `provider`/`description`. Version-5 profiles
 also declare `capabilities`, `roles`, `task_kinds`, `priority`, and
 `max_parallel`; selection filters in that order and sorts by descending
-priority then runner name. Model-less entries
-may omit `models` and `{model}`. Top-level `default_executor` and
-`default_model` identify the automatic dispatch pair. `runner_aliases` maps
+priority then runner name. The scheduler also enforces global execution mode
+and capacity from `automation.execution`. Model-less entries
+may omit `models` and `{model}`. `runners.default` identifies the single-task
+dispatch fallback. `runners.aliases` maps
 legacy profile names to `runner:model` references. Legacy scalar `model`
 profiles remain readable during migration.
 `ai-kit runner add [--default]` and `ai-kit runner list` manage the registry;
@@ -370,17 +405,24 @@ to the configured default pair. An explicit
 declared by X and records the resolved model/provider in
 `.ai-work/dispatch/<id>.json`. QA/review dispatches use the same collection
 as `.ai-work/dispatch/qa_<id>.json` and `.ai-work/dispatch/review_<id>.json`.
-`ai-kit dispatch-ready [--runner X] [--model M]` is the automatic safety-sensitive path:
-it only ever runs the configured `default_executor` — an explicit `--runner
-X` or `--model M` that differs from the configured pair is an `EngineError`
-raised before claiming any task, pointing at explicit `dispatch` as the
-alternative. A missing or misconfigured default pair, unknown model, or
-ambiguous multi-model runner also fails before claiming any task.
+`ai-kit dispatch-ready [--runner X] [--model M]` schedules across every
+eligible profile. An explicit runner narrows the pool but does not bypass role,
+task-kind, capability, capacity, or isolation contracts. A missing or
+misconfigured default pair, unknown model, or ambiguous multi-model runner
+fails before claiming work.
 
 Every governed assignment records the runner/model/agent identity, selected
 capabilities, canonical state path, branch, linked worktree, base commit,
 claim/lease, and timestamp. A retry reuses the worktree and audits its diff;
 cleanup is attempted only after valid delivery evidence closes the task.
+
+Plan drafts carry optional digest-bound `execution_authorization`. Automatic
+dispatch at materialization requires explicit confirmation for that exact plan
+definition and a mode matching `automation.execution.mode`; editing the plan
+invalidates the authorization. Failure policy may create a bounded
+`remediation-task`: the rejected task becomes `superseded`, the replacement
+records `remediates`/`remediation_attempt`, and all downstream task contracts
+are revised to also depend on the replacement.
 
 ## Design, contract, and delivery machine contracts
 
@@ -532,7 +574,9 @@ This bundle is a derived canonical projection, not workflow, QA, review,
 design, contract, or delivery authority. Its sources remain workflow state,
 project configuration and registries, evidence, Git, and source discovery.
 `artifact validate` checks integrity, schema, cross-artifact references,
-evidence freshness, and observation rules without changing lifecycle state.
+evidence freshness, the current authoritative-source fingerprint, and
+observation rules without changing lifecycle state. An intact but stale bundle
+is rejected until `artifact generate --refresh` publishes a new projection.
 A custom `--state /path/workflow.json` owns `/path/artifacts/project`.
 
 Module, dependency, and architecture relationships include an `observation`:

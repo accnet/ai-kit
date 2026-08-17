@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+
+- Task Contract and plan-draft schema v3 adds explicit allowed/forbidden
+  scope, constraints, deterministic QA requirements, and an output contract.
+  Completion publishes `.ai-work/results/<task>.json`; downstream handoffs
+  carry hashed task-result references.
+- `dispatch-ready` now schedules deterministically across the full eligible
+  runner pool using role, task kind, capability, capacity, priority, and name.
+- Failed and inconclusive QA now produces a deterministic failure taxonomy and
+  `.ai-work/recovery/<task>.json` recommendation for retry, replan, or manual
+  investigation.
+- `.ai-config/config.yaml` version 1 is the centralized runtime authority for
+  runners, digest-bound plan auto-execution, global scheduler/isolation limits,
+  local QA, review policy, completion, and bounded failure handling. Legacy
+  `runners.yaml`/`automation.yaml` remain a non-merged migration fallback.
+- Review `not-required` now produces explicit policy-waiver evidence. The
+  `remediation-task` failure strategy creates a versioned fix task and rewires
+  downstream DAG/task contracts instead of looping the rejected task forever.
+
 ## [2.1.0] - 2026-08-14
 
 ### Added

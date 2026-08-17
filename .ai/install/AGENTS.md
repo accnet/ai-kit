@@ -146,6 +146,7 @@ the engine actually writes.
 | Task DAG Builder | Task graph with waves, ready set, and critical path | `ai-kit artifact generate` -> `.ai-work/artifacts/project/dag.json`, rendered at `.visualizer/dag.html` |
 | Execution Contract Builder | Self-contained JSON handoff for a dispatched task (owner, acceptance, routing, instructions) | written by `ai-kit dispatch` / `dispatch-ready` / `pipeline` to `.ai-work/handoffs/<task-id>.json` |
 | Runtime Observer | Append-only audit history plus a bounded replay projection | `.ai-work/logs/events.jsonl`; `ai-kit artifact generate` -> `.ai-work/artifacts/project/events.json` |
+| Runtime Configuration | Validates, inspects, or migrates the centralized runner/automation authority | `ai-kit config validate/show/migrate` -> `.ai-config/config.yaml` |
 | Scheduler Advisor | What can run now vs. what is blocked and why | `ai-kit ready`, `ai-kit blocked`, `ai-kit dispatch-ready` |
 | Architecture / C4 / Module Graph | Versioned C4 L1-L3 projection plus contexts, modules, ownership, provenance, and dependency edges | `ai-kit artifact generate` -> `.ai-work/artifacts/project/architecture.json` |
 | Architecture Model Validator | Validates Truth Registry authorities, C4 references, context mappings, and per-entity multidimensional profiles without changing lifecycle state | `ai-kit architecture validate` |
@@ -207,7 +208,16 @@ misreading a renamed or retyped field:
 - `.ai-work/state/workflow.json` has a top-level `version` (currently `5`) and an immutable `workflow_id`; governed tasks carry assignment, contract refs, and a governance baseline;
   `.ai/engine/state-schema.md` documents its fields.
 - `.ai-work/handoffs/<task-id>.json` (the Execution Contract Builder output)
-  has `schema_version: 2` and includes canonical state/worktree/branch/lease assignment data.
+  has `schema_version: 3` and includes scope, constraints, QA/output contracts,
+  upstream task-result references, and canonical state/worktree/branch/lease assignment data.
+- `.ai-work/results/<task-id>.json` is the schema-version-1 bounded completion
+  projection. `.ai-work/recovery/<task-id>.json` is the schema-version-1
+  deterministic QA failure/recovery recommendation. Neither is lifecycle authority.
+- `.ai-config/config.yaml` version 1 is the project runtime authority for
+  runner profiles, plan authorization/auto-execution, scheduler isolation and
+  concurrency, quality/completion policy, and bounded failure strategy.
+  `runners.yaml`/`automation.yaml` are legacy fallback inputs only when this
+  file is absent; never merge both authorities.
 - `.ai-work/artifacts/project/manifest.json` is the atomic commit marker for
   one 12-payload project projection. Every payload has a schema-version-1
   envelope and the same `generation_id`; the manifest records its SHA-256,
@@ -405,11 +415,12 @@ hidden capability to build.
 - **G2 - Task completion:** every acceptance criterion has evidence and the
   relevant configured checks pass. Workers cannot create QA/review verdicts;
   `qa run` and `review apply` own those transitions.
-- **G3 - Review:** a reviewer records `approve` with no unresolved blockers
-  before delivery.
+- **G3 - Review:** when `review_required` is true, an independent reviewer
+  records `approve` with no unresolved blockers before delivery. When false,
+  `review.mode: not-required` must record explicit policy-waiver evidence.
 - **G4 - Hygiene:** never commit secrets, credentials, or transient
   `.ai-work/` state. Keep changes traceable to a task. `.ai-config/*.yaml`
-  (`runners.yaml`'s runner commands; `kit.yaml`'s `test_command`,
+  (`config.yaml`'s runner commands; `kit.yaml`'s `test_command`,
   `lint_command`, `typecheck_command`, `build_command`) are executed as
   shell strings by the engine (`dispatch`, `verify`) — treat write access to
   these files as equivalent to arbitrary shell execution, and review changes
@@ -446,7 +457,7 @@ retries or mark partial work complete.
 ## Runner Autonomy
 
 `ai-kit dispatch`, `dispatch-ready`, and `pipeline` hand a task off to a
-configured runner CLI (`.ai-config/runners.yaml`) with stdin closed — the
+configured runner CLI (`.ai-config/config.yaml`, or legacy `runners.yaml`) with stdin closed — the
 runner cannot pause to ask a human for per-action permission, so its command
 template necessarily includes a non-interactive/auto-approve flag
 (`--permission-mode acceptEdits`, `--auto-approve true`, `--allow-all-tools`,
@@ -458,7 +469,7 @@ confirmation during execution; it is the G2/G3 evidence and review gates
 above, which run after the runner finishes. Do not dispatch a task to a
 runner against a repository or task where unsupervised, full-tool-access
 execution is unacceptable before that review happens. Runner model names in
-`runners.yaml` are point-in-time examples tied to each provider's current
+`config.yaml` are point-in-time examples tied to each provider's current
 CLI — verify them against the installed CLI before relying on a pinned name,
 since they will drift out of date.
 

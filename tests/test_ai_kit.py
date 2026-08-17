@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -314,6 +315,27 @@ class GovernedControlPlaneTests(EngineTestCase):
         with self.assertRaisesRegex(ai_kit.EngineError, "hash is stale"):
             ai_kit.cmd_review_apply(ns(state=str(self.state_file), id="T1", evidence=None))
 
+    def test_review_apply_rejects_direct_evidence_with_incomplete_identity(self) -> None:
+        self._quality_command(); self.init_workflow(); self.add_task("T1")
+        self._implementation_complete()
+        state = ai_kit.load(self.state_file); task = ai_kit.task_map(state)["T1"]
+        task["assignment"] = {"runner": "executor", "model": "m1", "agent_id": "exec-1", "worktree": str(self.root), "base_commit": None}
+        ai_kit.save(state, self.state_file, state["revision"])
+        ai_kit.cmd_qa_run(ns(state=str(self.state_file), id="T1"))
+        qa_path = ai_kit._qa_evidence_path(self.state_file, "T1")
+        qa_payload = json.loads(qa_path.read_text(encoding="utf-8"))
+        recommendation = self.root / "incomplete-review.json"
+        recommendation.write_text(json.dumps({
+            "schema_version": 1, "task": "T1", "decision": "approve", "verdict": "approve",
+            "findings": [], "evidence": [], "runner": "executor", "agent_id": "review-1",
+            "qa_evidence": ai_kit._portable_workspace_ref(self.state_file, qa_path),
+            "qa_evidence_sha256": hashlib.sha256(qa_path.read_bytes()).hexdigest(),
+            "qa_fingerprint": qa_payload["fingerprint"],
+            "source_fingerprint": qa_payload["source_fingerprint"],
+        }), encoding="utf-8")
+        with self.assertRaisesRegex(ai_kit.EngineError, "runner and model"):
+            ai_kit.cmd_review_apply(ns(state=str(self.state_file), id="T1", evidence=str(recommendation)))
+
     def test_review_evidence_binding_survives_workspace_move(self) -> None:
         self._quality_command(); self.init_workflow(); self.add_task("T1")
         self._implementation_complete()
@@ -546,7 +568,7 @@ class GovernedControlPlaneTests(EngineTestCase):
             ai_kit.cmd_contract_transition(ns(id="x", version="1.0.0", action="activate", actor="architect", evidence=None, migration=None, confirmed_by_user=False))
         self.assertIn("integration", str(ctx.exception))
 
-    def test_isolated_dispatch_uses_absolute_schema_v2_handoff(self) -> None:
+    def test_isolated_dispatch_uses_absolute_schema_v3_handoff(self) -> None:
         self.init_workflow()
         self.add_task("T1")
         isolated = self.root / "linked-worktree"
@@ -579,9 +601,94 @@ class GovernedControlPlaneTests(EngineTestCase):
             ai_kit.cmd_dispatch(ns(state=str(self.state_file), id="T1", runner="test-runner", model=None, agent_id="worker-1"))
 
         handoff = ai_kit.workspace(self.state_file) / "handoffs" / "T1.json"
-        self.assertEqual(json.loads(handoff.read_text(encoding="utf-8"))["schema_version"], 2)
+        self.assertEqual(json.loads(handoff.read_text(encoding="utf-8"))["schema_version"], 3)
         self.assertIn(str(handoff.resolve()), captured["command"])
         self.assertEqual(captured["cwd"], str(isolated))
+
+    def test_task_contract_v3_and_result_reference(self) -> None:
+        self.init_workflow()
+        task = self.add_task(
+            "T1", files=["src/**"], forbidden_file=["src/secrets/**"],
+            constraint=["preserve public API"], required_check=["test_command"],
+            qa_command=["python -m unittest"], output_export=["public:store-client"],
+            output_evidence_kind=["test-report"], no_changed_files=False,
+        )
+        contract_path = ai_kit.workspace(self.state_file) / "tasks" / "T1.json"
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        self.assertEqual(contract["schema_version"], 3)
+        self.assertEqual(contract["scope"]["allowed_files"], ["src/**"])
+        self.assertEqual(contract["scope"]["forbidden_files"], ["src/secrets/**"])
+        self.assertEqual(contract["constraints"], ["preserve public API"])
+        self.assertEqual(contract["qa_contract"]["required_checks"], ["test_command"])
+        self.assertEqual(contract["output_contract"]["exports"], ["public:store-client"])
+
+        self.transition("T1", "start", actor="backend")
+        completed = self.transition("T1", "complete", actor="backend")
+        self.assertEqual(completed["status"], "implementation-complete")
+        result = ai_kit.cmd_result_show(ns(state=str(self.state_file), id="T1"))
+        self.assertEqual(result["schema_version"], 1)
+        self.assertEqual(result["task_contract"]["sha256"], task["contract_hash"])
+        self.assertEqual(result["exports"], ["public:store-client"])
+        self.add_task("T2", needs=["T1"])
+        downstream = ai_kit.task_map(ai_kit.load(self.state_file))["T2"]
+        refs = ai_kit._task_result_references(self.state_file, downstream)
+        self.assertEqual(refs[0]["task_id"], "T1")
+        self.assertEqual(refs[0]["sha256"], result["sha256"])
+
+    def test_pool_scheduler_assigns_all_eligible_runners_deterministically(self) -> None:
+        (self.root / ".ai-config" / "runners.yaml").write_text(
+            "runners:\n"
+            "  high:\n    command: \"runner --model {model} {prompt}\"\n    models: [fast, thorough]\n    pool_model: thorough\n    capabilities: [implementation, testing]\n    roles: [backend]\n    task_kinds: [implementation]\n    priority: 100\n    max_parallel: 1\n"
+            "  low:\n    command: \"true {prompt}\"\n    capabilities: [implementation]\n    roles: [backend]\n    task_kinds: [implementation]\n    priority: 10\n    max_parallel: 1\n",
+            encoding="utf-8",
+        )
+        self.init_workflow()
+        self.add_task("A", task_kind="implementation", required_capability=["testing"])
+        self.add_task("B", task_kind="implementation", required_capability=["implementation"])
+        fake_process = type("FakeProcess", (), {"pid": 1234})()
+        with mock.patch("subprocess.Popen", return_value=fake_process):
+            result = ai_kit.cmd_dispatch_ready(ns(
+                state=str(self.state_file), runner=None, model=None, limit=None,
+                context=None, epic=None, agent_id=None, worktree_root=None,
+                no_worktree=True,
+            ))
+        self.assertEqual(result["scheduler"], "runner-pool")
+        self.assertEqual([(item["task"], item["runner"]) for item in result["spawned"]], [("A", "high"), ("B", "low")])
+        self.assertEqual(result["spawned"][0]["model"], "thorough")
+
+    def test_failure_taxonomy_and_recovery_are_deterministic(self) -> None:
+        evidence = {
+            "status": "fail",
+            "checks": [{"name": "contract:content-hash", "result": "fail", "detail": "hash drift"}],
+        }
+        classification, action, retryable, _reasons = ai_kit._classify_qa_failure(evidence)
+        self.assertEqual(classification, "contract_drift")
+        self.assertEqual(action, "replan-required")
+        self.assertFalse(retryable)
+        classification, action, retryable, _reasons = ai_kit._classify_qa_failure({"status": "inconclusive", "checks": []})
+        self.assertEqual((classification, action, retryable), ("environment_inconclusive", "manual-investigation", False))
+
+    def test_qa_failure_persists_current_recovery_recommendation(self) -> None:
+        self.init_workflow(); self.add_task("T1")
+        self.transition("T1", "start", actor="backend")
+        self.transition("T1", "complete", actor="backend")
+        functional = {"passed": False, "checks": [{"name": "test_command", "status": "fail", "stderr": "failed"}]}
+        passing_gate = {"passed": True, "checks": []}
+        with (
+            mock.patch.object(ai_kit, "cmd_verify", return_value=functional),
+            mock.patch.object(ai_kit, "_design_validation", return_value=passing_gate),
+            mock.patch.object(ai_kit, "_contract_convergence", return_value=passing_gate),
+        ):
+            report = ai_kit.cmd_qa_run(ns(state=str(self.state_file), id="T1"))
+        self.assertEqual(report["status"], "fail")
+        recovery = ai_kit.cmd_recovery_show(ns(state=str(self.state_file), id="T1"))
+        self.assertEqual(recovery["classification"], "test_regression")
+        self.assertEqual(recovery["recommended_action"], "retry-worker")
+        self.assertTrue(recovery["retryable"])
+        task_projection = ai_kit._task_artifact(self.state_file, ai_kit.load(self.state_file), {"items": []})
+        projected = next(item for item in task_projection["items"] if item["task_id"] == "T1")
+        self.assertEqual(projected["recovery_ref"]["classification"], "test_regression")
+        self.assertIsNotNone(projected["result_ref"])
 
     def test_new_assignment_uses_current_head_not_planning_provenance(self) -> None:
         ai_kit.ROOT = self.root / "repo"
@@ -2183,6 +2290,227 @@ class RegistryEndToEndRoutingTests(EngineTestCase):
         for role in ("architect", "qa", "security", "integration", "performance"):
             registry = ai_kit._load_registry()
             self.assertIn("ai", registry["owners"].get(role, []), f"role '{role}' missing 'ai' in owners")
+
+
+class CentralRuntimeConfigTests(EngineTestCase):
+    def write_runtime_config(self, *, review_mode: str = "manual", qa_strategy: str = "manual", max_attempts: int = 0, automation_enabled: bool = False) -> None:
+        (self.root / ".ai-config" / "config.yaml").write_text(
+            textwrap.dedent(f"""\
+                version: 1
+                runners:
+                  default:
+                    name: worker
+                    model: model-a
+                  profiles:
+                    worker:
+                      command: "runner -m {{model}} {{prompt}}"
+                      models: [model-a]
+                      capabilities: [implementation, testing, review]
+                      roles: [backend, reviewer]
+                      task_kinds: [general, implementation]
+                      priority: 100
+                      max_parallel: 2
+                  aliases:
+                    primary: "worker:model-a"
+                automation:
+                  enabled: {str(automation_enabled).lower()}
+                  planning:
+                    auto_execute:
+                      enabled: true
+                      trigger: plan-materialized
+                      require: [valid_dag, complete_acceptance_criteria, current_execution_authorization]
+                  execution:
+                    mode: parallel
+                    max_parallel_tasks: 2
+                    auto_dispatch_ready: true
+                    dispatch_ready_limit: 2
+                    isolation:
+                      worktree_per_task: true
+                      require_disjoint_paths: true
+                  quality:
+                    qa:
+                      mode: local
+                      max_parallel: 2
+                    review:
+                      mode: {review_mode}
+                    completion:
+                      auto_resolve_review_when_not_required: true
+                      auto_close_delivery_not_applicable: true
+                  failure:
+                    qa:
+                      strategy: {qa_strategy}
+                      max_attempts: {max_attempts}
+                    review:
+                      strategy: manual
+                      max_attempts: 0
+            """),
+            encoding="utf-8",
+        )
+
+    def test_central_config_is_authoritative_and_strictly_validated(self) -> None:
+        self.write_runtime_config()
+        (self.root / ".ai-config" / "runners.yaml").write_text(
+            "runners:\n  ignored:\n    command: 'false {prompt}'\n", encoding="utf-8"
+        )
+        config = ai_kit._load_runtime_config()
+        self.assertEqual(config["runners"]["default"]["name"], "worker")
+        self.assertEqual(set(ai_kit._load_runners()), {"worker"})
+        self.assertTrue(ai_kit.cmd_config_validate(ns())["passed"])
+        with self.assertRaisesRegex(ai_kit.EngineError, "tabs are not allowed"):
+            (self.root / ".ai-config" / "config.yaml").write_text("version: 1\n\trunners: {}\n", encoding="utf-8")
+            ai_kit._load_runtime_config()
+
+    def test_config_validate_rejects_review_waiver_when_g3_is_required(self) -> None:
+        self.write_runtime_config(review_mode="not-required")
+        (self.root / ".ai-config" / "rules.yaml").write_text("review_required: true\n", encoding="utf-8")
+        result = ai_kit.cmd_config_validate(ns())
+        self.assertFalse(result["passed"])
+        check = next(item for item in result["checks"] if item["name"] == "review-policy-consistency")
+        self.assertFalse(check["passed"])
+
+    def test_plan_authorization_is_bound_to_the_exact_digest(self) -> None:
+        draft = {
+            "schema_version": 3, "id": "P1", "revision": 3, "title": "Plan", "workflow": "feature",
+            "brief": {"problem": "p", "scope": ["s"], "acceptance": ["a"], "constraints": [], "open_questions": [], "decisions": []},
+            "tasks": [], "status": "ready", "history": [], "materialization": None,
+        }
+        draft["execution_authorization"] = {
+            "plan_id": "P1", "plan_digest": ai_kit._draft_digest(draft), "mode": "parallel",
+        }
+        self.assertTrue(ai_kit._current_plan_execution_authorization(draft)[0])
+        draft["title"] = "Changed plan"
+        current, detail = ai_kit._current_plan_execution_authorization(draft)
+        self.assertFalse(current)
+        self.assertIn("stale", detail)
+
+    def test_config_migrate_promotes_legacy_files_without_merging(self) -> None:
+        (self.root / ".ai-config" / "runners.yaml").write_text(
+            "default_executor: worker\ndefault_model: model-a\nrunners:\n"
+            "  worker:\n    command: 'runner -m {model} {prompt}'\n    models: [model-a]\n"
+            "    capabilities: [implementation]\n    roles: [backend]\n    task_kinds: [general]\n"
+            "    priority: 10\n    max_parallel: 1\n",
+            encoding="utf-8",
+        )
+        (self.root / ".ai-config" / "automation.yaml").write_text(
+            "roles:\n  qa:\n    enabled: false\n  reviewer:\n    enabled: false\n"
+            "post_completion:\n  enabled: false\n",
+            encoding="utf-8",
+        )
+        result = ai_kit.cmd_config_migrate(ns(force=False))
+        self.assertTrue((self.root / ".ai-config" / "config.yaml").is_file())
+        self.assertTrue(result["valid"])
+        self.assertEqual(ai_kit._load_runtime_config()["runners"]["default"]["name"], "worker")
+        (self.root / ".ai-config" / "runners.yaml").write_text("runners: {}\n", encoding="utf-8")
+        self.assertEqual(set(ai_kit._load_runners()), {"worker"})
+
+    def test_review_not_required_creates_auditable_policy_evidence(self) -> None:
+        self.write_runtime_config(review_mode="not-required")
+        (self.root / ".ai-config" / "rules.yaml").write_text("review_required: false\n", encoding="utf-8")
+        self.init_workflow(); self.add_task("T1")
+        self.transition("T1", "start", actor="backend")
+        self.transition("T1", "complete", actor="backend")
+        state = ai_kit.load(self.state_file); task = ai_kit.task_map(state)["T1"]
+        qa_path = ai_kit._qa_evidence_path(self.state_file, "T1")
+        qa_path.parent.mkdir(parents=True, exist_ok=True)
+        fingerprint = ai_kit._evidence_fingerprint(task, self.root)
+        qa_path.write_text(json.dumps({"kind": "qa", "task": "T1", "status": "pass", "fingerprint": fingerprint, "source_fingerprint": fingerprint["source_fingerprint"]}), encoding="utf-8")
+        self.transition("T1", "qa-pass", actor="qa-control-plane", evidence=[str(qa_path)], _control_plane=True)
+        with self.assertRaisesRegex(ai_kit.EngineError, "control-plane-only"):
+            self.transition("T1", "review-waive", actor="reviewer", evidence=[self.review_evidence("T1")])
+        (self.root / ".ai-config" / "rules.yaml").write_text("review_required: true\n", encoding="utf-8")
+        with self.assertRaisesRegex(ai_kit.EngineError, "review_required: false"):
+            self.transition("T1", "review-waive", actor="review-policy-control-plane", evidence=[self.review_evidence("T1")], _control_plane=True)
+        (self.root / ".ai-config" / "rules.yaml").write_text("review_required: false\n", encoding="utf-8")
+        result = ai_kit._apply_review_policy_waiver("T1", str(self.state_file))
+        self.assertEqual(result["status"], "review-approved")
+        payload = json.loads(ai_kit._review_evidence_path(self.state_file, "T1").read_text(encoding="utf-8"))
+        self.assertEqual(payload["authority"], "review-not-required-policy")
+        self.assertEqual(payload["runner"], "policy-waiver")
+
+    def test_central_scheduler_enforces_global_capacity(self) -> None:
+        self.write_runtime_config()
+        self.init_workflow()
+        for task_id in ("T1", "T2", "T3"):
+            self.add_task(task_id)
+        fake_process = type("FakeProcess", (), {"pid": 4321})()
+        with mock.patch("subprocess.Popen", return_value=fake_process):
+            result = ai_kit.cmd_dispatch_ready(ns(
+                state=str(self.state_file), runner=None, model=None, limit=3,
+                context=None, epic=None, agent_id=None, worktree_root=None,
+                no_worktree=False,
+            ))
+        self.assertEqual(result["global_capacity"], 2)
+        self.assertEqual(result["claimed"], 2)
+        self.assertEqual([item["task"] for item in result["spawned"]], ["T1", "T2"])
+        statuses = {task["id"]: task["status"] for task in ai_kit.load(self.state_file)["tasks"]}
+        self.assertEqual(statuses, {"T1": "in-progress", "T2": "in-progress", "T3": "todo"})
+
+    def test_required_worktree_rejects_shared_workspace_override(self) -> None:
+        self.write_runtime_config()
+        self.init_workflow(); self.add_task("T1")
+        with self.assertRaisesRegex(ai_kit.EngineError, "worktree_per_task"):
+            ai_kit.cmd_dispatch(ns(
+                state=str(self.state_file), id="T1", runner=None, model=None,
+                agent_id=None, worktree_root=None, no_worktree=True,
+            ))
+        with self.assertRaisesRegex(ai_kit.EngineError, "worktree_per_task"):
+            ai_kit.cmd_dispatch_ready(ns(
+                state=str(self.state_file), runner=None, model=None, limit=1,
+                context=None, epic=None, agent_id=None, worktree_root=None,
+                no_worktree=True,
+            ))
+
+    def test_qa_capacity_is_bounded_and_slots_are_recoverable(self) -> None:
+        self.write_runtime_config()
+        first = ai_kit._acquire_quality_slot(self.state_file, "qa", 2)
+        second = ai_kit._acquire_quality_slot(self.state_file, "qa", 2)
+        try:
+            with self.assertRaisesRegex(ai_kit.EngineError, "configured capacity"):
+                ai_kit._acquire_quality_slot(self.state_file, "qa", 2)
+        finally:
+            first.unlink(missing_ok=True)
+            second.unlink(missing_ok=True)
+        recovered = ai_kit._acquire_quality_slot(self.state_file, "qa", 2)
+        recovered.unlink(missing_ok=True)
+
+    def test_remediation_task_rewires_downstream_dag_and_contracts(self) -> None:
+        self.write_runtime_config(qa_strategy="remediation-task", max_attempts=2)
+        self.init_workflow(); self.add_task("T1", files=["src/**"]); self.add_task("T2", needs=["T1"])
+        self.transition("T1", "start", actor="backend")
+        self.transition("T1", "complete", actor="backend")
+        evidence = self.qa_evidence("T1", status="fail")
+        self.transition("T1", "reject", actor="qa-control-plane", detail="tests failed", evidence=[evidence], _control_plane=True)
+        self.assertIsNone(ai_kit._create_remediation_task(self.state_file, "T1", "qa", evidence, ["disabled automation"]))
+        self.write_runtime_config(qa_strategy="remediation-task", max_attempts=2, automation_enabled=True)
+        result = ai_kit._create_remediation_task(self.state_file, "T1", "qa", evidence, ["functional:test_command"])
+        self.assertTrue(result["created"])
+        self.assertEqual(result["task"], "T1-fix-1")
+        state = ai_kit.load(self.state_file); tasks = ai_kit.task_map(state)
+        self.assertEqual(tasks["T1"]["status"], "superseded")
+        self.assertEqual(tasks["T1-fix-1"]["remediates"], "T1")
+        self.assertEqual(tasks["T2"]["needs"], ["T1", "T1-fix-1"])
+        self.assertFalse(ai_kit.runnable(tasks["T2"], tasks))
+        for task_id in ("T1-fix-1", "T2"):
+            contract = ai_kit.workspace(self.state_file) / "tasks" / f"{task_id}.json"
+            self.assertEqual(hashlib.sha256(contract.read_bytes()).hexdigest(), tasks[task_id]["contract_hash"])
+
+        self.transition("T1-fix-1", "start", actor="backend")
+        self.transition("T1-fix-1", "complete", actor="backend")
+        second_evidence = self.qa_evidence("T1-fix-1", status="fail")
+        self.transition("T1-fix-1", "reject", actor="qa-control-plane", detail="still failing", evidence=[second_evidence], _control_plane=True)
+        second = ai_kit._create_remediation_task(self.state_file, "T1-fix-1", "qa", second_evidence, ["second regression"])
+        self.assertEqual(second["task"], "T1-fix-2")
+        state = ai_kit.load(self.state_file); tasks = ai_kit.task_map(state)
+        self.assertEqual(tasks["T1-fix-2"]["remediates"], "T1")
+        self.assertEqual(tasks["T2"]["needs"], ["T1", "T1-fix-1", "T1-fix-2"])
+        self.transition("T1-fix-2", "start", actor="backend")
+        self.transition("T1-fix-2", "complete", actor="backend")
+        third_evidence = self.qa_evidence("T1-fix-2", status="fail")
+        self.transition("T1-fix-2", "reject", actor="qa-control-plane", detail="limit check", evidence=[third_evidence], _control_plane=True)
+        third = ai_kit._create_remediation_task(self.state_file, "T1-fix-2", "qa", third_evidence, ["third regression"])
+        self.assertFalse(third["created"])
+        self.assertIn("limit reached", third["reason"])
+        self.assertNotIn("T1-fix-3", ai_kit.task_map(ai_kit.load(self.state_file)))
 
 
 class PostCompletionConfigTests(EngineTestCase):

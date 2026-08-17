@@ -1,0 +1,109 @@
+version: 1
+runners:
+  default:
+    name: "codex-cli"
+    model: "gpt-5.6-terra"
+  profiles:
+    claude-cli:
+      command: "env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL claude -p {prompt} --permission-mode acceptEdits"
+      provider: "claude-cli"
+      input: "json-file"
+      capabilities: ["implementation", "refactoring", "testing", "review"]
+      roles: ["*"]
+      task_kinds: ["general", "contract", "implementation", "integration"]
+      priority: 100
+      max_parallel: 1
+    codex-cli:
+      command: "codex exec -m {model} --sandbox danger-full-access --ask-for-approval never {prompt}"
+      models: ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.4", "gpt-5.4-mini"]
+      pool_model: "gpt-5.6-terra"
+      provider: "codex-cli"
+      input: "json-file"
+      capabilities: ["implementation", "refactoring", "testing", "review"]
+      roles: ["*"]
+      task_kinds: ["general", "contract", "implementation", "integration"]
+      priority: 100
+      max_parallel: 2
+    cline-pass:
+      command: "cline -P cline-pass -m 'cline-pass/{model}' --auto-approve true {prompt}"
+      models: ["glm-5.2"]
+      pool_model: "glm-5.2"
+      provider: "cline-pass"
+      capabilities: ["implementation", "testing"]
+      roles: ["*"]
+      task_kinds: ["general", "implementation"]
+      priority: 50
+      max_parallel: 1
+    cline:
+      command: "cline -P deepseek -m '{model}' --auto-approve true {prompt}"
+      models: ["deepseek-v4-flash", "deepseek-v4-pro"]
+      pool_model: "deepseek-v4-flash"
+      provider: "cline"
+      capabilities: ["implementation", "testing", "review"]
+      roles: ["*"]
+      task_kinds: ["general", "implementation"]
+      priority: 50
+      max_parallel: 1
+    opencode-cli:
+      command: "opencode run {prompt} --model deepseek/{model}"
+      models: ["deepseek-v4-flash", "deepseek-v4-pro"]
+      pool_model: "deepseek-v4-flash"
+      provider: "opencode-cli"
+      capabilities: ["implementation", "testing", "review"]
+      roles: ["*"]
+      task_kinds: ["general", "implementation"]
+      priority: 60
+      max_parallel: 1
+    copilot-cli:
+      command: "copilot -p {prompt} --model {model} --allow-all-tools --log-level error"
+      models: ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.4", "gpt-5.4-mini"]
+      pool_model: "gpt-5.6-luna"
+      provider: "copilot-cli"
+      input: "json-file"
+      capabilities: ["implementation", "refactoring", "testing", "review"]
+      roles: ["*"]
+      task_kinds: ["general", "contract", "implementation", "integration"]
+      priority: 90
+      max_parallel: 1
+  aliases:
+    claude: "claude-cli"
+    codex-5.6-luna: "codex-cli:gpt-5.6-luna"
+    codex-5.6-terra: "codex-cli:gpt-5.6-terra"
+    codex-5.4: "codex-cli:gpt-5.4"
+    cline-pass: "cline-pass:glm-5.2"
+    deepseek-v4-flash: "cline:deepseek-v4-flash"
+    deepseek-v4-pro: "cline:deepseek-v4-pro"
+    opencode-deepseek-v4-flash: "opencode-cli:deepseek-v4-flash"
+    opencode-deepseek-v4-pro: "opencode-cli:deepseek-v4-pro"
+    copilot-gpt-5.6-luna: "copilot-cli:gpt-5.6-luna"
+automation:
+  enabled: true
+  planning:
+    auto_execute:
+      enabled: true
+      trigger: "plan-materialized"
+      require: ["valid_dag", "complete_acceptance_criteria", "current_execution_authorization"]
+  execution:
+    mode: "parallel"
+    max_parallel_tasks: 4
+    auto_dispatch_ready: true
+    dispatch_ready_limit: 4
+    isolation:
+      worktree_per_task: true
+      require_disjoint_paths: true
+  quality:
+    qa:
+      mode: "local"
+      max_parallel: 2
+    review:
+      mode: "not-required"
+    completion:
+      auto_resolve_review_when_not_required: true
+      auto_close_delivery_not_applicable: true
+  failure:
+    qa:
+      strategy: "remediation-task"
+      max_attempts: 2
+    review:
+      strategy: "remediation-task"
+      max_attempts: 2

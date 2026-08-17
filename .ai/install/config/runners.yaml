@@ -37,6 +37,7 @@ runners:
   codex-cli:
     command: "codex exec -m {model} --sandbox danger-full-access --ask-for-approval never {prompt}"
     models: ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.4", "gpt-5.4-mini"]
+    pool_model: "gpt-5.6-terra"
     provider: "codex-cli"
     description: "Codex CLI runner"
     input: "json-file"
@@ -58,6 +59,7 @@ runners:
   cline:
     command: "cline -P deepseek -m '{model}' --auto-approve true {prompt}"
     models: ["deepseek-v4-flash", "deepseek-v4-pro"]
+    pool_model: "deepseek-v4-flash"
     provider: "cline"
     description: "Cline DeepSeek runner"
     capabilities: [implementation, testing, review]
@@ -68,6 +70,7 @@ runners:
   opencode-cli:
     command: "opencode run {prompt} --model deepseek/{model}"
     models: ["deepseek-v4-flash", "deepseek-v4-pro"]
+    pool_model: "deepseek-v4-flash"
     provider: "opencode-cli"
     description: "OpenCode CLI runner"
     capabilities: [implementation, testing, review]
@@ -78,6 +81,7 @@ runners:
   copilot-cli:
     command: "copilot -p {prompt} --model {model} --allow-all-tools --log-level error"
     models: ["gpt-5.6-luna", "gpt-5.6-terra", "gemini-3.6-flash", "gemini-3.5-flash", "gpt-5.4", "gpt-5.4-mini", "claude-opus-4.8-fast", "grok-4.5", "kimi-k2.7-code", "gpt-4o", "gpt-4o-mini", "gpt-4o-mini-2024-08-23"]
+    pool_model: "gpt-5.6-luna"
     provider: "copilot-cli"
     description: "GitHub Copilot CLI runner"
     input: "json-file"

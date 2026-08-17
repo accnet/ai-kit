@@ -79,6 +79,15 @@ class ArtifactArchitectureTests(EngineTestCase):
         with self.assertRaisesRegex(ai_kit.EngineError, "hash mismatch"):
             ai_kit.cmd_artifact_validate(ns(state=str(self.state_file)))
 
+    def test_validator_rejects_an_internally_valid_but_stale_bundle(self) -> None:
+        self.generate(refresh=True)
+        # This authoritative input changes without publishing a replacement
+        # projection. Hashes still match the old manifest, so freshness must
+        # be checked independently of bundle integrity.
+        self.init_workflow()
+        with self.assertRaisesRegex(ai_kit.EngineError, "artifact bundle is stale"):
+            ai_kit.cmd_artifact_validate(ns(state=str(self.state_file)))
+
     def test_manifest_is_unchanged_when_commit_marker_replace_fails(self) -> None:
         first = self.generate(refresh=True)
         old_generation = first["manifest"]["generation_id"]

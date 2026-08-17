@@ -10,7 +10,7 @@ $aiRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $targetPath = (Resolve-Path $Target).Path
 $projectRoot = (Split-Path -Parent $aiRoot)
 $configTemplateRoot = Join-Path $aiRoot 'install/config'
-$configFiles = @('runners.yaml', 'automation.yaml', 'registry.yaml', 'contexts.yaml', 'epics.yaml', 'rules.yaml', 'kit.yaml', 'design-policy.json', 'contracts.json', 'delivery.json', 'architecture.json', 'architecture-fitness.json', 'truth.yaml')
+$configFiles = @('config.yaml', 'runners.yaml', 'automation.yaml', 'registry.yaml', 'contexts.yaml', 'epics.yaml', 'rules.yaml', 'kit.yaml', 'design-policy.json', 'contracts.json', 'delivery.json', 'architecture.json', 'architecture-fitness.json', 'truth.yaml')
 if ($targetPath -eq $aiRoot) { throw 'Target cannot be the .ai directory.' }
 
 $entries = New-Object System.Collections.Generic.List[object]

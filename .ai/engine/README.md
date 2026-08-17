@@ -55,6 +55,7 @@ python .ai/engine/ai_kit.py plan-draft create download-share --title "Share down
 python .ai/engine/ai_kit.py plan-draft update download-share --expected-revision 1 --summary "Clarified expiry" --add-scope "Expiry policy"
 python .ai/engine/ai_kit.py plan-draft add-task download-share T1 --expected-revision 2 --title "Define share contract" --owner planner --phase plan --acceptance "Contract has expiry semantics"
 python .ai/engine/ai_kit.py plan-draft finalize download-share --expected-revision 3 --confirmed-by-user
+python .ai/engine/ai_kit.py plan-draft authorize-execution download-share --expected-revision 4 --confirmed-by-user --mode parallel
 python .ai/engine/ai_kit.py --state .ai-work/state/download-share.json plan-draft materialize download-share --create-tasks
 ```
 
@@ -184,7 +185,9 @@ but never rolls back a valid lifecycle transition.
 
 `artifact validate` is read-only. It verifies manifest hashes, envelope and
 generation consistency, stable cross-artifact references, evidence freshness,
-and architecture observation provenance. It is not a QA, review, design,
+the current authoritative-source fingerprint, and architecture observation
+provenance. An otherwise intact stale bundle is rejected and must be rebuilt
+with `artifact generate --refresh`. It is not a QA, review, design,
 contract, or delivery gate. `artifact show <name>` returns one validated
 payload. `visualizer generate` is retained only as a deprecated alias and
 delegates to `artifact generate`.
@@ -254,18 +257,37 @@ commands. Use `onboard --apply` only after reviewing the output; it backs up
 `.ai-config/kit.yaml` before updating it. A custom `--state /path/name.json` uses
 `/path/name/` as its isolated artifact and audit workspace.
 
-Runner profiles live in `.ai-config/runners.yaml`. The canonical shape is one
-profile per CLI/provider, with a command template and a `models` allowlist:
+Runtime configuration lives in `.ai-config/config.yaml`. It owns runner
+profiles/defaults/aliases plus planning, execution, quality, completion, and
+failure policy. `runners.yaml` and `automation.yaml` remain a read-only legacy
+fallback only when a project has not created `config.yaml`; the engine never
+silently merges the two authorities. Use `ai-kit config migrate`, `config
+validate`, and `config show` to migrate, validate, or inspect the effective
+configuration.
 
 ```yaml
-default_executor: copilot-cli
-default_model: gpt-5.6-luna
-
+version: 1
 runners:
-  copilot-cli:
-    command: "copilot -p {prompt} --model {model} --allow-all-tools --log-level error"
-    models: [gpt-5.6-luna, gpt-4o, gpt-4o-mini]
-    provider: copilot-cli
+  default:
+    name: codex-cli
+    model: gpt-5.6-terra
+  profiles:
+    codex-cli:
+      command: "codex exec -m {model} {prompt}"
+      models: [gpt-5.6-terra, gpt-5.4]
+      capabilities: [implementation, refactoring, testing, review]
+      priority: 100
+      max_parallel: 2
+  aliases:
+    codex-terra: "codex-cli:gpt-5.6-terra"
+automation:
+  enabled: true
+  execution:
+    mode: parallel
+    max_parallel_tasks: 4
+    isolation:
+      worktree_per_task: true
+      require_disjoint_paths: true
 ```
 
 Use `ai-kit dispatch <id> --runner copilot-cli --model gpt-4o`. A runner with
@@ -275,16 +297,20 @@ one model selects it automatically; a runner with multiple models requires
 models must contain `{model}`; model-less CLIs such as Claude may omit both
 `models` and `{model}`.
 
-`default_executor` and `default_model` form the automatic dispatch pair.
-`dispatch-ready` rejects a different runner or model before claiming work.
-The optional `runner_aliases` section keeps old names such as
+`runners.default.name` and `runners.default.model` form the single-task
+`dispatch` fallback.
+`dispatch-ready` schedules across the full runner pool by role, task kind,
+required capabilities, remaining capacity, descending priority, and runner
+name. A multi-model profile uses `pool_model`, falling back deterministically
+to the first model in its allowlist. `--runner` narrows the pool and still enforces the task capability
+contract; `--model` therefore requires `--runner`.
+The optional `runners.aliases` section keeps old names such as
 `copilot-gpt-5.6-luna` working. `runner list` returns default settings,
 profiles, and aliases. `runner add` supports `--models MODEL...` for grouped
 profiles, legacy `--model MODEL`, and `--default-model MODEL`; it preserves
 existing aliases and grouped profiles.
 
-A runner entry may set `input: json-file` (currently set on `codex-cli`,
-`claude-cli`, and `copilot-cli` in `.ai-config/runners.yaml`). When set,
+A runner entry may set `input: json-file`. When set,
 `dispatch` writes a JSON snapshot of the task to
 `.ai-work/handoffs/<task-id>.json` (`schema_version`, `task` fields
 mirroring the task's own record, `execution` identity, and an
@@ -314,9 +340,10 @@ modules. Tasks snapshot upstream module revisions when created; `ai-kit drift`
 reports changes in that snapshot as `upstream_context_stale`, independently of
 the task's own `context_stale` flag.
 
-For running multiple agents in parallel, `dispatch-ready --runner X
-[--limit N] [--context C] [--epic E]` claims up to N ready tasks and spawns
-each one's runner as a background process, so they execute concurrently
+For running multiple agents in parallel, `dispatch-ready [--limit N]
+[--context C] [--epic E]` claims up to N ready tasks and assigns each one to
+the best eligible runner in the full configured pool. It spawns each runner
+as a background process, so they execute concurrently
 instead of one `dispatch` call blocking the next. Claiming is race-safe:
 `save()` rejects a write whose expected revision is stale, and
 `_retry_transition` retries a losing claim a few times before giving up, so
@@ -326,84 +353,54 @@ each concurrent agent instance a distinct identity — it's recorded as
 `claimed_by: "role#agent_id"` so the audit trail can tell apart multiple
 agents sharing one role.
 
-`ai-kit pipeline <task-id> [--agent-id ID]` chains one task through
-`dispatch -> verify -> qa-pass -> review-approve -> close` in a single
-synchronous call. The executor identity is `runners.yaml`'s existing
-`default_executor`/`default_model` (the same fallback plain `dispatch`
-already uses); `qa` and `reviewer` identities come from `.ai-config/automation.yaml`,
-a role-based mapping for the two roles that have no equivalent anywhere
-else in the registry:
+Task contracts use schema version 3. In addition to acceptance and legacy
+`files`, they declare allowed/forbidden scope, constraints, required QA checks
+and commands, and an output contract. Completion writes
+`.ai-work/results/<task>.json`; downstream context packages carry hashed result
+references. Failed/inconclusive QA writes `.ai-work/recovery/<task>.json` with
+a deterministic failure class and retry/replan/manual recommendation. Inspect
+them with `ai-kit result show TASK` and `ai-kit recovery show TASK`.
+
+`ai-kit pipeline <task-id> [--agent-id ID]` chains one task through dispatch,
+authoritative local QA, configured review policy, and delivery. Review mode is
+`independent`, `manual`, or `not-required`. `not-required` is legal only when
+`rules.review_required` is false; it writes explicit policy-waiver evidence
+and never claims that an independent reviewer ran. A code-bearing task remains
+`review-approved` until an integration commit is attested. Only a
+machine-verifiable delivery-not-applicable task may auto-close.
 
 ```yaml
-roles:
-  qa:
-    runner: opencode-cli
-    model: deepseek-v4-flash
-      backup_runner: codex-cli
-      backup_model: gpt-5.4
-  reviewer:
-    runner: opencode-cli
-    model: deepseek-v4-pro
+automation:
+  quality:
+    qa:
+      mode: local
+      max_parallel: 2
+    review:
+      mode: not-required
+    completion:
+      auto_resolve_review_when_not_required: true
+      auto_close_delivery_not_applicable: true
+  failure:
+    qa:
+      strategy: remediation-task
+      max_attempts: 2
+    review:
+      strategy: remediation-task
+      max_attempts: 2
 ```
 
-`automation.yaml` deliberately does not redefine `executor` — duplicating
-`default_executor`/`default_model` there would let the two configs drift
-out of sync silently. `pipeline` refuses to run if `qa` or `reviewer`
-resolves to the exact same `(runner, model)` as the executor — QA/review
-existing as a separate phase is pointless if it's the same identity
-re-checking its own work. Each QA/review
-evidence file it writes also records that phase's `runner`, `model`, and a
-fresh `agent_id`, alongside the existing `kind`/`status`/`verdict`/`reason`
-fields (these three identity fields are optional on plain `ai-kit approve`
-too — pass `--runner`/`--model`/`--agent-id` to stamp manual approvals the
-same way). If `verify` fails, `pipeline` stops with the task left at
-implementation-complete` rather than forcing a QA/review verdict on broken
-work. There is deliberately no background scheduler, but an opted-in
-post-completion run can retry rejected work a bounded number of times.
+When `automation.enabled` is true, `complete` starts the resumable pipeline.
+Failure strategy is gate-specific: `retry-current-task` retries only bounded,
+retryable failures; `manual` parks the rejected task; `remediation-task`
+creates `<task>-fix-N`, supersedes the rejected task, and adds the fix to every
+downstream `needs` list so the DAG cannot unlock early. `max_attempts` prevents
+an infinite fix chain.
 
-`ai-kit transition <task-id> complete` can optionally chain straight into
-that same verify -> QA -> review -> close sequence on its own, without a
-follow-up `pipeline` call. This is opt in via `.ai-config/automation.yaml`:
-
-```yaml
-post_completion:
-  enabled: true
-  retry_on_rejection: true
-  max_retries: 2
-  backup_after_retries: 1
-  dispatch_ready_on_close: true
-  dispatch_ready_limit: 1
-```
-
-Missing the `post_completion` section, `enabled: false`, or any
-non-boolean-`true` value all leave `complete` as a plain status
-transition (the pre-existing behavior) — the switch defaults to off so
-existing projects are unaffected until they opt in. When enabled, the run
-is idempotent and resumable: a task already at `done` is a safe no-op; one
-parked at `qa-passed` or `review-approved` (a prior run stopped partway, or
-a verdict rejected it and it was re-completed) resumes from the next
-unfinished phase instead of re-running QA/review that already passed. A
-per-task lock file serializes concurrent triggers for the same task so two
-racing `complete` calls only ever produce one pipeline run — the loser
-observes `post_completion: "already-running"` rather than double-dispatching
-QA/review. If a runner is interrupted after acquiring the lock, the next
-pipeline run checks the recorded PID and recovers the lock only when its
-owning process no longer exists; a live owner remains non-blocking. With
-`retry_on_rejection: true`, a QA or review rejection that
-returns the task to `todo` re-dispatches the executor and runs the full chain
-again until `max_retries` is reached. The retry count is capped at five by the
-engine. After a successful close, `dispatch_ready_on_close` invokes the
-dependency-aware `dispatch-ready` command and starts up to
-`dispatch_ready_limit` runnable tasks. A verify failure or a runner that exits
-without recording a verdict still leaves the task open and records
-`post-completion-failed`; those cases require an explicit fix or pipeline
-rerun.
-
-Each QA/reviewer role may define `backup_runner` and `backup_model`. Once the
-task has exceeded `backup_after_retries` rejected implementation attempts, the
-next QA/review dispatch uses that backup identity. The backup must still be
-different from the executor and must record its own verdict; a different model
-does not grant automatic approval.
+Plan auto-execution is separately guarded. `plan-draft authorize-execution`
+requires explicit user confirmation and stores a digest-bound authorization;
+any plan edit makes it stale. Materialization dispatches ready work only when
+the current authorization mode matches `automation.execution.mode` and the
+configured planning requirements pass.
 
 Every task also records `base_commit` (git HEAD at creation),
 `context_revision` (its context's `.ai-config/contexts.yaml` revision at creation),

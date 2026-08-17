@@ -82,16 +82,27 @@ _GIT_CAPTURE_HEAD_CACHE: dict[str, str | None] = {}
 # .ai-work/tasks/<id>.json: the self-contained "task contract" snapshot
 # written alongside tasks.md by add-task/plan (see state-schema.md's Task
 # contract files section). Bump only when its top-level shape changes.
-TASK_CONTRACT_SCHEMA_VERSION = 2
+TASK_CONTRACT_SCHEMA_VERSION = 3
 # A plan draft is deliberately separate from workflow.json: it captures the
 # evolving result of a human/agent conversation, while workflow.json remains
 # the deterministic execution control plane.  Bump only if the draft's
 # top-level shape changes.
-PLAN_DRAFT_SCHEMA_VERSION = 2
+PLAN_DRAFT_SCHEMA_VERSION = 3
+TASK_RESULT_SCHEMA_VERSION = 1
+RECOVERY_RECOMMENDATION_SCHEMA_VERSION = 1
+FAILURE_TAXONOMY = {
+    "implementation_failure",
+    "test_regression",
+    "architecture_violation",
+    "contract_drift",
+    "dependency_conflict",
+    "environment_inconclusive",
+}
 PLAN_DRAFT_STATUSES = {"drafting", "ready", "materialized"}
 WORKFLOW_STATE_SCHEMA_VERSION = 5
 TASK_LEASE_SECONDS = 30 * 60
 CONFIG_FILES = {
+    "config.yaml",
     "runners.yaml",
     "automation.yaml",
     "registry.yaml",
@@ -194,6 +205,283 @@ def _atomic_write_json(path: Path, value: object) -> None:
     temporary = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _strip_runtime_yaml_comment(line: str) -> str:
+    quote = None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote == '"':
+            escaped = True
+            continue
+        if char in {'"', "'"}:
+            quote = None if quote == char else char if quote is None else quote
+            continue
+        if char == "#" and quote is None and (index == 0 or line[index - 1].isspace()):
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
+def _runtime_yaml_scalar(raw: str, path: Path, line_number: int) -> object:
+    value = raw.strip()
+    if not value:
+        return {}
+    if value.startswith("["):
+        if not value.endswith("]"):
+            raise EngineError(f"{display_path(path)}:{line_number}: inline list must close on the same line")
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        items, token, quote = [], "", None
+        for char in inner + ",":
+            if char in {'"', "'"}:
+                quote = None if quote == char else char if quote is None else quote
+                token += char
+            elif char == "," and quote is None:
+                items.append(_runtime_yaml_scalar(token.strip(), path, line_number)); token = ""
+            else:
+                token += char
+        return items
+    if value == "{}":
+        return {}
+    if value.startswith("{"):
+        raise EngineError(
+            f"{display_path(path)}:{line_number}: inline mappings are not supported; use an indented mapping"
+        )
+    if value.startswith('"'):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise EngineError(f"{display_path(path)}:{line_number}: invalid quoted scalar: {exc}") from exc
+    if value.startswith("'") and value.endswith("'"):
+        return value[1:-1].replace("''", "'")
+    lowered = value.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"null", "~"}:
+        return None
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    return value
+
+
+def _load_strict_runtime_yaml(path: Path) -> dict:
+    """Parse the bounded config.yaml schema without an environment dependency."""
+    if not path.is_file():
+        raise EngineError(f"runtime config not found: {display_path(path)}")
+    logical = []
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = _strip_runtime_yaml_comment(raw)
+        if not line.strip():
+            continue
+        if "\t" in line[:len(line) - len(line.lstrip())]:
+            raise EngineError(f"{display_path(path)}:{number}: tabs are not allowed for indentation")
+        indent = len(line) - len(line.lstrip(" "))
+        if indent % 2:
+            raise EngineError(f"{display_path(path)}:{number}: indentation must use multiples of two spaces")
+        logical.append((number, indent, line.strip()))
+    root: dict = {}
+    stack: list[tuple[int, object]] = [(-2, root)]
+    for index, (number, indent, text_value) in enumerate(logical):
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        if not stack:
+            raise EngineError(f"{display_path(path)}:{number}: invalid indentation")
+        parent = stack[-1][1]
+        if text_value.startswith("- "):
+            if not isinstance(parent, list):
+                raise EngineError(f"{display_path(path)}:{number}: sequence item has no list parent")
+            parent.append(_runtime_yaml_scalar(text_value[2:], path, number))
+            continue
+        if ":" not in text_value or not isinstance(parent, dict):
+            raise EngineError(f"{display_path(path)}:{number}: expected mapping key")
+        key, raw_value = text_value.split(":", 1)
+        key = key.strip()
+        if not key or key in parent:
+            raise EngineError(f"{display_path(path)}:{number}: empty or duplicate key {key!r}")
+        raw_value = raw_value.strip()
+        if raw_value:
+            parent[key] = _runtime_yaml_scalar(raw_value, path, number)
+            continue
+        next_is_list = index + 1 < len(logical) and logical[index + 1][1] > indent and logical[index + 1][2].startswith("- ")
+        child: object = [] if next_is_list else {}
+        parent[key] = child
+        stack.append((indent, child))
+    return root
+
+
+def _project_runtime_config_path() -> Path:
+    return ROOT / ".ai-config" / "config.yaml"
+
+
+def _runtime_config_path() -> Path | None:
+    project = _project_runtime_config_path()
+    if project.is_file():
+        return project
+    # A project that explicitly owns either legacy file remains on the legacy
+    # authority until `config migrate` creates config.yaml.
+    if (ROOT / ".ai-config" / "runners.yaml").exists() or (ROOT / ".ai-config" / "automation.yaml").exists():
+        return None
+    template = ROOT / ".ai" / "install" / "config" / "config.yaml"
+    return template if template.is_file() else None
+
+
+def _require_mapping(value: object, label: str) -> dict:
+    if not isinstance(value, dict):
+        raise EngineError(f"config.yaml: {label} must be a mapping")
+    return value
+
+
+def _require_list(value: object, label: str) -> list:
+    if not isinstance(value, list):
+        raise EngineError(f"config.yaml: {label} must be a list")
+    return value
+
+
+def _validate_runtime_config(config: dict) -> dict:
+    if config.get("version") != 1:
+        raise EngineError("config.yaml must use version: 1")
+    unknown = set(config) - {"version", "runners", "automation"}
+    if unknown:
+        raise EngineError(f"config.yaml has unknown top-level keys: {', '.join(sorted(unknown))}")
+    runners = _require_mapping(config.get("runners"), "runners")
+    profiles = _require_mapping(runners.get("profiles"), "runners.profiles")
+    default = _require_mapping(runners.get("default"), "runners.default")
+    aliases = _require_mapping(runners.get("aliases", {}), "runners.aliases")
+    if default.get("name") not in profiles:
+        raise EngineError("config.yaml: runners.default.name must name a runner profile")
+    for name, raw_profile in profiles.items():
+        profile = _require_mapping(raw_profile, f"runners.profiles.{name}")
+        if profile.get("model") is not None:
+            if profile.get("models") is not None:
+                raise EngineError(f"config.yaml: runner {name} cannot declare both model and models")
+            profile["models"] = [profile.pop("model")]
+        if not isinstance(profile.get("command"), str) or not profile["command"].strip():
+            raise EngineError(f"config.yaml: runner {name} requires command")
+        for key in ("models", "capabilities", "roles", "task_kinds"):
+            if key in profile:
+                _require_list(profile[key], f"runners.profiles.{name}.{key}")
+        models = profile.get("models", [])
+        for key in ("pool_model",):
+            if profile.get(key) is not None and profile[key] not in models:
+                raise EngineError(f"config.yaml: runner {name}.{key} must be present in models")
+        maximum = profile.get("max_parallel", 1)
+        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
+            raise EngineError(f"config.yaml: runner {name}.max_parallel must be a non-negative integer")
+        if models and "{model}" not in profile["command"]:
+            raise EngineError(f"config.yaml: runner {name} declares models but command has no {{model}} placeholder")
+    default_model = default.get("model")
+    if default_model is not None and default_model not in profiles[default["name"]].get("models", []):
+        raise EngineError("config.yaml: runners.default.model is not allowed by its profile")
+    for alias, target in aliases.items():
+        if not isinstance(target, str) or not alias:
+            raise EngineError("config.yaml: runner aliases must map names to runner references")
+
+    automation = _require_mapping(config.get("automation"), "automation")
+    if not isinstance(automation.get("enabled"), bool):
+        raise EngineError("config.yaml: automation.enabled must be boolean")
+    planning = _require_mapping(automation.get("planning", {}), "automation.planning")
+    auto_execute = _require_mapping(planning.get("auto_execute", {}), "automation.planning.auto_execute")
+    if "enabled" in auto_execute and not isinstance(auto_execute["enabled"], bool):
+        raise EngineError("config.yaml: automation.planning.auto_execute.enabled must be boolean")
+    if "require" in auto_execute:
+        requirements = _require_list(auto_execute["require"], "automation.planning.auto_execute.require")
+        required_gates = {"valid_dag", "complete_acceptance_criteria", "current_execution_authorization"}
+        unknown_requirements = set(requirements) - required_gates
+        if unknown_requirements:
+            raise EngineError(f"config.yaml: unknown auto-execution requirements: {', '.join(sorted(unknown_requirements))}")
+        if auto_execute.get("enabled") and not required_gates.issubset(set(requirements)):
+            raise EngineError("config.yaml: auto-execution requires valid_dag, complete_acceptance_criteria, and current_execution_authorization")
+    if auto_execute and auto_execute.get("trigger", "plan-materialized") != "plan-materialized":
+        raise EngineError("config.yaml: only plan-materialized auto-execution is supported")
+    execution = _require_mapping(automation.get("execution", {}), "automation.execution")
+    mode = execution.get("mode", "parallel")
+    if mode not in {"sequential", "parallel"}:
+        raise EngineError("config.yaml: automation.execution.mode must be sequential or parallel")
+    for key, default_value in (("max_parallel_tasks", 1), ("dispatch_ready_limit", 1)):
+        value = execution.get(key, default_value)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise EngineError(f"config.yaml: automation.execution.{key} must be a positive integer")
+    if "auto_dispatch_ready" in execution and not isinstance(execution["auto_dispatch_ready"], bool):
+        raise EngineError("config.yaml: automation.execution.auto_dispatch_ready must be boolean")
+    isolation = _require_mapping(execution.get("isolation", {}), "automation.execution.isolation")
+    for key in ("worktree_per_task", "require_disjoint_paths"):
+        if key in isolation and not isinstance(isolation[key], bool):
+            raise EngineError(f"config.yaml: automation.execution.isolation.{key} must be boolean")
+    quality = _require_mapping(automation.get("quality", {}), "automation.quality")
+    qa = _require_mapping(quality.get("qa", {}), "automation.quality.qa")
+    if qa.get("mode", "local") not in {"local", "disabled"}:
+        raise EngineError("config.yaml: QA authority supports mode local or disabled")
+    qa_parallel = qa.get("max_parallel", 1)
+    if not isinstance(qa_parallel, int) or isinstance(qa_parallel, bool) or qa_parallel < 1:
+        raise EngineError("config.yaml: automation.quality.qa.max_parallel must be positive")
+    review = _require_mapping(quality.get("review", {}), "automation.quality.review")
+    if review.get("mode", "manual") not in {"independent", "manual", "not-required"}:
+        raise EngineError("config.yaml: review.mode must be independent, manual, or not-required")
+    if review.get("mode") == "independent" and not review.get("runner"):
+        raise EngineError("config.yaml: independent review requires a runner")
+    completion = _require_mapping(quality.get("completion", {}), "automation.quality.completion")
+    for key in ("auto_resolve_review_when_not_required", "auto_close_delivery_not_applicable"):
+        if key in completion and not isinstance(completion[key], bool):
+            raise EngineError(f"config.yaml: automation.quality.completion.{key} must be boolean")
+    failure = _require_mapping(automation.get("failure", {}), "automation.failure")
+    for gate in ("qa", "review"):
+        policy = _require_mapping(failure.get(gate, {}), f"automation.failure.{gate}")
+        if policy.get("strategy", "manual") not in {"retry-current-task", "remediation-task", "manual"}:
+            raise EngineError(f"config.yaml: failure.{gate}.strategy is invalid")
+        attempts = policy.get("max_attempts", 0)
+        if not isinstance(attempts, int) or isinstance(attempts, bool) or not 0 <= attempts <= 10:
+            raise EngineError(f"config.yaml: failure.{gate}.max_attempts must be between 0 and 10")
+    return config
+
+
+def _load_runtime_config() -> dict | None:
+    path = _runtime_config_path()
+    return _validate_runtime_config(_load_strict_runtime_yaml(path)) if path else None
+
+
+def _runtime_yaml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, list):
+        return json.dumps(value, ensure_ascii=False)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _dump_runtime_yaml(config: dict) -> str:
+    lines: list[str] = []
+
+    def emit(mapping: dict, indent: int) -> None:
+        prefix = " " * indent
+        for key, value in mapping.items():
+            if isinstance(value, dict):
+                if value:
+                    lines.append(f"{prefix}{key}:")
+                    emit(value, indent + 2)
+                else:
+                    lines.append(f"{prefix}{key}: {{}}")
+            else:
+                lines.append(f"{prefix}{key}: {_runtime_yaml_value(value)}")
+
+    emit(config, 0)
+    return "\n".join(lines) + "\n"
+
+
+def _write_runtime_config(config: dict) -> Path:
+    validated = _validate_runtime_config(config)
+    path = _project_runtime_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+    temporary.write_text(_dump_runtime_yaml(validated), encoding="utf-8")
+    os.replace(temporary, path)
+    return path
 
 
 def _load_contract_registry() -> dict:
@@ -508,6 +796,9 @@ def _load_epics() -> dict:
 
 def _load_runners() -> dict:
     """Load runner profiles from the structured YAML registry."""
+    runtime = _load_runtime_config()
+    if runtime:
+        return runtime["runners"]["profiles"]
     return _load_yaml_registry(".ai-config/runners.yaml", "runners")
 
 
@@ -558,6 +849,23 @@ def _load_automation_roles() -> dict:
     plain `dispatch` uses. automation.yaml only needs to add the two roles
     (qa, reviewer) that have no equivalent anywhere else in the registry.
     """
+    runtime = _load_runtime_config()
+    if runtime:
+        quality = runtime["automation"].get("quality", {})
+        qa = quality.get("qa", {})
+        review = quality.get("review", {})
+        roles = {
+            "qa": {"enabled": qa.get("mode", "local") == "local", "mode": qa.get("mode", "local")},
+            "reviewer": {
+                "enabled": review.get("mode", "manual") == "independent",
+                "mode": review.get("mode", "manual"),
+                "runner": review.get("runner"),
+                "model": review.get("model"),
+                "backup_runner": review.get("backup_runner"),
+                "backup_model": review.get("backup_model"),
+            },
+        }
+        return roles
     roles = _load_yaml_registry(".ai-config/automation.yaml", "roles")
     for name in ("qa", "reviewer"):
         if name not in roles:
@@ -608,6 +916,19 @@ def _load_post_completion_config() -> dict:
     mis-indented key were indistinguishable from never having configured
     automation at all, and the only symptom was tasks silently not advancing.
     """
+    runtime = _load_runtime_config()
+    if runtime:
+        automation = runtime["automation"]
+        execution = automation.get("execution", {})
+        failure = automation.get("failure", {}).get("qa", {})
+        return {
+            "enabled": automation.get("enabled", False),
+            "retry_on_rejection": failure.get("strategy", "manual") == "retry-current-task",
+            "max_retries": failure.get("max_attempts", 0),
+            "dispatch_ready_on_close": execution.get("auto_dispatch_ready", False),
+            "dispatch_ready_limit": execution.get("dispatch_ready_limit", 1),
+            "backup_after_retries": 1,
+        }
     BOOL_KEYS = {"enabled", "retry_on_rejection", "dispatch_ready_on_close"}
     INT_KEYS = {"max_retries": (0, 5), "dispatch_ready_limit": (1, 50), "backup_after_retries": (1, 5)}
     TRUE = {"true", "yes", "on", "1"}
@@ -673,6 +994,9 @@ def _post_completion_enabled() -> bool:
 
 def _load_runner_aliases() -> dict[str, str]:
     """Load legacy runner-name aliases from a flat YAML section."""
+    runtime = _load_runtime_config()
+    if runtime:
+        return {str(key): str(value) for key, value in runtime["runners"].get("aliases", {}).items()}
     path = _config_path("runners.yaml")
     if not path.exists():
         return {}
@@ -707,6 +1031,9 @@ def _runner_scalar(value: str) -> str:
 
 def _default_executor() -> str | None:
     """Read the top-level `default_executor: <name>` scalar from .ai-config/runners.yaml, or None if unset."""
+    runtime = _load_runtime_config()
+    if runtime:
+        return runtime["runners"]["default"].get("name")
     path = _config_path("runners.yaml")
     if not path.exists():
         return None
@@ -725,6 +1052,9 @@ def _default_executor() -> str | None:
 
 def _default_model() -> str | None:
     """Read the top-level default model paired with default_executor."""
+    runtime = _load_runtime_config()
+    if runtime:
+        return runtime["runners"]["default"].get("model")
     path = _config_path("runners.yaml")
     if not path.exists():
         return None
@@ -798,7 +1128,7 @@ def _runner_supports(name: str, entry: dict, task: dict, state: dict, reviewer: 
     return True, None
 
 
-def _select_runner_for_task(task: dict, state: dict, explicit: str | None, model: str | None, reviewer: bool = False) -> tuple[str, dict, str | None]:
+def _select_runner_for_task(task: dict, state: dict, explicit: str | None, model: str | None, reviewer: bool = False, pool: bool = False) -> tuple[str, dict, str | None]:
     if explicit:
         name, entry, selected_model = _resolve_runner(explicit, model)
         eligible, reason = _runner_supports(name, entry, task, state, reviewer=reviewer)
@@ -821,7 +1151,11 @@ def _select_runner_for_task(task: dict, state: dict, explicit: str | None, model
         raise EngineError(f"no runner satisfies capability contract for task {task['id']}")
     for _priority, name, entry in sorted(candidates):
         try:
-            return _resolve_runner(name, model)
+            pool_model = model
+            if pool and pool_model is None:
+                models = _entry_models(entry)
+                pool_model = entry.get("pool_model") or (models[0] if models else None)
+            return _resolve_runner(name, pool_model)
         except EngineError as exc:
             if "supports multiple models" not in str(exc):
                 raise
@@ -851,7 +1185,7 @@ def _resolve_runner(explicit: str | None, requested_model: str | None = None) ->
     name = explicit or default_executor
     if not name:
         raise EngineError(
-            "no --runner given and no default_executor configured in .ai-config/runners.yaml; "
+            "no --runner given and no default runner configured in .ai-config/config.yaml (or legacy runners.yaml); "
             "pass --runner explicitly or set one via 'ai-kit runner add <name> --default'"
         )
     alias_target = aliases.get(name)
@@ -894,6 +1228,15 @@ def _write_runners(
     default_model: str | None,
     aliases: dict[str, str],
 ) -> None:
+    runtime = _load_runtime_config()
+    if runtime:
+        runtime["runners"] = {
+            "default": {"name": default_executor, "model": default_model},
+            "profiles": runners,
+            "aliases": aliases,
+        }
+        _write_runtime_config(runtime)
+        return
     path = _writable_config_path("runners.yaml")
     lines = []
     if default_executor:
@@ -908,7 +1251,7 @@ def _write_runners(
         if fields.get("models"):
             models = _entry_models(fields)
             lines.append(f"    models: {json.dumps(models, ensure_ascii=False)}")
-        for key in ("model", "provider", "description", "input"):
+        for key in ("model", "pool_model", "provider", "description", "input"):
             if fields.get(key) is not None and fields.get(key) != "":
                 lines.append(f"    {key}: {_runner_scalar(str(fields[key]))}")
         for key in ("capabilities", "roles", "task_kinds"):
@@ -1220,6 +1563,7 @@ TRANSITIONS = {
     "complete": ({"in-progress"}, "implementation-complete"),
     "qa-pass": ({"implementation-complete"}, "qa-passed"),
     "review-approve": ({"qa-passed"}, "review-approved"),
+    "review-waive": ({"qa-passed"}, "review-approved"),
     "close": ({"review-approved"}, "done"),
     "block": ({"todo", "in-progress", "implementation-complete", "qa-passed", "review-approved"}, "blocked"),
     "unblock": ({"blocked"}, "todo"),
@@ -1422,6 +1766,81 @@ def _governance_baseline(task: dict) -> dict:
     }
 
 
+def _normalize_task_contract_v3(task: dict) -> dict:
+    """Add v3 execution boundaries without removing the legacy ``files`` field."""
+    for key in ("files", "constraints"):
+        if key in task and task[key] is not None and not isinstance(task[key], list):
+            raise EngineError(f"task contract {key} must be a list")
+    for key in ("scope", "qa_contract", "output_contract"):
+        if key in task and task[key] is not None and not isinstance(task[key], dict):
+            raise EngineError(f"task contract {key} must be an object")
+    files = list(dict.fromkeys(str(item) for item in (task.get("files") or []) if str(item).strip()))
+    raw_scope = task.get("scope") if isinstance(task.get("scope"), dict) else {}
+    for key in ("allowed_files", "forbidden_files"):
+        if key in raw_scope and not isinstance(raw_scope[key], list):
+            raise EngineError(f"task contract scope.{key} must be a list")
+    allowed = list(dict.fromkeys(
+        str(item) for item in (raw_scope.get("allowed_files") or files) if str(item).strip()
+    ))
+    forbidden = list(dict.fromkeys(
+        str(item) for item in (raw_scope.get("forbidden_files") or []) if str(item).strip()
+    ))
+    task["files"] = files
+    task["scope"] = {"allowed_files": allowed, "forbidden_files": forbidden}
+    task["constraints"] = list(dict.fromkeys(
+        str(item) for item in (task.get("constraints") or []) if str(item).strip()
+    ))
+    raw_qa = task.get("qa_contract") if isinstance(task.get("qa_contract"), dict) else {}
+    for key in ("required_checks", "commands"):
+        if key in raw_qa and not isinstance(raw_qa[key], list):
+            raise EngineError(f"task contract qa_contract.{key} must be a list")
+    task["qa_contract"] = {
+        "required_checks": list(dict.fromkeys(
+            str(item) for item in (raw_qa.get("required_checks") or []) if str(item).strip()
+        )),
+        "commands": list(dict.fromkeys(
+            str(item) for item in (raw_qa.get("commands") or []) if str(item).strip()
+        )),
+    }
+    raw_output = task.get("output_contract") if isinstance(task.get("output_contract"), dict) else {}
+    for key in ("exports", "evidence_kinds"):
+        if key in raw_output and not isinstance(raw_output[key], list):
+            raise EngineError(f"task contract output_contract.{key} must be a list")
+    if "changed_files" in raw_output and not isinstance(raw_output["changed_files"], bool):
+        raise EngineError("task contract output_contract.changed_files must be a boolean")
+    task["output_contract"] = {
+        "changed_files": bool(raw_output.get("changed_files", True)),
+        "exports": list(dict.fromkeys(
+            str(item) for item in (raw_output.get("exports") or []) if str(item).strip()
+        )),
+        "evidence_kinds": list(dict.fromkeys(
+            str(item) for item in (raw_output.get("evidence_kinds") or []) if str(item).strip()
+        )),
+    }
+    return task
+
+
+def _task_contract_v3_fields(args: argparse.Namespace) -> dict:
+    files = list(getattr(args, "files", None) or [])
+    return _normalize_task_contract_v3({
+        "files": files,
+        "scope": {
+            "allowed_files": files,
+            "forbidden_files": getattr(args, "forbidden_file", None) or [],
+        },
+        "constraints": getattr(args, "constraint", None) or [],
+        "qa_contract": {
+            "required_checks": getattr(args, "required_check", None) or [],
+            "commands": getattr(args, "qa_command", None) or [],
+        },
+        "output_contract": {
+            "changed_files": not bool(getattr(args, "no_changed_files", False)),
+            "exports": getattr(args, "output_export", None) or [],
+            "evidence_kinds": getattr(args, "output_evidence_kind", None) or [],
+        },
+    })
+
+
 def _new_task_governance_fields(args: argparse.Namespace) -> dict:
     task_kind = getattr(args, "task_kind", None) or "general"
     required_capabilities = list(dict.fromkeys(getattr(args, "required_capability", None) or []))
@@ -1431,6 +1850,7 @@ def _new_task_governance_fields(args: argparse.Namespace) -> dict:
         "required_capabilities": required_capabilities,
         "contract_refs": contract_refs,
         "assignment": None,
+        **_task_contract_v3_fields(args),
     }
     fields["governance_baseline"] = _governance_baseline({**fields})
     return fields
@@ -1925,6 +2345,8 @@ def validate(state: dict) -> None:
         task.setdefault("contract_hashes", {})
         task.setdefault("upstream_context_revisions", {})
         task.setdefault("superseded_by", None)
+        task.setdefault("remediates", None)
+        task.setdefault("remediation_attempt", None)
         task.setdefault("contract_revision", None)
         task.setdefault("contract_hash", None)
         task.setdefault("claim_id", None)
@@ -1933,6 +2355,7 @@ def validate(state: dict) -> None:
         task.setdefault("required_capabilities", [])
         task.setdefault("contract_refs", [])
         task.setdefault("assignment", None)
+        _normalize_task_contract_v3(task)
         # Existing v4 tasks remain explicitly outside new governance gates.
         # Operators opt them in with `backfill-governance`.
         task.setdefault("governance_baseline", None)
@@ -1954,11 +2377,21 @@ def validate(state: dict) -> None:
             raise EngineError(f"task {task['id']} has invalid task_kind: {task.get('task_kind')}")
         if not isinstance(task.get("required_capabilities"), list):
             raise EngineError(f"task {task['id']} required_capabilities must be a list")
+        if not isinstance(task.get("constraints"), list):
+            raise EngineError(f"task {task['id']} constraints must be a list")
+        if not isinstance(task.get("scope"), dict) or not isinstance(task["scope"].get("allowed_files"), list) or not isinstance(task["scope"].get("forbidden_files"), list):
+            raise EngineError(f"task {task['id']} scope must contain allowed_files and forbidden_files lists")
+        if not isinstance(task.get("qa_contract"), dict) or not isinstance(task["qa_contract"].get("required_checks"), list) or not isinstance(task["qa_contract"].get("commands"), list):
+            raise EngineError(f"task {task['id']} qa_contract must contain required_checks and commands lists")
+        if not isinstance(task.get("output_contract"), dict) or not isinstance(task["output_contract"].get("exports"), list) or not isinstance(task["output_contract"].get("evidence_kinds"), list):
+            raise EngineError(f"task {task['id']} output_contract is invalid")
         task["contract_refs"] = _normalize_contract_refs(task.get("contract_refs"))
         if task["status"] == "superseded" and not task.get("superseded_by"):
             raise EngineError(f"task {task['id']} is superseded but has no superseded_by task recorded")
         if task.get("superseded_by") and task["superseded_by"] not in tasks:
             raise EngineError(f"task {task['id']} superseded_by references unknown task: {task['superseded_by']}")
+        if task.get("remediates") and task["remediates"] not in tasks:
+            raise EngineError(f"task {task['id']} remediates unknown task: {task['remediates']}")
         if task["owner"] not in role_names():
             raise EngineError(f"task {task['id']} has unknown owner: {task['owner']}")
         if not task["phase"].strip() or not task["acceptance"]:
@@ -2187,7 +2620,7 @@ def _file_conflicts(task: dict, state: dict) -> list[dict]:
     missing or wrong, e.g. a task added by a different agent/process that
     didn't know about the overlap.
     """
-    task_files = set(task.get("files") or [])
+    task_files = set((task.get("scope") or {}).get("allowed_files") or task.get("files") or [])
     if not task_files:
         return []
     tasks = task_map(state)
@@ -2196,7 +2629,14 @@ def _file_conflicts(task: dict, state: dict) -> list[dict]:
     for other in state["tasks"]:
         if other["id"] == task["id"] or other["status"] != "in-progress":
             continue
-        overlap = task_files & set(other.get("files") or [])
+        other_files = set((other.get("scope") or {}).get("allowed_files") or other.get("files") or [])
+        overlap = {
+            left for left in task_files for right in other_files
+            if left == right
+            or left.rstrip("/*") == right.rstrip("/*")
+            or fnmatch.fnmatch(left.rstrip("/*"), right)
+            or fnmatch.fnmatch(right.rstrip("/*"), left)
+        }
         if not overlap:
             continue
         if other["id"] in upstream or task["id"] in _transitive_needs(other["id"], tasks):
@@ -2474,6 +2914,10 @@ def _artifact_source_fingerprint(state_file: Path) -> tuple[str, dict]:
     evidence_root = workspace(state_file) / "evidence"
     if evidence_root.exists():
         candidates.extend(sorted(path for path in evidence_root.rglob("*.json") if path.is_file()))
+    for projection_name in ("results", "recovery"):
+        projection_root = workspace(state_file) / projection_name
+        if projection_root.exists():
+            candidates.extend(sorted(path for path in projection_root.glob("*.json") if path.is_file()))
     archive = workspace(state_file) / "logs" / "events.jsonl"
     candidates.append(archive)
     files: dict[str, str | None] = {}
@@ -3332,16 +3776,31 @@ def _task_artifact(state_file: Path, state: dict | None, evidence: dict) -> dict
         entry = _board_entry(task, state_file)
         entry.update({"tags": task.get("tags", []), "files": task.get("files", []), "acceptance_count": len(task.get("acceptance", [])), "procedure": procedure["id"]})
         board[task["status"]].append(entry)
+        result_ref = _result_reference(state_file, task["id"])
+        recovery = _current_recovery_recommendation(state_file, task["id"])
+        recovery_path = _recovery_recommendation_path(state_file, task["id"])
+        recovery_ref = ({
+            "path": _portable_workspace_ref(state_file, recovery_path),
+            "sha256": hashlib.sha256(recovery_path.read_bytes()).hexdigest(),
+            "classification": recovery.get("classification"),
+            "recommended_action": recovery.get("recommended_action"),
+        } if recovery and recovery_path.is_file() else None)
         items.append({
             "id": stable_id, "task_id": task["id"], "title": task["title"], "owner": task["owner"],
             "phase": task["phase"], "status": task["status"], "task_kind": task.get("task_kind", "general"),
             "context_ref": f"context:{task['context']}" if task.get("context") else None,
             "epic": task.get("epic"), "needs": [f"task:{state['workflow_id']}:{dep}" for dep in task.get("needs", [])],
             "acceptance": task.get("acceptance", []), "files": task.get("files", []), "tags": task.get("tags", []),
+            "scope": task.get("scope"), "constraints": task.get("constraints", []),
+            "qa_contract": task.get("qa_contract"), "output_contract": task.get("output_contract"),
             "assignment": task.get("assignment"), "governance_baseline": task.get("governance_baseline"),
+            "remediates": f"task:{state['workflow_id']}:{task['remediates']}" if task.get("remediates") else None,
+            "remediation_attempt": task.get("remediation_attempt"),
+            "superseded_by": f"task:{state['workflow_id']}:{task['superseded_by']}" if task.get("superseded_by") else None,
             "procedure": {key: procedure[key] for key in ("id", "operation", "outputs", "authority", "actors")},
             "contract_refs": [{**ref, "contract_ref": f"contract:{ref['id']}@{ref['version']}"} for ref in task.get("contract_refs", [])],
             "evidence_refs": sorted(evidence_by_task.get(stable_id, [])), "blocked_reason": task.get("blocked_reason"),
+            "result_ref": result_ref, "recovery_ref": recovery_ref,
             "ready": runnable(task, task_map(state)),
         })
     return {"items": items, "board": board, "counts": {status: len(board[status]) for status in STATUSES}}
@@ -3992,8 +4451,20 @@ def cmd_artifact_generate(args: argparse.Namespace) -> dict:
 
 
 def cmd_artifact_validate(args: argparse.Namespace) -> dict:
-    manifest, payloads = _load_published_artifacts(state_path(getattr(args, "state", None)))
-    return {**_validate_artifact_payloads(payloads, manifest), "root": display_path(_artifact_root(state_path(getattr(args, "state", None))))}
+    state_file = state_path(getattr(args, "state", None))
+    manifest, payloads = _load_published_artifacts(state_file)
+    result = _validate_artifact_payloads(payloads, manifest)
+    # Bundle integrity alone is not enough for a derived projection: it must
+    # also describe the current authoritative inputs. Keep a stale bundle
+    # readable for the visualizer's last-known-good render, but never report
+    # it as a fully valid current projection to CLI/automation consumers.
+    current_fingerprint, _inputs = _artifact_source_fingerprint(state_file)
+    result["fresh"] = manifest.get("source_fingerprint") == current_fingerprint
+    result["source_fingerprint"] = manifest.get("source_fingerprint")
+    result["current_source_fingerprint"] = current_fingerprint
+    if not result["fresh"]:
+        raise EngineError("artifact bundle is stale; run 'ai-kit artifact generate --refresh'")
+    return {**result, "root": display_path(_artifact_root(state_file))}
 
 
 def cmd_artifact_show(args: argparse.Namespace) -> dict:
@@ -4218,6 +4689,10 @@ def _task_contract_dict(task: dict, revision: int, created_at: str, updated_at: 
         "depends_on": task.get("depends_on", []),
         "acceptance": task["acceptance"],
         "files": task["files"],
+        "scope": task.get("scope", {"allowed_files": task["files"], "forbidden_files": []}),
+        "constraints": task.get("constraints", []),
+        "qa_contract": task.get("qa_contract", {"required_checks": [], "commands": []}),
+        "output_contract": task.get("output_contract", {"changed_files": True, "exports": [], "evidence_kinds": []}),
         "tags": task.get("tags", []),
         "context": task.get("context"),
         "epic": task.get("epic"),
@@ -4226,6 +4701,8 @@ def _task_contract_dict(task: dict, revision: int, created_at: str, updated_at: 
         "required_capabilities": task.get("required_capabilities", []),
         "contract_refs": task.get("contract_refs", []),
         "governance_baseline": task.get("governance_baseline"),
+        "remediates": task.get("remediates"),
+        "remediation_attempt": task.get("remediation_attempt"),
         "created_at": created_at,
         "updated_at": updated_at,
     }
@@ -4300,10 +4777,10 @@ def _resolve_task_definition(task_id: str, state: dict, state_file: Path) -> dic
     except json.JSONDecodeError as exc:
         raise EngineError(f"invalid task contract JSON: {display_path(contract_path)}: {exc}") from exc
     merged = dict(task)
-    for field in ("title", "owner", "phase", "needs", "depends_on", "acceptance", "files", "tags", "context", "epic", "base_commit", "task_kind", "required_capabilities", "contract_refs", "governance_baseline"):
+    for field in ("title", "owner", "phase", "needs", "depends_on", "acceptance", "files", "scope", "constraints", "qa_contract", "output_contract", "tags", "context", "epic", "base_commit", "task_kind", "required_capabilities", "contract_refs", "governance_baseline", "remediates", "remediation_attempt"):
         if field in contract:
             merged[field] = contract[field]
-    return merged
+    return _normalize_task_contract_v3(merged)
 
 
 def cmd_add_task(args: argparse.Namespace) -> dict:
@@ -4340,8 +4817,12 @@ def cmd_update_task(args: argparse.Namespace) -> dict:
     if not task:
         raise EngineError(f"unknown task: {args.id}")
     add_acceptance = _flatten_repeated(args.add_acceptance)
-    if not add_acceptance and not args.add_files and not args.add_tags:
-        raise EngineError("update-task requires at least one of --add-acceptance, --add-files, --add-tags")
+    v3_changes = any(getattr(args, name, None) for name in (
+        "add_forbidden_file", "add_constraint", "add_required_check", "add_qa_command",
+        "add_output_export", "add_output_evidence_kind",
+    ))
+    if not add_acceptance and not args.add_files and not args.add_tags and not v3_changes:
+        raise EngineError("update-task requires at least one additive task-contract field")
     detail_parts = []
     if add_acceptance:
         task["acceptance"].extend(add_acceptance)
@@ -4352,6 +4833,21 @@ def cmd_update_task(args: argparse.Namespace) -> dict:
     if args.add_tags:
         task["tags"].extend(t for t in args.add_tags if t not in task["tags"])
         detail_parts.append("tags: " + ", ".join(args.add_tags))
+    _normalize_task_contract_v3(task)
+    for arg_name, target, key, label in (
+        ("add_forbidden_file", task["scope"], "forbidden_files", "forbidden files"),
+        ("add_constraint", task, "constraints", "constraints"),
+        ("add_required_check", task["qa_contract"], "required_checks", "required checks"),
+        ("add_qa_command", task["qa_contract"], "commands", "QA commands"),
+        ("add_output_export", task["output_contract"], "exports", "output exports"),
+        ("add_output_evidence_kind", task["output_contract"], "evidence_kinds", "output evidence kinds"),
+    ):
+        values = getattr(args, arg_name, None) or []
+        if values:
+            target[key].extend(value for value in values if value not in target[key])
+            detail_parts.append(f"{label}: " + ", ".join(values))
+    if args.add_files:
+        task["scope"]["allowed_files"] = list(task["files"])
     # Contract fields (acceptance/files/tags) just changed, so the contract
     # file is stale the instant this returns unless it's rewritten here too
     # -- bump its revision, preserve its original created_at, and record the
@@ -4387,8 +4883,13 @@ def cmd_transition(args: argparse.Namespace) -> dict:
     task = task_map(state).get(args.id)
     if not task:
         raise EngineError(f"unknown task: {args.id}")
+    if args.action == "review-waive":
+        if not getattr(args, "_control_plane", False):
+            raise EngineError("review-waive is control-plane-only; configure review.mode=not-required and use the post-completion pipeline")
+        if _load_rules().get("review_required", True):
+            raise EngineError("review-waive requires rules.review_required: false")
     if (
-        args.action in {"qa-pass", "review-approve", "close", "reject"}
+        args.action in {"qa-pass", "review-approve", "review-waive", "close", "reject"}
         and task.get("governance_baseline") is not None
         and task.get("assignment")
         and not getattr(args, "_control_plane", False)
@@ -4426,7 +4927,7 @@ def cmd_transition(args: argparse.Namespace) -> dict:
             raise EngineError(f"supersede --by references unknown task: {by_id_arg}")
         if by_id_arg == task["id"]:
             raise EngineError(f"task {task['id']} cannot be superseded by itself")
-    if args.action in {"qa-pass", "review-approve", "reject"}:
+    if args.action in {"qa-pass", "review-approve", "review-waive", "reject"}:
         # P0-4: Executor must not QA/review/reject their own work. claimed_by may
         # carry a per-agent-instance suffix ("role#agent_id"); compare on the role
         # alone so this still blocks self-review when multiple agents share a role.
@@ -4442,7 +4943,7 @@ def cmd_transition(args: argparse.Namespace) -> dict:
                 f"{args.action} requires the active --claim-id and --agent-id for task {args.id}; "
                 "use reclaim after the lease expires"
             )
-    if args.action in {"qa-pass", "review-approve"}:
+    if args.action in {"qa-pass", "review-approve", "review-waive"}:
         if not args.evidence:
             raise EngineError(f"{args.action} requires at least one --evidence path")
         validate_evidence(task, args.action, args.evidence)
@@ -4474,6 +4975,11 @@ def cmd_transition(args: argparse.Namespace) -> dict:
     requested_revision = getattr(args, "expected_revision", None)
     expected = requested_revision if requested_revision is not None else state["revision"]
     save(state, path, expected)
+    if args.action == "complete":
+        try:
+            _write_task_result(path, state, task)
+        except (OSError, EngineError, json.JSONDecodeError) as exc:
+            print(f"WARNING: task result generation failed for {task['id']}: {exc}", file=sys.stderr)
     # tasks.md is the file prompt-mode runners are told to execute from, so it
     # must never describe a transition the state write refused. Rendering it
     # after save() keeps it a projection of committed state rather than of the
@@ -4532,8 +5038,9 @@ def cmd_plan(args: argparse.Namespace) -> dict:
     depends_on = args.depends_on or []
     contract_hashes = _contract_hashes(depends_on)
     acceptance = _flatten_repeated(args.acceptance)
-    planning_args = argparse.Namespace(task_kind="general", required_capability=[], contract_ref=[])
-    plan_task = {"id": "T1", "title": "Confirm scope and plan: " + args.idea, "owner": "planner", "phase": "plan", "needs": [], "status": "todo", "acceptance": ["Scope, exclusions, risks, and acceptance criteria confirmed"], "files": [".ai-work/roadmap/roadmap.md", ".ai-work/plan/plan.md", ".ai-work/tasks/tasks.md"], "tags": ["planning"], "attempts": 0, "evidence": [], "blocked_reason": None, "claimed_by": None, "base_commit": base_commit, "context_revision": None, "epic_revision": None, "depends_on": [], "contract_hashes": {}, "contract_revision": None, "contract_hash": None, **_new_task_governance_fields(planning_args)}
+    planning_files = [".ai-work/roadmap/roadmap.md", ".ai-work/plan/plan.md", ".ai-work/tasks/tasks.md"]
+    planning_args = argparse.Namespace(task_kind="general", required_capability=[], contract_ref=[], files=planning_files)
+    plan_task = {"id": "T1", "title": "Confirm scope and plan: " + args.idea, "owner": "planner", "phase": "plan", "needs": [], "status": "todo", "acceptance": ["Scope, exclusions, risks, and acceptance criteria confirmed"], "files": planning_files, "tags": ["planning"], "attempts": 0, "evidence": [], "blocked_reason": None, "claimed_by": None, "base_commit": base_commit, "context_revision": None, "epic_revision": None, "depends_on": [], "contract_hashes": {}, "contract_revision": None, "contract_hash": None, **_new_task_governance_fields(planning_args)}
     build_task = {"id": "T2", "title": args.idea, "owner": args.owner, "phase": args.phase, "needs": ["T1"], "status": "todo", "acceptance": acceptance, "files": args.files or [], "tags": args.tags or [], "attempts": 0, "evidence": [], "blocked_reason": None, "claimed_by": None, "context": context, "epic": epic, "base_commit": base_commit, "context_revision": _context_revision(context), "epic_revision": _epic_revision(epic), "upstream_context_revisions": _upstream_context_revisions(context), "depends_on": depends_on, "contract_hashes": contract_hashes, "contract_revision": None, "contract_hash": None, **_new_task_governance_fields(args)}
     timestamp = now()
     plan_payload, plan_hash = _build_task_contract(plan_task, 1, timestamp)
@@ -4575,12 +5082,14 @@ def _validate_plan_draft_shape(draft: dict, path: Path) -> None:
     missing = required - set(draft)
     if missing:
         raise EngineError(f"plan draft {display_path(path)} missing keys: {', '.join(sorted(missing))}")
-    if draft["schema_version"] == 1:
+    if draft["schema_version"] in {1, 2}:
         for task in draft.get("tasks", []):
             task.setdefault("task_kind", "general")
             task.setdefault("required_capabilities", [])
             task.setdefault("contract_refs", [])
+            _normalize_task_contract_v3(task)
         draft["schema_version"] = PLAN_DRAFT_SCHEMA_VERSION
+    draft.setdefault("execution_authorization", None)
     if draft["schema_version"] != PLAN_DRAFT_SCHEMA_VERSION:
         raise EngineError(
             f"plan draft {display_path(path)} uses unsupported schema_version {draft['schema_version']} "
@@ -4676,7 +5185,7 @@ def _draft_task_from_args(args: argparse.Namespace) -> dict:
     acceptance = _flatten_repeated(args.acceptance)
     if not acceptance:
         raise EngineError("plan-draft add-task requires at least one --acceptance criterion")
-    return {
+    task = {
         "id": args.task_id,
         "title": args.title,
         "owner": args.owner,
@@ -4692,6 +5201,8 @@ def _draft_task_from_args(args: argparse.Namespace) -> dict:
         "required_capabilities": getattr(args, "required_capability", None) or [],
         "contract_refs": _normalize_contract_refs(getattr(args, "contract_ref", None) or []),
     }
+    task.update(_task_contract_v3_fields(args))
+    return task
 
 
 def _draft_to_runtime_task(task: dict, base_commit: str | None) -> tuple[dict, bytes]:
@@ -4707,10 +5218,17 @@ def _draft_to_runtime_task(task: dict, base_commit: str | None) -> tuple[dict, b
         "upstream_context_revisions": _upstream_context_revisions(context), "depends_on": depends_on,
         "contract_hashes": _contract_hashes(depends_on), "contract_revision": None, "contract_hash": None,
         "superseded_by": None,
+        "remediates": None,
+        "remediation_attempt": None,
         "task_kind": task.get("task_kind", "general"),
         "required_capabilities": task.get("required_capabilities", []),
         "contract_refs": _normalize_contract_refs(task.get("contract_refs", [])),
+        "scope": task.get("scope"),
+        "constraints": task.get("constraints", []),
+        "qa_contract": task.get("qa_contract"),
+        "output_contract": task.get("output_contract"),
     }
+    _normalize_task_contract_v3(runtime)
     runtime["assignment"] = None
     runtime["governance_baseline"] = _governance_baseline(runtime)
     payload, contract_hash = _build_task_contract(runtime, 1, now())
@@ -4812,7 +5330,7 @@ def cmd_plan_draft_create(args: argparse.Namespace) -> dict:
             "acceptance": _flatten_repeated(args.acceptance), "assumptions": args.assumption or [],
             "open_questions": args.open_question or [],
         },
-        "tasks": [], "history": [], "materialization": None,
+        "tasks": [], "history": [], "materialization": None, "execution_authorization": None,
     }
     _draft_event(draft, "create", args.actor, "draft created from conversation")
     _save_plan_draft(draft, path, -1)
@@ -4878,6 +5396,20 @@ def cmd_plan_draft_update_task(args: argparse.Namespace) -> dict:
     for field, value in (("needs", args.set_needs), ("acceptance", _flatten_repeated(args.set_acceptance)), ("files", args.set_files), ("tags", args.set_tags), ("depends_on", args.set_depends_on)):
         if value is not None and (field != "acceptance" or args.set_acceptance is not None):
             task[field] = value; changes.append(field)
+    _normalize_task_contract_v3(task)
+    for arg_name, target, key, label in (
+        ("set_forbidden_files", task["scope"], "forbidden_files", "scope.forbidden_files"),
+        ("set_constraints", task, "constraints", "constraints"),
+        ("set_required_checks", task["qa_contract"], "required_checks", "qa_contract.required_checks"),
+        ("set_qa_commands", task["qa_contract"], "commands", "qa_contract.commands"),
+        ("set_output_exports", task["output_contract"], "exports", "output_contract.exports"),
+        ("set_output_evidence_kinds", task["output_contract"], "evidence_kinds", "output_contract.evidence_kinds"),
+    ):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            target[key] = value; changes.append(label)
+    if args.set_files is not None:
+        task["scope"]["allowed_files"] = list(args.set_files)
     if not changes:
         raise EngineError("plan-draft update-task requires at least one field change")
     _draft_event(draft, "update-task", args.actor, args.summary)
@@ -4911,6 +5443,42 @@ def cmd_plan_draft_reopen(args: argparse.Namespace) -> dict:
     return {"draft": draft["id"], "revision": draft["revision"], "status": draft["status"]}
 
 
+def cmd_plan_draft_authorize_execution(args: argparse.Namespace) -> dict:
+    path, draft = _load_plan_draft(args.id)
+    if draft["status"] != "ready":
+        raise EngineError("execution authorization requires a finalized ready plan")
+    if args.expected_revision != draft["revision"]:
+        raise EngineError(f"stale plan draft revision: expected {args.expected_revision}, found {draft['revision']}")
+    if not args.confirmed_by_user:
+        raise EngineError("authorize-execution requires --confirmed-by-user for this exact plan revision")
+    _validate_draft_ready(draft)
+    authorization = {
+        "schema_version": 1,
+        "plan_id": draft["id"],
+        "plan_revision": draft["revision"],
+        "plan_digest": _draft_digest(draft),
+        "actor": args.actor,
+        "authorized_at": now(),
+        "mode": args.mode,
+        "authorization_revision": draft["revision"] + 1,
+    }
+    draft["execution_authorization"] = authorization
+    _draft_event(draft, "authorize-execution", args.actor, f"authorized {args.mode} execution for digest {authorization['plan_digest']}")
+    _save_plan_draft(draft, path, args.expected_revision)
+    return authorization
+
+
+def _current_plan_execution_authorization(draft: dict) -> tuple[bool, str]:
+    authorization = draft.get("execution_authorization") or {}
+    if not authorization:
+        return False, "execution authorization is missing"
+    if authorization.get("plan_id") != draft.get("id") or authorization.get("plan_digest") != _draft_digest(draft):
+        return False, "execution authorization is stale for the current plan definition"
+    if authorization.get("mode") not in {"sequential", "parallel"}:
+        return False, "execution authorization mode is invalid"
+    return True, "current"
+
+
 def cmd_plan_draft_materialize(args: argparse.Namespace) -> dict:
     draft_path, draft = _load_plan_draft(args.id)
     state_file = state_path(args.state)
@@ -4923,6 +5491,19 @@ def cmd_plan_draft_materialize(args: argparse.Namespace) -> dict:
     if draft["status"] != "ready":
         raise EngineError("plan draft must be finalized (status ready) before materialization")
     _validate_draft_ready(draft)
+    runtime_config = _load_runtime_config()
+    auto_execute = ((runtime_config or {}).get("automation", {}).get("planning", {}).get("auto_execute", {}))
+    automation_enabled = bool((runtime_config or {}).get("automation", {}).get("enabled"))
+    execution_authorized, authorization_detail = _current_plan_execution_authorization(draft)
+    if automation_enabled and auto_execute.get("enabled") and "current_execution_authorization" in auto_execute.get("require", []):
+        if not execution_authorized:
+            raise EngineError(f"automatic plan execution refused: {authorization_detail}")
+        configured_mode = runtime_config["automation"].get("execution", {}).get("mode", "parallel")
+        if (draft.get("execution_authorization") or {}).get("mode") != configured_mode:
+            raise EngineError(
+                "automatic plan execution refused: authorization mode does not match "
+                f"automation.execution.mode ({configured_mode})"
+            )
     source_revision = draft["revision"]
     digest = _draft_digest(draft)
     if state_file.exists():
@@ -4940,12 +5521,13 @@ def cmd_plan_draft_materialize(args: argparse.Namespace) -> dict:
         raise EngineError(f"workflow state already exists: {display_path(state_file)}; materialization never overwrites a workflow")
     state = new_state(draft["title"], draft["workflow"])
     state["source_plan"] = {"id": draft["id"], "revision": source_revision, "digest": digest, "draft": display_path(draft_path)}
+    state["execution_authorization"] = draft.get("execution_authorization") if execution_authorized else None
     base_commit = _git_head()
     contracts = []
     for task in draft["tasks"]:
-        runtime, payload = _draft_to_runtime_task(task, base_commit)
-        state["tasks"].append(runtime)
-        contracts.append((runtime["id"], payload))
+        runtime_task, payload = _draft_to_runtime_task(task, base_commit)
+        state["tasks"].append(runtime_task)
+        contracts.append((runtime_task["id"], payload))
     validate(state)
     sync_phases(state)
     materialization_event = {
@@ -4971,7 +5553,16 @@ def cmd_plan_draft_materialize(args: argparse.Namespace) -> dict:
     draft["materialization"] = {"state": display_path(state_file), "source_revision": source_revision, "digest": digest}
     _draft_event(draft, "materialize", args.actor, f"created workflow {display_path(state_file)}")
     _save_plan_draft(draft, draft_path, source_revision)
-    return {"draft": draft["id"], "status": "materialized", "state": display_path(state_file), "tasks": [task["id"] for task in draft["tasks"]], "idempotent": False}
+    result = {"draft": draft["id"], "status": "materialized", "state": display_path(state_file), "tasks": [task["id"] for task in draft["tasks"]], "idempotent": False}
+    if automation_enabled and auto_execute.get("enabled") and execution_authorized:
+        execution = (runtime_config or {}).get("automation", {}).get("execution", {})
+        dispatch_result = cmd_dispatch_ready(argparse.Namespace(
+            state=args.state, runner=None, model=None,
+            limit=execution.get("dispatch_ready_limit", 1), context=None, epic=None,
+            agent_id=None, worktree_root=None, no_worktree=False,
+        ))
+        result["auto_execution"] = dispatch_result
+    return result
 
 
 def cmd_plan_draft_show(args: argparse.Namespace) -> dict:
@@ -5655,6 +6246,9 @@ def _resolve_context_package(
     if task:
         task_contract = workspace(state_file) / "tasks" / f"{task['id']}.json"
         add_reference(display_path(task_contract), 0, "task", "task metadata and acceptance criteria")
+    task_result_refs = _task_result_references(state_file, task) if task else []
+    for result_ref in task_result_refs:
+        add_reference(result_ref["path"], 2, "task-result", f"result produced by dependency {result_ref['task_id']}")
 
     for path in task_files:
         add_reference(path, 1, "task-file", "declared task scope")
@@ -5776,6 +6370,7 @@ def _resolve_context_package(
             ),
         },
         "contracts": contract_refs,
+        "task_result_refs": task_result_refs,
         "contract_impact": contract_impact,
         "symbol_context": symbol_context,
         "metrics": {
@@ -5842,10 +6437,14 @@ def cmd_runner_add(args: argparse.Namespace) -> dict:
         "priority": getattr(args, "priority", 0),
         "max_parallel": getattr(args, "max_parallel", 1),
     }
+    if getattr(args, "pool_model", None):
+        runners[args.name]["pool_model"] = args.pool_model
     if requested_models:
         runners[args.name]["models"] = requested_models
     elif requested_model:
         runners[args.name]["model"] = requested_model
+    if runners[args.name].get("pool_model") and runners[args.name]["pool_model"] not in _entry_models(runners[args.name]):
+        raise EngineError("--pool-model must be present in the runner model allowlist")
     default_executor = args.name if args.default else _default_executor()
     default_model = requested_default_model if requested_default_model is not None else _default_model()
     if args.default and requested_default_model is None:
@@ -5875,6 +6474,152 @@ def cmd_runner_list(args: argparse.Namespace) -> dict:
         "runner_aliases": _load_runner_aliases(),
         "runners": _load_runners(),
     }
+
+
+def _legacy_effective_runtime_config() -> dict:
+    profiles = _load_yaml_registry(".ai-config/runners.yaml", "runners")
+    for profile in profiles.values():
+        if profile.get("model") and not profile.get("models"):
+            profile["models"] = [profile.pop("model")]
+        for numeric, fallback in (("priority", 0), ("max_parallel", 1)):
+            try:
+                profile[numeric] = int(profile.get(numeric, fallback))
+            except (TypeError, ValueError) as exc:
+                raise EngineError(f"legacy runner {numeric} must be an integer") from exc
+    roles = _load_yaml_registry(".ai-config/automation.yaml", "roles")
+    post = _load_post_completion_config()
+    qa_enabled = _parse_role_enabled((roles.get("qa") or {}).get("enabled")) if roles.get("qa") else False
+    reviewer = roles.get("reviewer") or {}
+    reviewer_enabled = _parse_role_enabled(reviewer.get("enabled")) if reviewer else False
+    review_config = {
+        "mode": "independent" if reviewer_enabled else "manual",
+    }
+    for key in ("runner", "model", "backup_runner", "backup_model"):
+        if reviewer.get(key):
+            review_config[key] = reviewer[key]
+    return _validate_runtime_config({
+        "version": 1,
+        "runners": {
+            "default": {"name": _default_executor(), "model": _default_model()},
+            "profiles": profiles,
+            "aliases": _load_runner_aliases(),
+        },
+        "automation": {
+            "enabled": bool(post.get("enabled")),
+            "planning": {
+                "auto_execute": {
+                    "enabled": False,
+                    "trigger": "plan-materialized",
+                    "require": ["valid_dag", "complete_acceptance_criteria", "current_execution_authorization"],
+                },
+            },
+            "execution": {
+                "mode": "parallel",
+                "max_parallel_tasks": max(1, sum(max(0, int(item.get("max_parallel", 1))) for item in profiles.values())),
+                "auto_dispatch_ready": bool(post.get("dispatch_ready_on_close")),
+                "dispatch_ready_limit": int(post.get("dispatch_ready_limit", 1)),
+                "isolation": {"worktree_per_task": True, "require_disjoint_paths": True},
+            },
+            "quality": {
+                "qa": {"mode": "local" if qa_enabled else "disabled", "max_parallel": 1},
+                "review": review_config,
+                "completion": {
+                    "auto_resolve_review_when_not_required": False,
+                    "auto_close_delivery_not_applicable": True,
+                },
+            },
+            "failure": {
+                "qa": {
+                    "strategy": "retry-current-task" if post.get("retry_on_rejection") else "manual",
+                    "max_attempts": int(post.get("max_retries", 0)),
+                },
+                "review": {"strategy": "manual", "max_attempts": int(post.get("max_retries", 0))},
+            },
+        },
+    })
+
+
+def _effective_runtime_config() -> tuple[dict, str]:
+    runtime = _load_runtime_config()
+    if runtime:
+        path = _runtime_config_path()
+        return runtime, display_path(path) if path else "config.yaml"
+    return _legacy_effective_runtime_config(), "legacy:runners.yaml+automation.yaml"
+
+
+def _runtime_config_cross_checks(config: dict) -> list[dict]:
+    checks = []
+    review_mode = config["automation"].get("quality", {}).get("review", {}).get("mode", "manual")
+    review_required = _load_rules().get("review_required", True)
+    checks.append({
+        "name": "review-policy-consistency",
+        "passed": not (review_mode == "not-required" and review_required),
+        "detail": f"review.mode={review_mode}, rules.review_required={str(review_required).lower()}",
+    })
+    execution = config["automation"].get("execution", {})
+    isolation = execution.get("isolation", {})
+    checks.append({
+        "name": "parallel-isolation",
+        "passed": execution.get("mode", "parallel") != "parallel" or bool(isolation.get("worktree_per_task", True)),
+        "detail": "parallel execution requires worktree_per_task",
+    })
+    default = config["runners"]["default"]
+    try:
+        _resolve_runner(default.get("name"), default.get("model"))
+        runner_detail, runner_passed = "default runner resolves", True
+    except EngineError as exc:
+        runner_detail, runner_passed = str(exc), False
+    checks.append({"name": "default-runner", "passed": runner_passed, "detail": runner_detail})
+    alias_errors = []
+    for alias in sorted(config["runners"].get("aliases", {})):
+        try:
+            _resolve_runner(alias, None)
+        except EngineError as exc:
+            alias_errors.append(f"{alias}: {exc}")
+    checks.append({
+        "name": "runner-aliases",
+        "passed": not alias_errors,
+        "detail": "; ".join(alias_errors) if alias_errors else "all aliases resolve",
+    })
+    review = config["automation"].get("quality", {}).get("review", {})
+    reviewer_passed, reviewer_detail = True, f"review mode {review_mode}"
+    if review_mode == "independent":
+        try:
+            reviewer_name, _entry, reviewer_model = _resolve_runner(review.get("runner"), review.get("model"))
+            default_name, _entry, default_model = _resolve_runner(default.get("name"), default.get("model"))
+            if (reviewer_name, reviewer_model) == (default_name, default_model):
+                raise EngineError("independent reviewer resolves to the default executor identity")
+            reviewer_detail = f"independent reviewer resolves to {reviewer_name}/{reviewer_model}"
+        except EngineError as exc:
+            reviewer_passed, reviewer_detail = False, str(exc)
+    checks.append({"name": "reviewer-identity", "passed": reviewer_passed, "detail": reviewer_detail})
+    return checks
+
+
+def cmd_config_show(args: argparse.Namespace) -> dict:
+    config, source = _effective_runtime_config()
+    return {"source": source, "authority": source != "legacy:runners.yaml+automation.yaml", "config": config}
+
+
+def cmd_config_validate(args: argparse.Namespace) -> dict:
+    config, source = _effective_runtime_config()
+    checks = _runtime_config_cross_checks(config)
+    return {"source": source, "valid": all(item["passed"] for item in checks), "passed": all(item["passed"] for item in checks), "checks": checks}
+
+
+def cmd_config_migrate(args: argparse.Namespace) -> dict:
+    path = _project_runtime_config_path()
+    if path.exists() and not args.force:
+        raise EngineError(f"runtime config already exists: {display_path(path)}; use --force to normalize it")
+    if path.exists():
+        config = _validate_runtime_config(_load_strict_runtime_yaml(path))
+        source = display_path(path)
+    else:
+        config = _legacy_effective_runtime_config()
+        source = "legacy:runners.yaml+automation.yaml"
+    written = _write_runtime_config(config)
+    checks = _runtime_config_cross_checks(config)
+    return {"migrated_from": source, "config": display_path(written), "valid": all(item["passed"] for item in checks), "checks": checks}
 
 
 def cmd_epic_add(args: argparse.Namespace) -> dict:
@@ -9073,6 +9818,22 @@ def _retry_rejected_task(task_id: str, state_arg: str | None, agent_id: str | No
     return _run_post_completion(task_id, state_arg, agent_id=agent_id)
 
 
+def _auto_dispatch_ready_after_failure(state_arg: str | None) -> dict | None:
+    runtime = _load_runtime_config()
+    automation = (runtime or {}).get("automation", {})
+    execution = automation.get("execution", {})
+    if not automation.get("enabled") or not execution.get("auto_dispatch_ready"):
+        return None
+    try:
+        return cmd_dispatch_ready(argparse.Namespace(
+            state=state_arg, runner=None, model=None,
+            limit=execution.get("dispatch_ready_limit", 1), context=None, epic=None,
+            agent_id=None, worktree_root=None, no_worktree=False,
+        ))
+    except (EngineError, OSError) as exc:
+        return {"scheduler": "runner-pool", "spawned": [], "error": str(exc)}
+
+
 def _run_post_completion_legacy(task_id: str, state_arg: str | None, agent_id: str | None = None) -> dict:
     """Preserve the v4 automation contract for tasks not opted into governance."""
     lock_path = _post_completion_lock_path(task_id, state_arg)
@@ -9113,8 +9874,51 @@ def _run_post_completion_legacy(task_id: str, state_arg: str | None, agent_id: s
         _release_task_lock(lock_path)
 
 
+def _apply_review_policy_waiver(task_id: str, state_arg: str | None) -> dict:
+    state_file = state_path(state_arg)
+    state = load(state_file); validate(state)
+    task = task_map(state).get(task_id)
+    if not task or task.get("status") != "qa-passed":
+        raise EngineError(f"review policy waiver requires qa-passed task {task_id}")
+    if _load_rules().get("review_required", True):
+        raise EngineError("review policy waiver requires rules.review_required: false")
+    qa_current, qa_detail = _qa_evidence_is_current(state_file, task)
+    if not qa_current:
+        raise EngineError(qa_detail)
+    qa_path = Path(qa_detail)
+    qa_payload = json.loads(qa_path.read_text(encoding="utf-8"))
+    evidence = {
+        "schema_version": 1,
+        "kind": "review",
+        "task": task_id,
+        "evidence_id": f"evidence:review:{task_id}",
+        "decision": "approve",
+        "verdict": "approve",
+        "findings": [],
+        "evidence": [],
+        "runner": "policy-waiver",
+        "model": "not-required",
+        "agent_id": "ai-kit-control-plane",
+        "authority": "review-not-required-policy",
+        "policy": {"review_mode": "not-required", "review_required": False},
+        "qa_evidence": _portable_workspace_ref(state_file, qa_path),
+        "qa_evidence_sha256": hashlib.sha256(qa_path.read_bytes()).hexdigest(),
+        "qa_fingerprint": qa_payload.get("fingerprint"),
+        "source_fingerprint": qa_payload.get("source_fingerprint") or (qa_payload.get("fingerprint") or {}).get("source_fingerprint"),
+        "submitted_at": now(),
+    }
+    path = _review_evidence_path(state_file, task_id)
+    _atomic_write_json(path, evidence)
+    changed = cmd_transition(argparse.Namespace(
+        state=state_arg, id=task_id, action="review-waive", actor="review-policy-control-plane",
+        detail="independent review not required by current policy", evidence=[str(path.resolve())],
+        expected_revision=None, agent_id=None, claim_id=None, by=None, _control_plane=True,
+    ))
+    return {"task": task_id, "status": changed["status"], "evidence": str(path.resolve())}
+
+
 def _run_post_completion(task_id: str, state_arg: str | None, agent_id: str | None = None) -> dict:
-    """Run verify -> independent QA -> independent review -> close.
+    """Run authoritative QA -> configured review policy -> delivery gate.
 
     Idempotent and resumable: a task already at 'done' is a safe no-op; a
     task parked at 'qa-passed' or 'review-approved' (e.g. a prior run
@@ -9124,14 +9928,10 @@ def _run_post_completion(task_id: str, state_arg: str | None, agent_id: str | No
     concurrent triggers for the same task only ever produce one pipeline
     run; a duplicate call while one is already in flight is a safe no-op.
 
-    'verify' always runs (it is deterministic checks, not a judgment call).
-    QA and review each only dispatch a CLI runner when
-    `.ai-config/automation.yaml`'s `roles.qa`/`roles.reviewer` has
-    `enabled: true` (the default). A disabled role stops the chain right
-    before it, leaving the task parked at `implementation-complete` (qa
-    disabled) or `qa-passed` (review disabled) with a `post-completion-
-    manual-<role>` event recorded -- the expected next step is a human or an
-    interactive session verifying by hand via `ai-kit approve`/`transition`.
+    Runtime policy comes from `.ai-config/config.yaml` when present. Local QA
+    remains authoritative. Review may be independent, manual, or explicitly
+    not required; the last mode creates auditable policy-waiver evidence.
+    Code-bearing tasks remain parked until an integration commit is attested.
     """
     initial_path = state_path(state_arg); initial_state = load(initial_path); validate(initial_state)
     initial_task = task_map(initial_state).get(task_id)
@@ -9152,6 +9952,8 @@ def _run_post_completion(task_id: str, state_arg: str | None, agent_id: str | No
             return {"task": task_id, "post_completion": f"noop-status-{task['status']}"}
 
         roles = _load_automation_roles()
+        runtime = _load_runtime_config()
+        completion = ((runtime or {}).get("automation", {}).get("quality", {}).get("completion", {}))
         event(state, path, "post-completion-start", task, "system", task["status"], task["status"], "automated post-completion pipeline started")
         save(state, path, state["revision"])
 
@@ -9179,6 +9981,23 @@ def _run_post_completion(task_id: str, state_arg: str | None, agent_id: str | No
             if report.get("status") == "inconclusive":
                 return {"task": task_id, "post_completion": "qa-inconclusive", "status": task["status"], "report": report}
             if task["status"] != "qa-passed":
+                if report.get("remediation"):
+                    dispatched = _auto_dispatch_ready_after_failure(state_arg) if report["remediation"].get("created") else None
+                    return {
+                        "task": task_id,
+                        "post_completion": "qa-remediation-created" if report["remediation"].get("created") else "qa-manual-investigation",
+                        "status": task["status"],
+                        "remediation": report["remediation"],
+                        "dispatch": dispatched,
+                    }
+                recovery = _current_recovery_recommendation(path, task_id)
+                if recovery and recovery.get("recommended_action") != "retry-worker":
+                    return {
+                        "task": task_id,
+                        "post_completion": "qa-replan-required" if recovery.get("recommended_action") == "replan-required" else "qa-manual-investigation",
+                        "status": task["status"],
+                        "recovery": recovery,
+                    }
                 retry_result = _retry_rejected_task(task_id, state_arg, agent_id, lock_path)
                 if retry_result is not None:
                     return retry_result
@@ -9186,29 +10005,49 @@ def _run_post_completion(task_id: str, state_arg: str | None, agent_id: str | No
 
         if task["status"] == "qa-passed":
             if not roles["reviewer"]["enabled"]:
-                state = load(path); task = task_map(state).get(task_id)
-                event(state, path, "post-completion-manual-review", task, "system", task["status"], task["status"], "roles.reviewer.enabled is false; qa-passed, waiting for manual 'ai-kit approve --role review'")
-                save(state, path, state["revision"])
-                return {"task": task_id, "post_completion": "review-manual", "status": task["status"]}
+                if (
+                    roles["reviewer"].get("mode") == "not-required"
+                    and completion.get("auto_resolve_review_when_not_required", False)
+                ):
+                    print(f"[post-completion] {task_id}: recording review policy waiver...", file=sys.stderr)
+                    _apply_review_policy_waiver(task_id, state_arg)
+                    state = load(path); validate(state); task = task_map(state).get(task_id)
+                else:
+                    state = load(path); task = task_map(state).get(task_id)
+                    event(state, path, "post-completion-manual-review", task, "system", task["status"], task["status"], "review mode is manual; qa-passed, waiting for an explicit review recommendation")
+                    save(state, path, state["revision"])
+                    return {"task": task_id, "post_completion": "review-manual", "status": task["status"]}
 
-            print(f"[post-completion] {task_id}: dispatching review...", file=sys.stderr)
-            try:
-                task = _dispatch_approval(task_id, "review", state_arg, agent_id=agent_id)
-            except EngineError as exc:
-                state = load(path); task = task_map(state).get(task_id)
-                event(state, path, "post-completion-failed", task, "system", task["status"], task["status"], f"review dispatch error: {exc}")
-                save(state, path, state["revision"])
-                return {"task": task_id, "post_completion": "review-error", "error": str(exc)}
-            if task["status"] != "review-approved":
-                retry_result = _retry_rejected_task(task_id, state_arg, agent_id, lock_path)
-                if retry_result is not None:
-                    return retry_result
-                return {"task": task_id, "post_completion": "review-rejected", "status": task["status"]}
+            if task["status"] == "qa-passed":
+                print(f"[post-completion] {task_id}: dispatching review...", file=sys.stderr)
+                try:
+                    task = _dispatch_approval(task_id, "review", state_arg, agent_id=agent_id)
+                except EngineError as exc:
+                    state = load(path); task = task_map(state).get(task_id)
+                    event(state, path, "post-completion-failed", task, "system", task["status"], task["status"], f"review dispatch error: {exc}")
+                    save(state, path, state["revision"])
+                    return {"task": task_id, "post_completion": "review-error", "error": str(exc)}
+                if task["status"] != "review-approved":
+                    if task.get("status") == "superseded" and task.get("superseded_by"):
+                        dispatched = _auto_dispatch_ready_after_failure(state_arg)
+                        return {
+                            "task": task_id,
+                            "post_completion": "review-remediation-created",
+                            "status": task["status"],
+                            "remediation": {"created": True, "task": task["superseded_by"]},
+                            "dispatch": dispatched,
+                        }
+                    retry_result = _retry_rejected_task(task_id, state_arg, agent_id, lock_path)
+                    if retry_result is not None:
+                        return retry_result
+                    return {"task": task_id, "post_completion": "review-rejected", "status": task["status"]}
 
         if task["status"] == "review-approved":
             not_applicable, _reason = _delivery_not_applicable(task)
             if not not_applicable:
                 return {"task": task_id, "post_completion": "delivery-awaiting-integration", "status": task["status"]}
+            if runtime and not completion.get("auto_close_delivery_not_applicable", False):
+                return {"task": task_id, "post_completion": "delivery-manual", "status": task["status"]}
             print(f"[post-completion] {task_id}: closing delivery-not-applicable task...", file=sys.stderr)
             cmd_delivery_close(argparse.Namespace(state=state_arg, id=task_id, evidence=None))
             state = load(path); validate(state); task = task_map(state)[task_id]
@@ -9242,11 +10081,10 @@ def _run_post_completion(task_id: str, state_arg: str | None, agent_id: str | No
 
 
 def cmd_pipeline(args: argparse.Namespace) -> dict:
-    """Advance one task through dispatch -> verify -> QA -> review -> close.
+    """Advance one task through dispatch -> authoritative QA -> review policy -> delivery.
 
-    Executor identity comes from runners.yaml's default_executor/default_model
-    (the same fallback plain `dispatch` uses); qa/reviewer identities come
-    from .ai-config/automation.yaml. Refuses to proceed if QA or review would run
+    Executor identity comes from the effective runtime configuration (the same
+    fallback plain `dispatch` uses). Refuses to proceed if review would run
     under the exact same (runner, model) as the executor -- the point of a
     separate approval phase is a second, independent look. QA and review are
     each dispatched to their own configured runner (see _dispatch_approval),
@@ -9260,12 +10098,9 @@ def cmd_pipeline(args: argparse.Namespace) -> dict:
     across phases -- a stalled or failed phase stops here and reports why;
     resume by re-running after fixing the cause.
 
-    A role with `roles.<qa|reviewer>.enabled: false` in automation.yaml is
-    never dispatched or identity-checked here -- `_run_post_completion` parks
-    the task right before that role's verdict instead (`qa-manual` /
-    `review-manual`), which this command reports back as a normal (non-error)
-    result rather than "pipeline stopped", since a disabled role is an
-    intentional handoff to manual verification, not a failure.
+    Disabled/manual quality policy parks the task at the corresponding gate.
+    Review `not-required` records policy-waiver evidence; it is not represented
+    as an independent reviewer verdict.
     """
     state_file = state_path(args.state)
     state = load(state_file); validate(state)
@@ -9277,13 +10112,13 @@ def cmd_pipeline(args: argparse.Namespace) -> dict:
     if task.get("governance_baseline") is None and roles["qa"]["enabled"]:
         qa_runner, _qa_entry, qa_model = _resolve_runner(roles["qa"]["runner"], roles["qa"].get("model"))
         if (qa_runner, qa_model) == (exec_runner, exec_model):
-            raise EngineError(f".ai-config/automation.yaml: role 'qa' must run under a different runner or model ({qa_runner}/{qa_model})")
+            raise EngineError(f"runtime config: role 'qa' must run under a different runner or model ({qa_runner}/{qa_model})")
     rev_runner = rev_model = None
     if roles["reviewer"]["enabled"]:
         rev_runner, _rev_entry, rev_model = _resolve_runner(roles["reviewer"]["runner"], roles["reviewer"].get("model"))
         if (rev_runner, rev_model) == (exec_runner, exec_model):
             raise EngineError(
-                f".ai-config/automation.yaml: role 'reviewer' resolves to the same identity as 'executor' "
+                f"runtime config: role 'reviewer' resolves to the same identity as 'executor' "
                 f"({rev_runner}/{rev_model}); review must run under a different runner or model"
             )
 
@@ -9296,13 +10131,13 @@ def cmd_pipeline(args: argparse.Namespace) -> dict:
     result = _run_post_completion(task["id"], args.state, agent_id=args.agent_id)
     state = load(state_path(args.state))
     task = task_map(state).get(task["id"])
-    if result.get("post_completion") in {"qa-manual", "review-manual", "qa-inconclusive", "delivery-awaiting-integration"}:
+    if result.get("post_completion") in {"qa-manual", "review-manual", "qa-inconclusive", "qa-replan-required", "qa-manual-investigation", "qa-remediation-created", "review-remediation-created", "delivery-awaiting-integration", "delivery-manual"}:
         return {
             "task": task["id"] if task else args.id, "status": task["status"] if task else "unknown",
             "post_completion": result["post_completion"],
             "executor": f"{exec_runner}/{exec_model}",
             "qa": f"{qa_runner}/{qa_model}" if qa_model else qa_runner,
-            "reviewer": f"{rev_runner}/{rev_model}" if rev_runner else "manual",
+            "reviewer": f"{rev_runner}/{rev_model}" if rev_runner else roles["reviewer"].get("mode", "manual"),
         }
     if not task or task["status"] != "done":
         status = task["status"] if task else "unknown"
@@ -9314,7 +10149,7 @@ def cmd_pipeline(args: argparse.Namespace) -> dict:
         "task": task["id"], "status": "done",
         "executor": f"{exec_runner}/{exec_model}",
         "qa": f"{qa_runner}/{qa_model}" if qa_model else qa_runner,
-        "reviewer": f"{rev_runner}/{rev_model}" if rev_runner else "manual",
+        "reviewer": f"{rev_runner}/{rev_model}" if rev_runner else roles["reviewer"].get("mode", "manual"),
     }
 
 
@@ -9342,11 +10177,13 @@ def _write_task_handoff(
         f"complete --actor {task['owner']}{lease_flag} --detail 'Completed by {runner_label}'"
     )
     handoff = {
-        "schema_version": 2,
+        "schema_version": 3,
         "task": {
             "id": task["id"], "title": task["title"], "owner": task["owner"],
             "phase": task["phase"], "acceptance": task["acceptance"],
             "files": task["files"], "needs": task["needs"], "tags": task["tags"],
+            "scope": task.get("scope"), "constraints": task.get("constraints", []),
+            "qa_contract": task.get("qa_contract"), "output_contract": task.get("output_contract"),
             "context": task.get("context"), "epic": task.get("epic"),
             "depends_on": task.get("depends_on", []),
             "task_kind": task.get("task_kind", "general"),
@@ -9365,6 +10202,7 @@ def _write_task_handoff(
             "skills": route_payload.get("skills", []),
             "skill_details": route_payload.get("skill_details", []),
             "context_package": route_payload.get("context_package"),
+            "task_result_refs": (route_payload.get("context_package") or {}).get("task_result_refs", []),
             "loading_instructions": route_payload.get("loading_instructions", []),
         },
         "instructions": (
@@ -9380,6 +10218,10 @@ def _write_task_handoff(
 
 def cmd_dispatch(args: argparse.Namespace) -> dict:
     import subprocess as _sp
+    runtime = _load_runtime_config()
+    isolation = ((runtime or {}).get("automation", {}).get("execution", {}).get("isolation", {}))
+    if isolation.get("worktree_per_task") and bool(getattr(args, "no_worktree", False)):
+        raise EngineError("config.yaml requires worktree_per_task; --no-worktree is not allowed")
     state_file = state_path(args.state)
     state = load(state_file); validate(state)
     task = _resolve_task_definition(args.id, state, state_file)
@@ -9479,77 +10321,56 @@ def cmd_dispatch(args: argparse.Namespace) -> dict:
 
 
 def cmd_dispatch_ready(args: argparse.Namespace) -> dict:
-    """Claim up to --limit ready tasks and dispatch each to a background runner.
-
-    Claiming (the todo -> in-progress transition) happens sequentially here,
-    through _retry_transition, so two dispatch-ready invocations racing over
-    the same ready tasks never double-claim one. Once a task is claimed its
-    runner process is spawned with Popen (not waited on), so N claimed tasks
-    actually execute concurrently instead of one after another.
-    """
+    """Dispatch ready tasks across every eligible runner in the configured pool."""
     import subprocess as _sp
-    state = load(state_path(args.state)); validate(state)
-    default_executor = _default_executor()
-    if not default_executor:
-        raise EngineError(
-            "no default_executor configured in .ai-config/runners.yaml; "
-            "set one via 'ai-kit runner add <name> --default', or use "
-            "'ai-kit dispatch <id> --runner <name>' for explicit dispatch"
-        )
-    if args.runner and args.runner != default_executor:
-        raise EngineError(
-            f"dispatch-ready only runs the configured default_executor ('{default_executor}'), "
-            f"not '{args.runner}'; use 'ai-kit dispatch <id> --runner {args.runner}' for explicit dispatch"
-        )
-    configured_default_model = _default_model()
-    if args.model and configured_default_model and args.model != configured_default_model:
-        raise EngineError(
-            f"dispatch-ready only runs the configured default_model ('{configured_default_model}'), "
-            f"not '{args.model}'; use explicit dispatch for another model"
-        )
-    runner_name, runner, selected_model = _resolve_runner(args.runner, args.model)
+    if args.model and not args.runner:
+        raise EngineError("dispatch-ready --model requires --runner; pooled scheduling chooses each runner's configured default model")
+    state_file = state_path(args.state)
+    state = load(state_file); validate(state)
+    runtime = _load_runtime_config()
+    execution = ((runtime or {}).get("automation", {}).get("execution", {}))
+    isolation = execution.get("isolation", {})
+    if isolation.get("worktree_per_task") and bool(getattr(args, "no_worktree", False)):
+        raise EngineError("config.yaml requires worktree_per_task; --no-worktree is not allowed")
+    configured_global = int(execution.get("max_parallel_tasks", 1_000_000))
+    global_capacity = 1 if execution.get("mode") == "sequential" else configured_global
+    active_global = sum(1 for item in state["tasks"] if item.get("status") == "in-progress")
+    available_global = max(0, global_capacity - active_global)
     tasks = task_map(state)
-    candidates = [
-        task for task in state["tasks"]
-        if runnable(task, tasks) and _runner_supports(runner_name, runner, task, state)[0]
-    ]
+    candidates = [task for task in state["tasks"] if runnable(task, tasks)]
     if args.context:
         candidates = [t for t in candidates if t.get("context") == args.context]
     if args.epic:
         candidates = [t for t in candidates if t.get("epic") == args.epic]
-    configured_capacity = int(runner.get("max_parallel", 1_000_000))
-    limit = args.limit if args.limit else len(candidates)
-    claimed = []
-    skipped_at_capacity = []
-    state_file = state_path(args.state)
-    for task in candidates:
+    candidates.sort(key=lambda task: task["id"])
+    requested_limit = args.limit if args.limit else len(candidates)
+    limit = min(requested_limit, available_global)
+    claimed: list[dict] = []
+    deferred: list[dict] = []
+    for snapshot in candidates:
         if len(claimed) >= limit:
             break
-        # Capacity is re-derived from on-disk state on every iteration, not
-        # from the snapshot read at the top. Each claim below (and any claim
-        # made by a concurrent dispatch-ready) changes the active count, so a
-        # budget computed once for the whole batch let two invocations both
-        # see free slots and jointly overshoot max_parallel. This narrows the
-        # window to a single claim; the claim itself is still what decides a
-        # tie, so the counted total can exceed the limit by at most the number
-        # of processes racing on the same slot.
         live_state = load(state_file)
-        if _runner_active_count(runner_name, live_state) >= max(1, configured_capacity):
-            skipped_at_capacity = [item["id"] for item in candidates[candidates.index(task):]]
-            break
+        validate(live_state)
+        live_task = task_map(live_state).get(snapshot["id"])
+        if not live_task or not runnable(live_task, task_map(live_state)):
+            deferred.append({"task": snapshot["id"], "reason": "no-longer-runnable"})
+            continue
+        task = _resolve_task_definition(live_task["id"], live_state, state_file)
+        try:
+            runner_name, _runner, selected_model = _select_runner_for_task(
+                task, live_state, args.runner, args.model, pool=True
+            )
+        except EngineError as exc:
+            deferred.append({"task": task["id"], "reason": str(exc)})
+            continue
         agent_id = args.agent_id or uuid.uuid4().hex[:8]
-        start_args = argparse.Namespace(state=args.state, id=task["id"], action="start", actor=task["owner"], detail=f"auto-claimed by dispatch-ready for runner '{runner_name}'", evidence=None, expected_revision=None, agent_id=agent_id, claim_id=None, by=None)
+        start_args = argparse.Namespace(state=args.state, id=task["id"], action="start", actor=task["owner"], detail=f"auto-claimed by pool scheduler for runner '{runner_name}'", evidence=None, expected_revision=None, agent_id=agent_id, claim_id=None, by=None)
         try:
             _retry_transition(start_args)
-        except EngineError:
-            continue  # lost the claim race, or no longer runnable; skip rather than substitute another task
-        # Reserve the slot in state immediately. _runner_active_count only
-        # sees tasks that carry an assignment naming the runner, and the real
-        # assignment is written by the `dispatch` child process further below
-        # -- so until now a claimed-but-not-yet-dispatched task counted for
-        # nothing. Every claim in this batch (and in any concurrent batch) was
-        # therefore invisible to the capacity check that was supposed to bound
-        # it. The child replaces this stub with the full assignment.
+        except EngineError as exc:
+            deferred.append({"task": task["id"], "reason": str(exc)})
+            continue
         claimed_task = _persist_assignment(state_file, task["id"], {
             "runner": runner_name,
             "model": selected_model,
@@ -9558,7 +10379,7 @@ def cmd_dispatch_ready(args: argparse.Namespace) -> dict:
             "assigned_at": now(),
             "state_path": str(state_file.resolve()),
         })
-        claimed.append({"task": claimed_task["id"], "agent_id": agent_id})
+        claimed.append({"task": claimed_task["id"], "agent_id": agent_id, "runner": runner_name, "model": selected_model})
     log_dir = workspace(state_path(args.state)) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     spawned = []
@@ -9568,13 +10389,13 @@ def cmd_dispatch_ready(args: argparse.Namespace) -> dict:
         cmd = [sys.executable, str(ROOT / ".ai" / "engine" / "ai_kit.py")]
         if args.state:
             cmd += ["--state", args.state]
-        cmd += ["dispatch", entry["task"], "--runner", runner_name, "--agent-id", entry["agent_id"]]
+        cmd += ["dispatch", entry["task"], "--runner", entry["runner"], "--agent-id", entry["agent_id"]]
         if getattr(args, "worktree_root", None):
             cmd += ["--worktree-root", args.worktree_root]
         if getattr(args, "no_worktree", False):
             cmd.append("--no-worktree")
-        if selected_model is not None:
-            cmd += ["--model", selected_model]
+        if entry["model"] is not None:
+            cmd += ["--model", entry["model"]]
         # Redirect the child's stdout/stderr to its own log file instead of
         # inheriting this process's fds: an inherited pipe stays open (and a
         # caller reading dispatch-ready's own output can hang or see
@@ -9583,11 +10404,12 @@ def cmd_dispatch_ready(args: argparse.Namespace) -> dict:
         log_path = log_dir / f"dispatch_{entry['task']}.log"
         with log_path.open("w", encoding="utf-8") as log_handle:
             proc = _sp.Popen(cmd, cwd=str(ROOT), stdout=log_handle, stderr=_sp.STDOUT, close_fds=True)
-        spawned.append({"task": entry["task"], "agent_id": entry["agent_id"], "pid": proc.pid, "log": display_path(log_path)})
+        spawned.append({"task": entry["task"], "agent_id": entry["agent_id"], "runner": entry["runner"], "model": entry["model"], "pid": proc.pid, "log": display_path(log_path)})
     return {
-        "runner": runner_name, "candidates": len(candidates), "claimed": len(claimed),
-        "capacity": configured_capacity, "deferred_at_capacity": skipped_at_capacity,
-        "spawned": spawned,
+        "scheduler": "runner-pool", "candidates": len(candidates), "claimed": len(claimed),
+        "execution_mode": execution.get("mode", "parallel"),
+        "global_capacity": global_capacity, "active_before": active_global,
+        "deferred": deferred, "spawned": spawned,
     }
 
 
@@ -9631,8 +10453,333 @@ def _scope_validation(task: dict, cwd: Path) -> dict:
     if not task.get("assignment"):
         return {"passed": True, "not_applicable": True, "changed_paths": [], "out_of_scope": []}
     changed = _task_changed_paths(task, cwd)
-    out_of_scope = [path for path in changed if not _path_in_declared_scope(path, task.get("files") or [])]
-    return {"passed": not out_of_scope, "changed_paths": changed, "out_of_scope": out_of_scope}
+    scope = task.get("scope") or {}
+    allowed = scope.get("allowed_files") or task.get("files") or []
+    forbidden = scope.get("forbidden_files") or []
+    out_of_scope = [path for path in changed if not _path_in_declared_scope(path, allowed)]
+    forbidden_changes = [path for path in changed if _path_in_declared_scope(path, forbidden)]
+    changed_files_allowed = bool((task.get("output_contract") or {}).get("changed_files", True))
+    unexpected_changes = changed if changed and not changed_files_allowed else []
+    return {
+        "passed": not out_of_scope and not forbidden_changes and not unexpected_changes,
+        "changed_paths": changed,
+        "out_of_scope": out_of_scope,
+        "forbidden_changes": forbidden_changes,
+        "unexpected_changes": unexpected_changes,
+    }
+
+
+def _task_result_path(state_file: Path, task_id: str) -> Path:
+    return workspace(state_file) / "results" / f"{task_id}.json"
+
+
+def _recovery_recommendation_path(state_file: Path, task_id: str) -> Path:
+    return workspace(state_file) / "recovery" / f"{task_id}.json"
+
+
+def _result_reference(state_file: Path, task_id: str) -> dict | None:
+    path = _task_result_path(state_file, task_id)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("schema_version") != TASK_RESULT_SCHEMA_VERSION or payload.get("task_id") != task_id:
+        return None
+    return {
+        "task_id": task_id,
+        "task_ref": f"task:{payload.get('workflow_id')}:{task_id}" if payload.get("workflow_id") else None,
+        "path": _portable_workspace_ref(state_file, path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "status": payload.get("status"),
+        "changed_files": payload.get("changed_files", []),
+        "exports": payload.get("exports", []),
+    }
+
+
+def _task_result_references(state_file: Path, task: dict) -> list[dict]:
+    refs = []
+    for dependency in sorted(set(task.get("needs") or [])):
+        reference = _result_reference(state_file, dependency)
+        if reference:
+            refs.append(reference)
+    return refs
+
+
+def _write_task_result(state_file: Path, state: dict, task: dict) -> Path:
+    cwd = Path((task.get("assignment") or {}).get("worktree") or ROOT).resolve()
+    try:
+        changed_files = _task_changed_paths(task, cwd) if task.get("assignment") else []
+        generation_error = None
+    except EngineError as exc:
+        changed_files = []
+        generation_error = str(exc)
+    import subprocess as _sp
+    head_run = _sp.run(["git", "-C", str(cwd), "rev-parse", "HEAD"], capture_output=True, text=True)
+    head_commit = head_run.stdout.strip() if head_run.returncode == 0 else None
+    evidence_refs = []
+    for raw in task.get("evidence") or []:
+        candidate = Path(raw)
+        if candidate.is_file():
+            evidence_refs.append({
+                "path": _portable_workspace_ref(state_file, candidate),
+                "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            })
+    output_contract = task.get("output_contract") or {}
+    payload = {
+        "schema_version": TASK_RESULT_SCHEMA_VERSION,
+        "task_id": task["id"],
+        "workflow_id": state.get("workflow_id"),
+        "status": task.get("status"),
+        "task_contract": {"revision": task.get("contract_revision"), "sha256": task.get("contract_hash")},
+        "assignment": {
+            key: (task.get("assignment") or {}).get(key)
+            for key in ("runner", "model", "agent_id", "branch", "worktree", "base_commit")
+        },
+        "head_commit": head_commit,
+        "changed_files": changed_files,
+        "exports": output_contract.get("exports", []),
+        "evidence_refs": evidence_refs,
+        "output_contract": output_contract,
+        "upstream_result_refs": _task_result_references(state_file, task),
+        "generation_error": generation_error,
+        "generated_at": now(),
+    }
+    path = _task_result_path(state_file, task["id"])
+    _atomic_write_json(path, payload)
+    return path
+
+
+def cmd_result_show(args: argparse.Namespace) -> dict:
+    state_file = state_path(args.state)
+    state = load(state_file); validate(state)
+    task = task_map(state).get(args.id)
+    if not task:
+        raise EngineError(f"unknown task: {args.id}")
+    path = _task_result_path(state_file, task["id"])
+    if not path.is_file():
+        raise EngineError(f"task result not found for {task['id']}; it is created at implementation completion")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return {**payload, "path": _portable_workspace_ref(state_file, path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _task_result_validation(state_file: Path, state: dict, task: dict, changed_paths: list[str]) -> dict:
+    path = _task_result_path(state_file, task["id"])
+    if not path.is_file():
+        try:
+            _write_task_result(state_file, state, task)
+        except (OSError, EngineError, json.JSONDecodeError) as exc:
+            return {"passed": False, "inconclusive": True, "checks": [{"name": "task-result", "status": "inconclusive", "detail": str(exc)}]}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"passed": False, "inconclusive": False, "checks": [{"name": "task-result", "status": "fail", "detail": str(exc)}]}
+    required_evidence = set((task.get("output_contract") or {}).get("evidence_kinds", []))
+    actual_evidence = {
+        kind for kind in (_parse_evidence_kind(value) for value in task.get("evidence") or []) if kind
+    }
+    missing_evidence = sorted(required_evidence - actual_evidence)
+    checks = [
+        {"name": "task-result-schema", "status": "pass" if payload.get("schema_version") == TASK_RESULT_SCHEMA_VERSION and payload.get("task_id") == task["id"] else "fail"},
+        {"name": "task-result-contract", "status": "pass" if (payload.get("task_contract") or {}).get("sha256") == task.get("contract_hash") else "fail"},
+        {"name": "task-result-changed-files", "status": "pass" if payload.get("changed_files", []) == changed_paths else "fail", "detail": json.dumps({"expected": changed_paths, "actual": payload.get("changed_files", [])}, sort_keys=True)},
+        {"name": "task-result-output-contract", "status": "pass" if payload.get("output_contract") == task.get("output_contract") else "fail"},
+        {"name": "task-result-evidence-kinds", "status": "pass" if not missing_evidence else "fail", "detail": ", ".join(missing_evidence)},
+    ]
+    return {"passed": all(item["status"] == "pass" for item in checks), "inconclusive": False, "checks": checks, "path": _portable_workspace_ref(state_file, path)}
+
+
+def _classify_qa_failure(evidence: dict) -> tuple[str, str, bool, list[str]]:
+    status = evidence.get("status")
+    failed = [item for item in evidence.get("checks", []) if item.get("result") == "fail"]
+    names = " ".join(str(item.get("name") or "") for item in failed).lower()
+    details = " ".join(str(item.get("detail") or "") for item in failed).lower()
+    searchable = f"{names} {details}"
+    reasons = [str(item.get("name")) for item in failed] or [f"qa status: {status}"]
+    if status == "inconclusive":
+        return "environment_inconclusive", "manual-investigation", False, reasons
+    if any(token in searchable for token in ("declared-file-scope", "forbidden", "out_of_scope", "dependency", "task-contract-drift")):
+        return "dependency_conflict", "replan-required", False, reasons
+    if any(token in searchable for token in ("contract", "generated:", "codegen", "content-hash")):
+        return "contract_drift", "replan-required", False, reasons
+    if any(token in searchable for token in ("architecture", "design", "fitness:")):
+        return "architecture_violation", "replan-required", False, reasons
+    if any(token in searchable for token in ("test_command", "lint_command", "typecheck_command", "build_command", "qa_contract:")):
+        return "test_regression", "retry-worker", True, reasons
+    return "implementation_failure", "retry-worker", True, reasons
+
+
+def _write_recovery_recommendation(state_file: Path, task: dict, evidence_path: Path, evidence: dict) -> Path:
+    classification, action, retryable, reasons = _classify_qa_failure(evidence)
+    if classification not in FAILURE_TAXONOMY:
+        raise EngineError(f"unsupported failure classification: {classification}")
+    result_ref = _result_reference(state_file, task["id"])
+    payload = {
+        "schema_version": RECOVERY_RECOMMENDATION_SCHEMA_VERSION,
+        "task_id": task["id"],
+        "classification": classification,
+        "recommended_action": action,
+        "retryable": retryable,
+        "reasons": reasons,
+        "qa_evidence_ref": {
+            "path": _portable_workspace_ref(state_file, evidence_path),
+            "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+        },
+        "task_result_ref": result_ref,
+        "created_at": now(),
+    }
+    path = _recovery_recommendation_path(state_file, task["id"])
+    _atomic_write_json(path, payload)
+    return path
+
+
+def _current_recovery_recommendation(state_file: Path, task_id: str) -> dict | None:
+    path = _recovery_recommendation_path(state_file, task_id)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        evidence_ref = payload.get("qa_evidence_ref") or {}
+        evidence_path = _resolve_workspace_ref(state_file, evidence_ref.get("path"))
+        if not evidence_path.is_file() or hashlib.sha256(evidence_path.read_bytes()).hexdigest() != evidence_ref.get("sha256"):
+            return None
+        return payload
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _failure_policy(gate: str) -> dict:
+    runtime = _load_runtime_config()
+    if runtime:
+        automation = runtime["automation"]
+        if not automation.get("enabled", False):
+            return {"strategy": "manual", "max_attempts": 0}
+        return dict(automation.get("failure", {}).get(gate, {"strategy": "manual", "max_attempts": 0}))
+    legacy = _load_post_completion_config()
+    return {
+        "strategy": "retry-current-task" if gate == "qa" and legacy.get("retry_on_rejection") else "manual",
+        "max_attempts": int(legacy.get("max_retries", 0)),
+    }
+
+
+def _create_remediation_task(
+    state_file: Path,
+    task_id: str,
+    gate: str,
+    evidence_ref: str,
+    reasons: list[str] | None = None,
+) -> dict | None:
+    """Replace a rejected task with a bounded, first-class remediation task.
+
+    The rejected task is superseded and every downstream dependency also
+    needs the remediation task. This preserves the historical task/result
+    while ensuring no consumer unlocks until the corrective work completes.
+    """
+    policy = _failure_policy(gate)
+    if policy.get("strategy") != "remediation-task":
+        return None
+    state = load(state_file); validate(state)
+    tasks = task_map(state)
+    original = tasks.get(task_id)
+    if not original or original.get("status") != "todo":
+        return None
+    remediation_root = original.get("remediates") or task_id
+    existing = sorted(
+        (item for item in state["tasks"] if item.get("remediates") == remediation_root),
+        key=lambda item: int(item.get("remediation_attempt") or 0),
+    )
+    attempt = len(existing) + 1
+    maximum = int(policy.get("max_attempts", 0))
+    if maximum < 1 or attempt > maximum:
+        return {
+            "created": False,
+            "strategy": "remediation-task",
+            "reason": f"{gate} remediation attempt limit reached ({maximum})",
+        }
+    remediation_id = f"{remediation_root}-fix-{attempt}"
+    if remediation_id in tasks:
+        return {"created": False, "strategy": "remediation-task", "task": remediation_id, "reason": "already exists"}
+
+    copied = json.loads(json.dumps(original))
+    copied.update({
+        "id": remediation_id,
+        "title": f"Remediate {remediation_root}: {original['title']}",
+        "status": "todo",
+        "needs": list(original.get("needs") or []),
+        "acceptance": list(original.get("acceptance") or []) + [
+            f"Resolve {gate} failure for {task_id}: {reason}"
+            for reason in (reasons or ["see attached failure evidence"])
+        ],
+        "attempts": 0,
+        "evidence": [evidence_ref],
+        "blocked_reason": None,
+        "claimed_by": None,
+        "claim_id": None,
+        "claim_expires_at": None,
+        "assignment": None,
+        "superseded_by": None,
+        "remediates": remediation_root,
+        "remediation_attempt": attempt,
+        "base_commit": _git_head(refresh=True) or original.get("base_commit"),
+        "contract_revision": 1,
+        "contract_hash": None,
+    })
+    copied["governance_baseline"] = _governance_baseline(copied)
+    _normalize_task_contract_v3(copied)
+
+    timestamp = now()
+    pending_contracts: list[tuple[str, bytes]] = []
+    payload, digest = _build_task_contract(copied, 1, timestamp)
+    copied["contract_hash"] = digest
+    pending_contracts.append((remediation_id, payload))
+    state["tasks"].append(copied)
+
+    rewired = []
+    for dependent in state["tasks"]:
+        if dependent["id"] in {task_id, remediation_id} or task_id not in dependent.get("needs", []):
+            continue
+        dependent["needs"] = list(dict.fromkeys([*dependent["needs"], remediation_id]))
+        revision = int(dependent.get("contract_revision") or 0) + 1
+        created_at = _existing_contract_created_at(dependent["id"], state_file) or timestamp
+        dependent_payload, dependent_hash = _build_task_contract(dependent, revision, created_at, timestamp)
+        dependent["contract_revision"] = revision
+        dependent["contract_hash"] = dependent_hash
+        pending_contracts.append((dependent["id"], dependent_payload))
+        rewired.append(dependent["id"])
+
+    original["status"] = "superseded"
+    original["superseded_by"] = remediation_id
+    original["blocked_reason"] = f"replaced by {remediation_id} after {gate} failure"
+    event(state, state_file, "create-remediation", copied, "failure-control-plane", None, "todo", f"attempt {attempt}/{maximum}; remediates {remediation_root}")
+    event(state, state_file, "supersede", original, "failure-control-plane", "todo", "superseded", f"replaced by {remediation_id}")
+    validate(state)
+    sync_phases(state)
+    save(state, state_file, state["revision"])
+    for contract_task_id, contract_payload in pending_contracts:
+        _write_contract_payload(contract_payload, contract_task_id, state_file)
+    sync_tasks_md(state, state_file)
+    _auto_generate_visualizer_data(state_file)
+    return {
+        "created": True,
+        "strategy": "remediation-task",
+        "task": remediation_id,
+        "attempt": attempt,
+        "max_attempts": maximum,
+        "rewired_dependents": rewired,
+    }
+
+
+def cmd_recovery_show(args: argparse.Namespace) -> dict:
+    state_file = state_path(args.state)
+    state = load(state_file); validate(state)
+    if args.id not in task_map(state):
+        raise EngineError(f"unknown task: {args.id}")
+    payload = _current_recovery_recommendation(state_file, args.id)
+    if not payload:
+        raise EngineError(f"current recovery recommendation not found for task {args.id}")
+    path = _recovery_recommendation_path(state_file, args.id)
+    return {**payload, "path": _portable_workspace_ref(state_file, path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
 def _qa_evidence_path(state_file: Path, task_id: str) -> Path:
@@ -9693,7 +10840,58 @@ def _activate_integration_contracts(task: dict, evidence: str) -> list[str]:
     return activated
 
 
-def cmd_qa_run(args: argparse.Namespace) -> dict:
+def _acquire_quality_slot(state_file: Path, kind: str, maximum: int) -> Path:
+    root = workspace(state_file) / "locks" / kind
+    root.mkdir(parents=True, exist_ok=True)
+    mutex = root / ".capacity.lock"
+    acquired_mutex = False
+    for attempt in range(20):
+        try:
+            descriptor = os.open(str(mutex), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(descriptor, str(os.getpid()).encode("ascii")); os.close(descriptor)
+            acquired_mutex = True
+            break
+        except FileExistsError:
+            try:
+                owner = int(mutex.read_text(encoding="utf-8") or 0)
+            except (OSError, ValueError):
+                owner = 0
+            if not _process_is_alive(owner):
+                try:
+                    mutex.unlink()
+                except OSError:
+                    pass
+            else:
+                time.sleep(0.025 * (attempt + 1))
+    if not acquired_mutex:
+        raise EngineError(f"could not acquire {kind} capacity lock")
+    try:
+        active = []
+        for path in root.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if _process_is_alive(int(payload.get("pid") or 0)):
+                    active.append(path)
+                else:
+                    path.unlink()
+            except (OSError, ValueError, json.JSONDecodeError):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        if len(active) >= maximum:
+            raise EngineError(f"{kind} is at configured capacity ({maximum})")
+        slot = root / f"{os.getpid()}-{uuid.uuid4().hex}.json"
+        _atomic_write_json(slot, {"pid": os.getpid(), "kind": kind, "created_at": now()})
+        return slot
+    finally:
+        try:
+            mutex.unlink()
+        except OSError:
+            pass
+
+
+def _cmd_qa_run_authoritative(args: argparse.Namespace) -> dict:
     state_file = state_path(args.state)
     state = load(state_file); validate(state)
     task = task_map(state).get(args.id)
@@ -9706,24 +10904,34 @@ def cmd_qa_run(args: argparse.Namespace) -> dict:
     design = _design_validation(state_file, task) if _load_rules().get("design_policy_required", True) else {"passed": True, "checks": [], "disabled": True}
     contract = _contract_convergence(task, cwd) if _load_rules().get("contract_convergence_required", True) else {"passed": True, "checks": [], "disabled": True}
     scope = _scope_validation(task, cwd)
+    output = _task_result_validation(state_file, state, task, scope.get("changed_paths", []))
     drift = _drift_flags(task, state_file)
     dependency_ok = not any(value for key, value in drift.items() if key in {"contract_stale", "task_contract_drift"})
-    inconclusive = bool(functional.get("inconclusive"))
+    required_checks = (task.get("qa_contract") or {}).get("required_checks", [])
+    functional_checks = {str(check.get("name")): check for check in functional.get("checks", [])}
+    missing_required = [name for name in required_checks if name not in functional_checks]
+    failed_required = [name for name in required_checks if name in functional_checks and functional_checks[name].get("status") != "pass"]
+    inconclusive = bool(functional.get("inconclusive") or output.get("inconclusive") or missing_required)
     # Missing/unavailable functional tooling is inconclusive, but must not
     # mask a real design, contract, dependency, or scope violation found by
     # another deterministic gate in the same run.
     hard_failure = (
-        (not inconclusive and not functional.get("passed"))
+        (not functional.get("passed") and not functional.get("inconclusive"))
+        or bool(failed_required)
         or not design.get("passed") or not contract.get("passed")
+        or (not output.get("passed") and not output.get("inconclusive"))
         or not scope.get("passed") or not dependency_ok
     )
     status = "inconclusive" if inconclusive and not hard_failure else "fail" if hard_failure else "pass"
     checks = []
-    for group, payload in (("functional", functional), ("design", design), ("contract", contract)):
+    for group, payload in (("functional", functional), ("design", design), ("contract", contract), ("output", output)):
         for check in payload.get("checks", []):
             check_status = check.get("status") or check.get("result") or "fail"
             checks.append({"name": f"{group}:{check.get('name')}", "result": "pass" if check_status in {"pass", "warning", "exception", "skipped"} else "fail", "detail": check.get("detail") or check.get("stderr")})
-    checks.append({"name": "declared-file-scope", "result": "pass" if scope["passed"] else "fail", "detail": ", ".join(scope["out_of_scope"])})
+    checks.append({"name": "declared-file-scope", "result": "pass" if not scope["out_of_scope"] else "fail", "detail": ", ".join(scope["out_of_scope"])})
+    checks.append({"name": "forbidden-file-scope", "result": "pass" if not scope.get("forbidden_changes") else "fail", "detail": ", ".join(scope.get("forbidden_changes", []))})
+    checks.append({"name": "output-changed-files", "result": "pass" if not scope.get("unexpected_changes") else "fail", "detail": ", ".join(scope.get("unexpected_changes", []))})
+    checks.append({"name": "qa-contract-required-checks", "result": "fail" if failed_required else "inconclusive" if missing_required else "pass", "detail": json.dumps({"missing": missing_required, "failed": failed_required}, sort_keys=True)})
     checks.append({"name": "dependency-and-task-contract-drift", "result": "pass" if dependency_ok else "fail", "detail": json.dumps(drift, sort_keys=True)})
     evidence = {
         "schema_version": 1, "kind": "qa", "task": task["id"], "status": status,
@@ -9731,11 +10939,15 @@ def cmd_qa_run(args: argparse.Namespace) -> dict:
         "evidence_id": f"evidence:qa:{task['id']}",
         "fingerprint": _evidence_fingerprint(task, cwd), "checks": checks,
         "functional": functional, "design": design, "contract": contract, "scope": scope,
+        "output": output,
     }
     evidence["source_fingerprint"] = evidence["fingerprint"]["source_fingerprint"]
     evidence_path = _qa_evidence_path(state_file, task["id"])
     _atomic_write_json(evidence_path, evidence)
     evidence_ref = str(evidence_path.resolve())
+    recovery_ref = None
+    if status != "pass":
+        recovery_ref = str(_write_recovery_recommendation(state_file, task, evidence_path, evidence).resolve())
     _auto_generate_for_args(args)
     # `passed` is the key main() turns into this command's exit status. QA is
     # the authoritative gate, so omitting it made `ai-kit qa run` exit 1 even
@@ -9743,11 +10955,19 @@ def cmd_qa_run(args: argparse.Namespace) -> dict:
     # Only "pass" is a green verdict: "inconclusive" is not a pass (nothing
     # functional ran), and neither is "fail".
     if status == "inconclusive":
-        return {"task": task["id"], "status": status, "passed": False, "inconclusive": True, "lifecycle": task["status"], "evidence": evidence_ref, "checks": checks}
+        return {"task": task["id"], "status": status, "passed": False, "inconclusive": True, "lifecycle": task["status"], "evidence": evidence_ref, "recovery": recovery_ref, "checks": checks}
     if status == "fail":
-        if task["status"] == "implementation-complete":
-            cmd_transition(argparse.Namespace(state=args.state, id=task["id"], action="reject", actor="qa-control-plane", detail="authoritative QA failed", evidence=[evidence_ref], expected_revision=None, agent_id=None, claim_id=None, by=None, _control_plane=True))
-        return {"task": task["id"], "status": status, "passed": False, "lifecycle": "todo", "evidence": evidence_ref, "checks": checks}
+        cmd_transition(argparse.Namespace(state=args.state, id=task["id"], action="reject", actor="qa-control-plane", detail="authoritative QA failed", evidence=[evidence_ref], expected_revision=None, agent_id=None, claim_id=None, by=None, _control_plane=True))
+        recovery = _current_recovery_recommendation(state_file, task["id"])
+        remediation = _create_remediation_task(
+            state_file,
+            task["id"],
+            "qa",
+            evidence_ref,
+            (recovery or {}).get("reasons"),
+        )
+        lifecycle = "superseded" if remediation and remediation.get("created") else "todo"
+        return {"task": task["id"], "status": status, "passed": False, "lifecycle": lifecycle, "evidence": evidence_ref, "recovery": recovery_ref, "remediation": remediation, "checks": checks}
     # The contract registry is global and shared; the lifecycle transition is
     # optimistically concurrent and can still refuse (lost revision race,
     # locked state). Activating first meant a refused qa-pass could leave
@@ -9759,6 +10979,19 @@ def cmd_qa_run(args: argparse.Namespace) -> dict:
         cmd_transition(argparse.Namespace(state=args.state, id=task["id"], action="qa-pass", actor="qa-control-plane", detail="deterministic QA passed", evidence=[evidence_ref], expected_revision=None, agent_id=None, claim_id=None, by=None, _control_plane=True))
     activated = _activate_integration_contracts(task, evidence_ref)
     return {"task": task["id"], "status": "pass", "passed": True, "lifecycle": "qa-passed", "evidence": evidence_ref, "activated_contracts": activated, "checks": checks}
+
+
+def cmd_qa_run(args: argparse.Namespace) -> dict:
+    runtime = _load_runtime_config()
+    maximum = int(((runtime or {}).get("automation", {}).get("quality", {}).get("qa", {}).get("max_parallel", 1_000_000)))
+    slot = _acquire_quality_slot(state_path(args.state), "qa", maximum)
+    try:
+        return _cmd_qa_run_authoritative(args)
+    finally:
+        try:
+            slot.unlink()
+        except OSError:
+            pass
 
 
 def cmd_qa_show(args: argparse.Namespace) -> dict:
@@ -9950,16 +11183,19 @@ def cmd_review_apply(args: argparse.Namespace) -> dict:
     # simply omitted agent_id was rejected as self-review against an executor
     # that had no agent_id either. Absent identities are unknown, not equal:
     # demand that they be recorded, then compare.
-    reviewer_agent = recommendation.get("agent_id")
+    reviewer_runner = str(recommendation.get("runner") or "").strip()
+    reviewer_model = str(recommendation.get("model") or "").strip()
+    reviewer_agent = str(recommendation.get("agent_id") or "").strip()
     executor_agent = assignment.get("agent_id")
     if not reviewer_agent:
         raise EngineError("review recommendation must record the reviewer's agent_id")
+    if not reviewer_runner or not reviewer_model:
+        raise EngineError("review recommendation must record the reviewer's runner and model")
     if executor_agent and reviewer_agent == executor_agent:
         raise EngineError("reviewer agent_id must differ from executor")
     if (
-        recommendation.get("runner")
-        and recommendation.get("runner") == assignment.get("runner")
-        and recommendation.get("model") == assignment.get("model")
+        reviewer_runner == assignment.get("runner")
+        and reviewer_model == assignment.get("model")
     ):
         raise EngineError("reviewer runner/model identity must differ from executor")
     qa_current, qa_detail = _qa_evidence_is_current(state_file, task)
@@ -9975,7 +11211,10 @@ def cmd_review_apply(args: argparse.Namespace) -> dict:
     evidence_ref = str(recommendation_path.resolve())
     if recommendation.get("decision") == "changes-requested":
         changed = cmd_transition(argparse.Namespace(state=args.state, id=task["id"], action="reject", actor="review-control-plane", detail="review changes requested", evidence=[evidence_ref], expected_revision=None, agent_id=None, claim_id=None, by=None, _control_plane=True))
-        return {"task": task["id"], "decision": "changes-requested", "lifecycle": changed["status"], "recommendation": evidence_ref}
+        reasons = [str(item.get("message") or item.get("detail") or item) if isinstance(item, dict) else str(item) for item in recommendation.get("findings", [])]
+        remediation = _create_remediation_task(state_file, task["id"], "review", evidence_ref, reasons)
+        lifecycle = "superseded" if remediation and remediation.get("created") else changed["status"]
+        return {"task": task["id"], "decision": "changes-requested", "lifecycle": lifecycle, "recommendation": evidence_ref, "remediation": remediation}
     if recommendation.get("decision") != "approve" or recommendation.get("verdict") != "approve":
         raise EngineError("recommendation decision is invalid")
     # Approve the contracts only once review-approve has actually committed --
@@ -10272,6 +11511,16 @@ def cmd_verify(args: argparse.Namespace) -> dict:
                     check["stderr"] = result.stderr[-500:] if result.stderr else ""
                     report["passed"] = False
                 report["checks"].append(check)
+    for index, cmd in enumerate((task.get("qa_contract") or {}).get("commands", []), start=1):
+        executed_quality_checks += 1
+        name = f"qa_contract:{index}"
+        print(f"  Running {name}: {cmd}", file=sys.stderr)
+        result = _run_captured(cmd, shell=True, cwd=run_root)
+        check = {"name": name, "command": cmd, "exit_code": result.returncode, "status": "pass" if result.returncode == 0 else "fail"}
+        if result.returncode != 0:
+            check["stderr"] = result.stderr[-500:] if result.stderr else ""
+            report["passed"] = False
+        report["checks"].append(check)
     if executed_quality_checks == 0:
         # G2 requires evidence that the acceptance criteria actually hold. With
         # every verification command left at kit.yaml's 'true' sentinel, nothing
@@ -10383,18 +11632,23 @@ def parser() -> argparse.ArgumentParser:
     sub = root.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init"); init.add_argument("--title", required=True); init.add_argument("--workflow", required=True); init.add_argument("--actor", default="planner"); init.add_argument("--force", action="store_true"); init.set_defaults(fn=cmd_init)
     scaffold = sub.add_parser("scaffold", help="install an opt-in architecture/project starter"); scaffold.add_argument("profile", choices=SCAFFOLD_PROFILES); scaffold.add_argument("--force", action="store_true", help="replace scaffold-owned files and store-pilot configuration"); scaffold.set_defaults(fn=cmd_scaffold)
-    add = sub.add_parser("add-task"); add.add_argument("id"); add.add_argument("--title", required=True); add.add_argument("--owner", required=True); add.add_argument("--phase", required=True); add.add_argument("--needs", nargs="*"); add.add_argument("--depends-on", action="append", default=[], metavar="PATH"); add.add_argument("--acceptance", nargs="+", action="append", required=True); add.add_argument("--files", nargs="*"); add.add_argument("--tags", nargs="*"); add.add_argument("--context"); add.add_argument("--epic"); add.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); add.add_argument("--required-capability", action="append", default=[]); add.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); add.add_argument("--actor", default="planner"); add.set_defaults(fn=cmd_add_task)
-    update = sub.add_parser("update-task"); update.add_argument("id"); update.add_argument("--add-acceptance", nargs="+", action="append"); update.add_argument("--add-files", nargs="*"); update.add_argument("--add-tags", nargs="*"); update.add_argument("--actor", default="planner"); update.set_defaults(fn=cmd_update_task)
+    config = sub.add_parser("config", help="validate, inspect, or migrate centralized runtime configuration"); config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_show = config_sub.add_parser("show"); config_show.add_argument("--effective", action="store_true", default=True); config_show.set_defaults(fn=cmd_config_show)
+    config_validate = config_sub.add_parser("validate"); config_validate.set_defaults(fn=cmd_config_validate)
+    config_migrate = config_sub.add_parser("migrate"); config_migrate.add_argument("--force", action="store_true"); config_migrate.set_defaults(fn=cmd_config_migrate)
+    add = sub.add_parser("add-task"); add.add_argument("id"); add.add_argument("--title", required=True); add.add_argument("--owner", required=True); add.add_argument("--phase", required=True); add.add_argument("--needs", nargs="*"); add.add_argument("--depends-on", action="append", default=[], metavar="PATH"); add.add_argument("--acceptance", nargs="+", action="append", required=True); add.add_argument("--files", nargs="*"); add.add_argument("--forbidden-file", action="append", default=[]); add.add_argument("--constraint", action="append", default=[]); add.add_argument("--required-check", action="append", default=[]); add.add_argument("--qa-command", action="append", default=[]); add.add_argument("--output-export", action="append", default=[]); add.add_argument("--output-evidence-kind", action="append", default=[]); add.add_argument("--no-changed-files", action="store_true"); add.add_argument("--tags", nargs="*"); add.add_argument("--context"); add.add_argument("--epic"); add.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); add.add_argument("--required-capability", action="append", default=[]); add.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); add.add_argument("--actor", default="planner"); add.set_defaults(fn=cmd_add_task)
+    update = sub.add_parser("update-task"); update.add_argument("id"); update.add_argument("--add-acceptance", nargs="+", action="append"); update.add_argument("--add-files", nargs="*"); update.add_argument("--add-tags", nargs="*"); update.add_argument("--add-forbidden-file", action="append"); update.add_argument("--add-constraint", action="append"); update.add_argument("--add-required-check", action="append"); update.add_argument("--add-qa-command", action="append"); update.add_argument("--add-output-export", action="append"); update.add_argument("--add-output-evidence-kind", action="append"); update.add_argument("--actor", default="planner"); update.set_defaults(fn=cmd_update_task)
     ready = sub.add_parser("ready"); ready.add_argument("--context"); ready.add_argument("--epic"); ready.set_defaults(fn=cmd_ready)
-    plan = sub.add_parser("plan"); plan.add_argument("--idea", required=True); plan.add_argument("--workflow", default="feature"); plan.add_argument("--owner", required=True); plan.add_argument("--acceptance", nargs="+", action="append", required=True); plan.add_argument("--files", nargs="*"); plan.add_argument("--tags", nargs="*"); plan.add_argument("--phase", default="build"); plan.add_argument("--context"); plan.add_argument("--epic"); plan.add_argument("--depends-on", action="append", default=[], metavar="PATH"); plan.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); plan.add_argument("--required-capability", action="append", default=[]); plan.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); plan.add_argument("--scope"); plan.add_argument("--out-of-scope"); plan.add_argument("--risks", nargs="*"); plan.add_argument("--assumptions"); plan.add_argument("--actor", default="planner"); plan.add_argument("--force", action="store_true"); plan.set_defaults(fn=cmd_plan)
+    plan = sub.add_parser("plan"); plan.add_argument("--idea", required=True); plan.add_argument("--workflow", default="feature"); plan.add_argument("--owner", required=True); plan.add_argument("--acceptance", nargs="+", action="append", required=True); plan.add_argument("--files", nargs="*"); plan.add_argument("--forbidden-file", action="append", default=[]); plan.add_argument("--constraint", action="append", default=[]); plan.add_argument("--required-check", action="append", default=[]); plan.add_argument("--qa-command", action="append", default=[]); plan.add_argument("--output-export", action="append", default=[]); plan.add_argument("--output-evidence-kind", action="append", default=[]); plan.add_argument("--no-changed-files", action="store_true"); plan.add_argument("--tags", nargs="*"); plan.add_argument("--phase", default="build"); plan.add_argument("--context"); plan.add_argument("--epic"); plan.add_argument("--depends-on", action="append", default=[], metavar="PATH"); plan.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); plan.add_argument("--required-capability", action="append", default=[]); plan.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); plan.add_argument("--scope"); plan.add_argument("--out-of-scope"); plan.add_argument("--risks", nargs="*"); plan.add_argument("--assumptions"); plan.add_argument("--actor", default="planner"); plan.add_argument("--force", action="store_true"); plan.set_defaults(fn=cmd_plan)
     plan_draft = sub.add_parser("plan-draft", help="create, revise, finalize, and materialize a collaborative plan draft")
     plan_draft_sub = plan_draft.add_subparsers(dest="plan_draft_command", required=True)
     draft_create = plan_draft_sub.add_parser("create"); draft_create.add_argument("id"); draft_create.add_argument("--title", required=True); draft_create.add_argument("--workflow", default="feature"); draft_create.add_argument("--problem", required=True); draft_create.add_argument("--scope", action="append", default=[]); draft_create.add_argument("--out-of-scope", action="append", default=[]); draft_create.add_argument("--acceptance", nargs="+", action="append", default=[]); draft_create.add_argument("--assumption", action="append", default=[]); draft_create.add_argument("--open-question", action="append", default=[]); draft_create.add_argument("--actor", default="planner"); draft_create.set_defaults(fn=cmd_plan_draft_create)
     draft_update = plan_draft_sub.add_parser("update"); draft_update.add_argument("id"); draft_update.add_argument("--expected-revision", type=int, required=True); draft_update.add_argument("--summary", required=True); draft_update.add_argument("--title"); draft_update.add_argument("--problem"); draft_update.add_argument("--set-scope", nargs="*"); draft_update.add_argument("--set-out-of-scope", nargs="*"); draft_update.add_argument("--set-acceptance", nargs="+", action="append"); draft_update.add_argument("--add-scope", action="append"); draft_update.add_argument("--add-out-of-scope", action="append"); draft_update.add_argument("--add-acceptance", nargs="+", action="append"); draft_update.add_argument("--add-assumption", action="append"); draft_update.add_argument("--add-open-question", action="append"); draft_update.add_argument("--resolve-open-question", action="append"); draft_update.add_argument("--actor", default="planner"); draft_update.set_defaults(fn=cmd_plan_draft_update)
-    draft_add_task = plan_draft_sub.add_parser("add-task"); draft_add_task.add_argument("id"); draft_add_task.add_argument("task_id"); draft_add_task.add_argument("--expected-revision", type=int, required=True); draft_add_task.add_argument("--title", required=True); draft_add_task.add_argument("--owner", required=True); draft_add_task.add_argument("--phase", required=True); draft_add_task.add_argument("--needs", nargs="*"); draft_add_task.add_argument("--depends-on", action="append", default=[], metavar="PATH"); draft_add_task.add_argument("--acceptance", nargs="+", action="append", required=True); draft_add_task.add_argument("--files", nargs="*"); draft_add_task.add_argument("--tags", nargs="*"); draft_add_task.add_argument("--context"); draft_add_task.add_argument("--epic"); draft_add_task.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); draft_add_task.add_argument("--required-capability", action="append", default=[]); draft_add_task.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); draft_add_task.add_argument("--actor", default="planner"); draft_add_task.set_defaults(fn=cmd_plan_draft_add_task)
-    draft_update_task = plan_draft_sub.add_parser("update-task"); draft_update_task.add_argument("id"); draft_update_task.add_argument("task_id"); draft_update_task.add_argument("--expected-revision", type=int, required=True); draft_update_task.add_argument("--summary", required=True); draft_update_task.add_argument("--title"); draft_update_task.add_argument("--owner"); draft_update_task.add_argument("--phase"); draft_update_task.add_argument("--context"); draft_update_task.add_argument("--epic"); draft_update_task.add_argument("--set-needs", nargs="*"); draft_update_task.add_argument("--set-depends-on", action="append", default=None, metavar="PATH"); draft_update_task.add_argument("--set-acceptance", nargs="+", action="append"); draft_update_task.add_argument("--set-files", nargs="*"); draft_update_task.add_argument("--set-tags", nargs="*"); draft_update_task.add_argument("--actor", default="planner"); draft_update_task.set_defaults(fn=cmd_plan_draft_update_task)
+    draft_add_task = plan_draft_sub.add_parser("add-task"); draft_add_task.add_argument("id"); draft_add_task.add_argument("task_id"); draft_add_task.add_argument("--expected-revision", type=int, required=True); draft_add_task.add_argument("--title", required=True); draft_add_task.add_argument("--owner", required=True); draft_add_task.add_argument("--phase", required=True); draft_add_task.add_argument("--needs", nargs="*"); draft_add_task.add_argument("--depends-on", action="append", default=[], metavar="PATH"); draft_add_task.add_argument("--acceptance", nargs="+", action="append", required=True); draft_add_task.add_argument("--files", nargs="*"); draft_add_task.add_argument("--forbidden-file", action="append", default=[]); draft_add_task.add_argument("--constraint", action="append", default=[]); draft_add_task.add_argument("--required-check", action="append", default=[]); draft_add_task.add_argument("--qa-command", action="append", default=[]); draft_add_task.add_argument("--output-export", action="append", default=[]); draft_add_task.add_argument("--output-evidence-kind", action="append", default=[]); draft_add_task.add_argument("--no-changed-files", action="store_true"); draft_add_task.add_argument("--tags", nargs="*"); draft_add_task.add_argument("--context"); draft_add_task.add_argument("--epic"); draft_add_task.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); draft_add_task.add_argument("--required-capability", action="append", default=[]); draft_add_task.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); draft_add_task.add_argument("--actor", default="planner"); draft_add_task.set_defaults(fn=cmd_plan_draft_add_task)
+    draft_update_task = plan_draft_sub.add_parser("update-task"); draft_update_task.add_argument("id"); draft_update_task.add_argument("task_id"); draft_update_task.add_argument("--expected-revision", type=int, required=True); draft_update_task.add_argument("--summary", required=True); draft_update_task.add_argument("--title"); draft_update_task.add_argument("--owner"); draft_update_task.add_argument("--phase"); draft_update_task.add_argument("--context"); draft_update_task.add_argument("--epic"); draft_update_task.add_argument("--set-needs", nargs="*"); draft_update_task.add_argument("--set-depends-on", action="append", default=None, metavar="PATH"); draft_update_task.add_argument("--set-acceptance", nargs="+", action="append"); draft_update_task.add_argument("--set-files", nargs="*"); draft_update_task.add_argument("--set-forbidden-files", nargs="*"); draft_update_task.add_argument("--set-constraints", nargs="*"); draft_update_task.add_argument("--set-required-checks", nargs="*"); draft_update_task.add_argument("--set-qa-commands", nargs="*"); draft_update_task.add_argument("--set-output-exports", nargs="*"); draft_update_task.add_argument("--set-output-evidence-kinds", nargs="*"); draft_update_task.add_argument("--set-tags", nargs="*"); draft_update_task.add_argument("--actor", default="planner"); draft_update_task.set_defaults(fn=cmd_plan_draft_update_task)
     draft_finalize = plan_draft_sub.add_parser("finalize"); draft_finalize.add_argument("id"); draft_finalize.add_argument("--expected-revision", type=int, required=True); draft_finalize.add_argument("--confirmed-by-user", action="store_true", help="required after the Planner has shown the plan and the user explicitly approved it"); draft_finalize.add_argument("--actor", default="planner"); draft_finalize.set_defaults(fn=cmd_plan_draft_finalize)
     draft_reopen = plan_draft_sub.add_parser("reopen"); draft_reopen.add_argument("id"); draft_reopen.add_argument("--expected-revision", type=int, required=True); draft_reopen.add_argument("--reason", required=True); draft_reopen.add_argument("--actor", default="planner"); draft_reopen.set_defaults(fn=cmd_plan_draft_reopen)
+    draft_authorize = plan_draft_sub.add_parser("authorize-execution"); draft_authorize.add_argument("id"); draft_authorize.add_argument("--expected-revision", type=int, required=True); draft_authorize.add_argument("--confirmed-by-user", action="store_true", required=True); draft_authorize.add_argument("--mode", choices=["sequential", "parallel"], default="parallel"); draft_authorize.add_argument("--actor", default="user"); draft_authorize.set_defaults(fn=cmd_plan_draft_authorize_execution)
     draft_materialize = plan_draft_sub.add_parser("materialize"); draft_materialize.add_argument("id"); draft_materialize.add_argument("--create-tasks", action="store_true", help="required after a separate explicit user request to create the task DAG"); draft_materialize.add_argument("--actor", default="planner"); draft_materialize.set_defaults(fn=cmd_plan_draft_materialize)
     draft_show = plan_draft_sub.add_parser("show"); draft_show.add_argument("id"); draft_show.set_defaults(fn=cmd_plan_draft_show)
     trans = sub.add_parser("transition"); trans.add_argument("id"); trans.add_argument("action", choices=TRANSITIONS); trans.add_argument("--actor", required=True); trans.add_argument("--detail"); trans.add_argument("--evidence", nargs="+"); trans.add_argument("--expected-revision", type=int); trans.add_argument("--agent-id", help="unique identity of the agent instance recorded in the task lease"); trans.add_argument("--claim-id", help="opaque task lease required to complete or block claimed work"); trans.add_argument("--by", metavar="TASK-ID", help="required for 'supersede': the task id that replaced this one"); trans.set_defaults(fn=cmd_transition)
@@ -10403,6 +11657,10 @@ def parser() -> argparse.ArgumentParser:
     qa = sub.add_parser("qa", help="authoritative deterministic QA"); qa_sub = qa.add_subparsers(dest="qa_command", required=True)
     qa_run = qa_sub.add_parser("run"); qa_run.add_argument("id"); qa_run.set_defaults(fn=cmd_qa_run)
     qa_show = qa_sub.add_parser("show"); qa_show.add_argument("id"); qa_show.set_defaults(fn=cmd_qa_show)
+    result = sub.add_parser("result", help="immutable-reference task output projection"); result_sub = result.add_subparsers(dest="result_command", required=True)
+    result_show = result_sub.add_parser("show"); result_show.add_argument("id"); result_show.set_defaults(fn=cmd_result_show)
+    recovery = sub.add_parser("recovery", help="deterministic failure classification and recovery recommendation"); recovery_sub = recovery.add_subparsers(dest="recovery_command", required=True)
+    recovery_show = recovery_sub.add_parser("show"); recovery_show.add_argument("id"); recovery_show.set_defaults(fn=cmd_recovery_show)
     review = sub.add_parser("review", help="independent recommendation evidence"); review_sub = review.add_subparsers(dest="review_command", required=True)
     review_submit = review_sub.add_parser("submit"); review_submit.add_argument("id"); review_submit.add_argument("--input", required=True); review_submit.set_defaults(fn=cmd_review_submit)
     review_show = review_sub.add_parser("show"); review_show.add_argument("id"); review_show.set_defaults(fn=cmd_review_show)
@@ -10457,7 +11715,7 @@ def parser() -> argparse.ArgumentParser:
     visualizer_generate = visualizer_sub.add_parser("generate"); visualizer_generate.add_argument("--refresh", action="store_true"); visualizer_generate.set_defaults(fn=cmd_visualizer_generate)
     visualizer_serve = visualizer_sub.add_parser("serve"); visualizer_serve.add_argument("--host", default="127.0.0.1"); visualizer_serve.add_argument("--port", type=int, default=8080); visualizer_serve.add_argument("--verbose", action="store_true"); visualizer_serve.set_defaults(fn=cmd_visualizer_serve)
     runner = sub.add_parser("runner"); runner_sub = runner.add_subparsers(dest="runner_command", required=True)
-    runner_add = runner_sub.add_parser("add"); runner_add.add_argument("name"); runner_add.add_argument("--command", required=True); runner_add.add_argument("--model"); runner_add.add_argument("--models", nargs="+"); runner_add.add_argument("--provider"); runner_add.add_argument("--description"); runner_add.add_argument("--capabilities", nargs="+"); runner_add.add_argument("--roles", nargs="+"); runner_add.add_argument("--task-kinds", nargs="+", choices=sorted(TASK_KINDS)); runner_add.add_argument("--priority", type=int, default=0); runner_add.add_argument("--max-parallel", type=int, default=1); runner_add.add_argument("--default-model"); runner_add.add_argument("--default", action="store_true"); runner_add.add_argument("--force", action="store_true"); runner_add.set_defaults(fn=cmd_runner_add)
+    runner_add = runner_sub.add_parser("add"); runner_add.add_argument("name"); runner_add.add_argument("--command", required=True); runner_add.add_argument("--model"); runner_add.add_argument("--models", nargs="+"); runner_add.add_argument("--pool-model", help="model selected by pooled dispatch; defaults to the first model in the allowlist"); runner_add.add_argument("--provider"); runner_add.add_argument("--description"); runner_add.add_argument("--capabilities", nargs="+"); runner_add.add_argument("--roles", nargs="+"); runner_add.add_argument("--task-kinds", nargs="+", choices=sorted(TASK_KINDS)); runner_add.add_argument("--priority", type=int, default=0); runner_add.add_argument("--max-parallel", type=int, default=1); runner_add.add_argument("--default-model"); runner_add.add_argument("--default", action="store_true"); runner_add.add_argument("--force", action="store_true"); runner_add.set_defaults(fn=cmd_runner_add)
     runner_list = runner_sub.add_parser("list"); runner_list.set_defaults(fn=cmd_runner_list)
     epics = sub.add_parser("epics"); epics.set_defaults(fn=cmd_epics)
     epic = sub.add_parser("epic"); epic_sub = epic.add_subparsers(dest="epic_command", required=True)
@@ -10490,7 +11748,7 @@ def main() -> int:
         # is still printed either way; only the exit status changes, so a
         # caller reading stdout is unaffected while `if !`/`&&`/`set -e` now
         # behave the way any shell author would assume.
-        if isinstance(output, dict) and args.fn in {cmd_verify, cmd_qa_run, cmd_design_validate, cmd_contract_verify, cmd_contract_check, cmd_delivery_check, cmd_architecture_fitness, cmd_architecture_validate} and not output.get("passed"):
+        if isinstance(output, dict) and args.fn in {cmd_verify, cmd_qa_run, cmd_config_validate, cmd_design_validate, cmd_contract_verify, cmd_contract_check, cmd_delivery_check, cmd_architecture_fitness, cmd_architecture_validate} and not output.get("passed"):
             return 1
         return 0
     except EngineError as exc:

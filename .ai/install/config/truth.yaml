@@ -1,6 +1,10 @@
 # Truth Registry points to canonical authorities; it is not an authority itself.
 schema_version: 1
 topics:
+  runtime:
+    authority: .ai-config/config.yaml
+    kind: config
+    required: true
   architecture:
     authority: .ai-config/architecture.json
     kind: config
