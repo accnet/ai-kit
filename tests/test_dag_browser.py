@@ -247,8 +247,16 @@ class DagBrowserTests(unittest.TestCase):
 
     def test_renders_every_task_and_edge(self) -> None:
         with self.page_at("dag.html") as (page, errors):
+            self.assertIn("/index.html#view=dag", page.url)
             self.assertEqual(page.locator(".node").count(), len(self.payload["tasks"]))
             self.assertEqual(page.locator(".edge-path").count(), len(self.payload["edges"]))
+            self.assertEqual([e for e in errors if is_real_error(e)], [])
+
+    def test_legacy_dag_deep_link_preserves_task_selection(self) -> None:
+        with self.page_at("dag.html?task=T1") as (page, errors):
+            self.assertIn("/index.html#view=dag&task=T1", page.url)
+            self.assertEqual(page.locator("#viewDag .node.selected").count(), 1)
+            self.assertIn("T1", page.locator("#selCard").inner_text())
             self.assertEqual([e for e in errors if is_real_error(e)], [])
 
     def test_no_two_nodes_overlap(self) -> None:

@@ -276,10 +276,22 @@ def _load_registry() -> dict:
                 wrapped = re.match(r"\s+(\w+):\s*(.+)$", line)
                 if wrapped:
                     _reject_unterminated_list(wrapped.group(2).strip(), registry_path, f"owners.{wrapped.group(1)}")
+    # Scoped to the core_skills block. A whole-file search took the FIRST
+    # `names:` anywhere -- a commented-out example, or a `names:` added to any
+    # section above core_skills -- and silently made that the core skill list.
     core_names: list[str] = []
-    match = re.search(r"names:\s*\[([^\]]*)\]", text)
-    if match:
-        core_names = [n.strip() for n in match.group(1).split(",") if n.strip()]
+    in_core = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not line.startswith((" ", "\t")):
+            in_core = stripped == "core_skills:"
+            continue
+        if not in_core or stripped.startswith("#"):
+            continue
+        match = re.match(r"^\s+names:\s*\[([^\]]*)\]", line)
+        if match:
+            core_names = [n.strip() for n in match.group(1).split(",") if n.strip()]
+            break
     return {"owners": owners, "core_skills": {"names": core_names}}
 
 
@@ -312,12 +324,14 @@ def _parse_yaml_registry_text(text: str, path: Path, top_key: str) -> dict:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if line == header:
-            in_section = True
-            current = None
-            continue
         if not line.startswith((" ", "\t")):
-            in_section = False
+            # Compare the STRIPPED line: a header written with a trailing
+            # space failed the exact match, silently yielding an empty section
+            # instead of an error. For skill_triggers that quietly switched off
+            # every mandatory-concern route (security-review, accessibility,
+            # data-migration, ...); for contexts it quietly switched off
+            # revision-drift detection.
+            in_section = stripped == header
             current = None
             continue
         if not in_section:
@@ -564,6 +578,17 @@ def _load_automation_roles() -> dict:
     return roles
 
 
+_POST_COMPLETION_WARNED: set[str] = set()
+
+
+def _post_completion_warn(message: str) -> None:
+    """Report a post_completion config problem once per process, on stderr."""
+    if message in _POST_COMPLETION_WARNED:
+        return
+    _POST_COMPLETION_WARNED.add(message)
+    print(f"WARNING: {message}", file=sys.stderr)
+
+
 def _load_post_completion_config() -> dict:
     """Load the opt-in post-completion automation switch.
 
@@ -573,50 +598,73 @@ def _load_post_completion_config() -> dict:
     A missing file, missing section, or malformed value all default to
     'enabled: false' so dispatch/transition/pipeline behavior is unchanged
     unless an operator explicitly opts in.
+
+    Failing closed is deliberate and must stay that way: this is read from
+    `cmd_transition` on every `complete`, so raising on a bad value would make
+    an unrelated automation typo break the transition the caller actually
+    asked for. What it does NOT do any more is stay quiet about it -- an
+    unknown key or an unparseable value now warns on stderr (once per
+    process). Previously `enabld: true`, `enabled: yes please` or a
+    mis-indented key were indistinguishable from never having configured
+    automation at all, and the only symptom was tasks silently not advancing.
     """
+    BOOL_KEYS = {"enabled", "retry_on_rejection", "dispatch_ready_on_close"}
+    INT_KEYS = {"max_retries": (0, 5), "dispatch_ready_limit": (1, 50), "backup_after_retries": (1, 5)}
+    TRUE = {"true", "yes", "on", "1"}
+    FALSE = {"false", "no", "off", "0"}
+
+    values: dict[str, object] = {
+        "enabled": False, "retry_on_rejection": False, "max_retries": 0,
+        "dispatch_ready_on_close": False, "dispatch_ready_limit": 1, "backup_after_retries": 1,
+    }
     path = _config_path("automation.yaml")
     if not path.exists():
-        return {"enabled": False}
-    enabled = False
-    retry_on_rejection = False
-    max_retries = 0
-    dispatch_ready_on_close = False
-    dispatch_ready_limit = 1
-    backup_after_retries = 1
+        return values
+
     in_section = False
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line == "post_completion:":
-            in_section = True
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if not line.startswith((" ", "\t")):
+            # Tolerate trailing whitespace after the header, which the previous
+            # exact `line == "post_completion:"` comparison silently rejected.
+            in_section = stripped == "post_completion:"
             continue
-        if in_section:
-            if not line.startswith((" ", "\t")):
-                break
-            match = re.match(r"^\s+enabled:\s*(\S+)", line)
-            if match:
-                enabled = match.group(1).strip().strip('"\'').lower() in {"true", "yes", "1"}
-            match = re.match(r"^\s+retry_on_rejection:\s*(\S+)", line)
-            if match:
-                retry_on_rejection = match.group(1).strip().strip('"\'').lower() in {"true", "yes", "1"}
-            match = re.match(r"^\s+max_retries:\s*(\d+)", line)
-            if match:
-                max_retries = min(5, max(0, int(match.group(1))))
-            match = re.match(r"^\s+dispatch_ready_on_close:\s*(\S+)", line)
-            if match:
-                dispatch_ready_on_close = match.group(1).strip().strip('"\'').lower() in {"true", "yes", "1"}
-            match = re.match(r"^\s+dispatch_ready_limit:\s*(\d+)", line)
-            if match:
-                dispatch_ready_limit = min(50, max(1, int(match.group(1))))
-            match = re.match(r"^\s+backup_after_retries:\s*(\d+)", line)
-            if match:
-                backup_after_retries = min(5, max(1, int(match.group(1))))
-    return {
-        "enabled": enabled,
-        "retry_on_rejection": retry_on_rejection,
-        "max_retries": max_retries if retry_on_rejection else 0,
-        "dispatch_ready_on_close": dispatch_ready_on_close,
-        "dispatch_ready_limit": dispatch_ready_limit,
-        "backup_after_retries": backup_after_retries,
-    }
+        if not in_section or not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"^\s+([A-Za-z0-9_]+):\s*(.*)$", line)
+        if not match:
+            _post_completion_warn(f"{display_path(path)}:{number}: ignoring unparseable post_completion entry {stripped!r}")
+            continue
+        key, raw = match.group(1), match.group(2).strip().strip('"' + chr(39))
+        raw = raw.split(" #", 1)[0].strip()
+        if key in BOOL_KEYS:
+            if raw.lower() in TRUE:
+                values[key] = True
+            elif raw.lower() in FALSE:
+                values[key] = False
+            else:
+                _post_completion_warn(
+                    f"{display_path(path)}:{number}: post_completion.{key} must be true or false, got {raw!r}; "
+                    f"treating it as false"
+                )
+        elif key in INT_KEYS:
+            low, high = INT_KEYS[key]
+            if re.fullmatch(r"\d+", raw):
+                values[key] = min(high, max(low, int(raw)))
+            else:
+                _post_completion_warn(
+                    f"{display_path(path)}:{number}: post_completion.{key} must be a whole number, got {raw!r}; "
+                    f"keeping the default {values[key]}"
+                )
+        else:
+            known = ", ".join(sorted(BOOL_KEYS | set(INT_KEYS)))
+            _post_completion_warn(
+                f"{display_path(path)}:{number}: ignoring unknown post_completion key {key!r}; expected one of: {known}"
+            )
+
+    if not values["retry_on_rejection"]:
+        values["max_retries"] = 0
+    return values
 
 
 def _post_completion_enabled() -> bool:
@@ -634,11 +682,8 @@ def _load_runner_aliases() -> dict[str, str]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if line == "runner_aliases:":
-            in_section = True
-            continue
         if not line.startswith((" ", "\t")):
-            in_section = False
+            in_section = stripped == "runner_aliases:"  # tolerate trailing whitespace
             continue
         if not in_section:
             continue
@@ -740,10 +785,15 @@ def _runner_supports(name: str, entry: dict, task: dict, state: dict, reviewer: 
         maximum = int(entry.get("max_parallel", 1_000_000))
     except (TypeError, ValueError):
         raise EngineError(f"runner {name} max_parallel must be an integer")
+    if maximum <= 0:
+        # An explicit 0 is how an operator drains a runner. `max(1, maximum)`
+        # below used to floor it at one, so a drained runner still accepted a
+        # task -- the one outcome setting it to 0 is meant to prevent.
+        return False, f"runner {name} is disabled (max_parallel: {maximum})"
     active_count = _runner_active_count(name, state)
     if task.get("status") == "in-progress" and (task.get("assignment") or {}).get("runner") == name:
         active_count = max(0, active_count - 1)
-    if active_count >= max(1, maximum):
+    if active_count >= maximum:
         return False, f"runner {name} is at capacity ({maximum})"
     return True, None
 
@@ -875,23 +925,37 @@ def _write_runners(
 
 
 def _render_runner_command(template: str, prompt: str, model: str | None) -> str:
-    """Render prompt/model placeholders with shell-safe quoting."""
-    command = template.replace("{prompt}", shlex.quote(prompt))
-    if model is not None:
-        command = command.replace("{model}", shlex.quote(model))
-    if "{model}" in command:
-        raise EngineError("runner command still contains {model}; select a model before dispatch")
-    return command
+    """Render prompt/model placeholders with shell-safe quoting.
+
+    {model} is resolved against the TEMPLATE, before the prompt goes in. The
+    prompt carries task titles, acceptance criteria and file paths, so it can
+    legitimately contain the literal text "{model}" -- substituting afterwards
+    rewrote the user's own words inside the quoted prompt, or (with no model
+    selected) made an unrelated task title trip the "select a model" guard.
+    """
+    if "{model}" in template:
+        if model is None:
+            raise EngineError("runner command still contains {model}; select a model before dispatch")
+        template = template.replace("{model}", shlex.quote(model))
+    return template.replace("{prompt}", shlex.quote(prompt))
 
 
-def _git_head() -> str | None:
-    """Return the repo's current HEAD commit hash, or None outside git / before the first commit."""
+def _git_head(refresh: bool = False) -> str | None:
+    """Return the repo's current HEAD commit hash, or None outside git / before the first commit.
+
+    Pass ``refresh=True`` from anything that must observe commits made after
+    this process started. The cache below is correct for planning (one CLI
+    invocation describes one repository snapshot), but a long-lived process --
+    `pipeline`, post-completion retry -- keeps running while dependencies get
+    integrated, and a cached HEAD would silently pin every later worktree to
+    the commit this process happened to see first.
+    """
     import subprocess as _sp
     # A CLI invocation operates on one repository snapshot. Cache the lookup
     # so workflows that create many tasks do not repeatedly spawn Git (which
     # is especially expensive and prone to pipe-reader contention on Windows).
     cache_key = str(ROOT.resolve())
-    if cache_key in _GIT_HEAD_CACHE:
+    if not refresh and cache_key in _GIT_HEAD_CACHE:
         return _GIT_HEAD_CACHE[cache_key]
     # Avoid spawning Git for the common temporary/non-repository case. Besides
     # being cheaper, this matters on Windows where a captured subprocess can
@@ -945,7 +1009,7 @@ def _ensure_task_worktree(
     # dispatch time so an integration task sees producer/consumer commits that
     # became done after the plan was created. Retries returned above keep the
     # original assignment base and worktree unchanged.
-    base_commit = _git_head() or task.get("base_commit")
+    base_commit = _git_head(refresh=True) or task.get("base_commit")
     if no_worktree:
         worktree = ROOT
         branch = None
@@ -1467,11 +1531,21 @@ def _load_stack_skills() -> dict[str, list[str]]:
     if not path.exists():
         return {}
     text = path.read_text(encoding="utf-8")
-    if "stack_skills:" not in text:
+    # Locate the section by scanning for a top-level key, not by splitting on
+    # the first occurrence of the text anywhere: a comment mentioning
+    # `stack_skills:` above the real section made the split start mid-comment
+    # and drop entries.
+    lines = text.splitlines()
+    start = next(
+        (index + 1 for index, line in enumerate(lines)
+         if not line.startswith((" ", "\t")) and line.strip() == "stack_skills:"),
+        None,
+    )
+    if start is None:
         return {}
-    section = text.split("stack_skills:", 1)[1]
+    section = lines[start:]
     mapping: dict[str, list[str]] = {}
-    for line in section.splitlines():
+    for line in section:
         if line and not line.startswith((" ", "\t")):
             break  # next top-level key
         match = re.match(r"^  (\S+):\s*\{path:\s*([^,}]+),\s*stack:\s*\[([^\]]*)\]\s*\}", line)
@@ -1626,6 +1700,145 @@ def _technology_skill_doc_paths(skill_dir: Path, metadata: dict) -> list[str]:
     return resolved
 
 
+def _process_is_alive(pid: int) -> bool:
+    """Cross-platform "does this pid still exist" check for lock reclamation.
+
+    Deliberately does NOT use ``os.kill(pid, 0)`` on Windows. There, ``os.kill``
+    has no signal semantics at all: it calls ``TerminateProcess(handle, sig)``,
+    so historically a liveness probe could kill the very process it asked
+    about, and for an unknown pid ``OpenProcess`` fails with
+    ``ERROR_INVALID_PARAMETER`` -- surfacing as a plain ``OSError``, never the
+    ``ProcessLookupError`` a POSIX-shaped handler expects. A probe written for
+    POSIX therefore both fails to reclaim a stale lock and escapes as an
+    unhandled traceback. Query the process object directly instead.
+
+    Unknown answers resolve to True (assume alive): refusing to steal a lock
+    only blocks, while stealing one held by a live process corrupts state.
+    """
+    if pid <= 0:
+        return False
+    if _is_windows_runtime():
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            SYNCHRONIZE = 0x00100000
+            ERROR_ACCESS_DENIED = 5
+            WAIT_TIMEOUT = 0x00000102
+            handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if not handle:
+                # Access denied means the process exists but belongs to another
+                # user; anything else (chiefly ERROR_INVALID_PARAMETER) means
+                # there is no such process.
+                return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+            try:
+                # A live process never signals; an exited one signals immediately.
+                return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _lock_owner_pid(lock_path: Path) -> int | None:
+    """Read the owning pid from a lock file, or None when it records none.
+
+    Accepts both shapes AI-Kit has written: a bare pid and a JSON object with
+    a ``pid`` member, so locks left by an earlier version stay readable.
+    """
+    try:
+        text = lock_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    try:
+        return int(payload["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _lock_is_stale(lock_path: Path, max_age_seconds: float) -> bool:
+    """True only when a lock file's owner is provably gone.
+
+    A recorded pid is authoritative: if that process no longer exists the lock
+    is abandoned and reclaimable immediately, however long ago it was taken.
+    Age is the fallback for a lock with no readable owner (empty, truncated,
+    or pre-dating pid recording) -- the case that otherwise wedges the
+    workflow forever after a hard kill.
+    """
+    pid = _lock_owner_pid(lock_path)
+    if pid is not None:
+        return not _process_is_alive(pid)
+    try:
+        return (time.time() - lock_path.stat().st_mtime) > max_age_seconds
+    except OSError:
+        # Vanished while we were looking: the next O_EXCL create decides.
+        return True
+
+
+def _acquire_lock_file(lock_path: Path, payload: dict | None = None, *, max_age_seconds: float = 900.0) -> bool:
+    """Take `lock_path` exclusively, reclaiming it if its owner died.
+
+    Returns False without blocking when the lock is genuinely held. The owning
+    pid is recorded inside so any other process can make the same judgement.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    for _attempt in range(2):
+        try:
+            descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if not _lock_is_stale(lock_path, max_age_seconds):
+                return False
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            continue  # one retry: another process may win the reclaimed slot
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"pid": os.getpid(), **(payload or {})}))
+        return True
+    return False
+
+
+# Archive lines staged by event() and flushed by save() once the matching state
+# write has actually committed. Keyed by resolved state path so concurrent
+# workflows in one process never mix their histories.
+_PENDING_EVENT_ARCHIVE: dict[str, list[dict]] = {}
+
+
+def _flush_event_archive(path: Path, items: list[dict]) -> None:
+    event_log = workspace(path) / "logs" / "events.jsonl"
+    event_log.parent.mkdir(parents=True, exist_ok=True)
+    with event_log.open("a", encoding="utf-8") as handle:
+        for item in items:
+            handle.write(json.dumps(item) + "\n")
+
+
 def load(path: Path) -> dict:
     if not path.exists():
         raise EngineError(f"state not found: {path}; run init first")
@@ -1638,16 +1851,23 @@ def load(path: Path) -> dict:
 def save(state: dict, path: Path, expected_revision: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = path.with_suffix(path.suffix + ".lock")
+    # Events staged for this path are claimed up front, so any failure below
+    # (a lost revision race, a busy lock) discards them instead of leaving the
+    # append-only archive describing a transition that never committed.
+    pending_events = _PENDING_EVENT_ARCHIVE.pop(str(path.resolve()), [])
     deadline = time.monotonic() + 5
     while True:
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
+        # A state write is held for milliseconds, so a lock older than the
+        # grace period below can only belong to a process that died holding
+        # it. Without reclamation one hard kill wedges every later write.
+        if _acquire_lock_file(lock, max_age_seconds=120.0):
             break
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise EngineError(f"state is locked: {path}")
-            time.sleep(0.05)
+        if time.monotonic() >= deadline:
+            raise EngineError(
+                f"state is locked: {path}; another AI-Kit process is writing it, "
+                f"or remove {display_path(lock)} if none is running"
+            )
+        time.sleep(0.05)
     try:
         disk_revision = None
         if path.exists():
@@ -1663,12 +1883,20 @@ def save(state: dict, path: Path, expected_revision: int | None = None) -> None:
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, path)
+        # The state write has committed; only now is the archive allowed to
+        # claim these transitions happened.
+        if pending_events:
+            _flush_event_archive(path, pending_events)
+        if path == STATE:
+            # Written inside the lock and atomically: this is a projection of
+            # the state just committed, so publishing it after releasing the
+            # lock let a slower writer overwrite a newer summary, and a plain
+            # write_text left a truncated file readable by anything polling it.
+            active = [task["id"] for task in state["tasks"] if task["status"] == "in-progress"]
+            summary = {"version": 1, "workflow_state": display_path(path), "workflow_id": state.get("workflow_id"), "title": state["title"], "workflow": state["workflow"], "active_tasks": active, "updated_at": now()}
+            _atomic_write_json(CURRENT, summary)
     finally:
         lock.unlink(missing_ok=True)
-    if path == STATE:
-        active = [task["id"] for task in state["tasks"] if task["status"] == "in-progress"]
-        summary = {"version": 1, "workflow_state": display_path(path), "workflow_id": state.get("workflow_id"), "title": state["title"], "workflow": state["workflow"], "active_tasks": active, "updated_at": now()}
-        CURRENT.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
 
 def task_map(state: dict) -> dict:
@@ -1752,18 +1980,29 @@ def validate(state: dict) -> None:
             )
         if task["task_kind"] == "implementation" and task["contract_refs"] and not relations.intersection({"implements", "consumes"}):
             raise EngineError(f"task {task['id']} implementation requires an implements or consumes contract ref")
+    # Iterative DFS. The recursive version raised RecursionError -- an
+    # unhandled traceback, not an EngineError -- once a needs chain got deeper
+    # than the interpreter limit, so a large plan failed to validate with a
+    # message about Python internals instead of about the plan.
     seen, active = set(), set()
-    def visit(task_id: str) -> None:
-        if task_id in active:
-            raise EngineError(f"dependency cycle detected at {task_id}")
-        if task_id not in seen:
+    for root_id in tasks:
+        if root_id in seen:
+            continue
+        stack: list[tuple[str, bool]] = [(root_id, False)]
+        while stack:
+            task_id, leaving = stack.pop()
+            if leaving:
+                active.discard(task_id)
+                seen.add(task_id)
+                continue
+            if task_id in active:
+                raise EngineError(f"dependency cycle detected at {task_id}")
+            if task_id in seen:
+                continue
             active.add(task_id)
+            stack.append((task_id, True))
             for dep in tasks[task_id]["needs"]:
-                visit(dep)
-            active.remove(task_id)
-            seen.add(task_id)
-    for task_id in tasks:
-        visit(task_id)
+                stack.append((dep, False))
 
     for task in state["tasks"]:
         if task["task_kind"] != "integration" or not task["contract_refs"]:
@@ -1804,14 +2043,30 @@ def validate(state: dict) -> None:
                     )
 
     # G3 - Review: configurable via rules.yaml `review_required` key
-    # When review_required is true, tasks at "done" must carry review evidence
-    # proving they passed through review-approve. The evidence file is validated
-    # by _parse_evidence_kind() which reads the `kind` field from the JSON payload.
-    # Set `review_required: false` in .ai-config/rules.yaml to skip this check.
+    # When review_required is true, tasks at "done" must have passed through
+    # review-approve. Set `review_required: false` in .ai-config/rules.yaml to
+    # skip this check.
+    #
+    # The recorded transition in state["events"] is the primary proof, not the
+    # evidence file on disk. Evidence paths are stored as given, which for
+    # every engine-written verdict is an absolute path: clone the project,
+    # move the checkout, or run it on another machine and _parse_evidence_kind
+    # silently returns None for all of them. Because validate() runs on EVERY
+    # load, that turned a relocated workspace into a workflow no command could
+    # open at all -- `show`, `status`, even `--help`-adjacent reads -- with no
+    # way back short of hand-editing workflow.json. The event history travels
+    # with the state, so it stays true wherever the project is checked out.
+    # The file check remains as a fallback for states written before events
+    # were complete (and for hand-built fixtures that attach evidence without
+    # an event trail).
     if rules.get("review_required", True):
+        reviewed = {
+            item.get("task") for item in state.get("events", [])
+            if item.get("action") == "review-approve" and item.get("task")
+        }
         for task in state["tasks"]:
             if task["status"] == "done":
-                has_review = any(
+                has_review = task["id"] in reviewed or any(
                     _parse_evidence_kind(p) == "review" for p in (task.get("evidence") or [])
                 )
                 if not has_review:
@@ -2041,12 +2296,22 @@ def _validate_qa_checks(task: dict, payload: dict, source: str) -> None:
 
 
 def event(state: dict, path: Path, action: str, task: dict | None, actor: str, old: str | None, new: str | None, detail: str) -> dict:
+    """Record a lifecycle event on `state` and stage it for the event archive.
+
+    The archive line is deliberately NOT written here. Callers always run
+    event() before save(), and save() can still legitimately refuse the write
+    (a lost optimistic-concurrency race, a busy lock). Appending immediately
+    meant a refused transition was already recorded in the append-only
+    logs/events.jsonl as if it had happened, which no later command can undo:
+    it permanently diverges the archive from state["events"] and raises a
+    standing `event_history_divergence` risk in the project artifacts. The
+    same race also drives _retry_transition, so one contended transition could
+    log several phantom lines. save() flushes the staged lines once the state
+    write has actually committed.
+    """
     item = {"ts": now(), "action": action, "task": task["id"] if task else None, "actor": actor, "from": old, "to": new, "detail": detail}
     state["events"].append(item)
-    event_log = workspace(path) / "logs" / "events.jsonl"
-    event_log.parent.mkdir(parents=True, exist_ok=True)
-    with event_log.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(item) + "\n")
+    _PENDING_EVENT_ARCHIVE.setdefault(str(path.resolve()), []).append(item)
     return item
 
 
@@ -2355,8 +2620,12 @@ def _event_projection(state_file: Path, state: dict | None) -> tuple[dict, dict 
 
 def _evidence_artifact(state_file: Path, state: dict | None) -> dict:
     task_by_id = task_map(state) if state else {}
+    # _resolve_workspace_ref, not Path(...).resolve(): a relative evidence
+    # entry was resolved against the process CWD, so the same workflow
+    # reported different "referenced"/"current" evidence depending on which
+    # directory the command ran from.
     referenced = {
-        str(Path(path).resolve())
+        str(_resolve_workspace_ref(state_file, path))
         for task in task_by_id.values()
         for path in task.get("evidence", [])
         if isinstance(path, str)
@@ -2987,6 +3256,13 @@ def _contract_artifact(state_file: Path, state: dict | None) -> dict:
         task_ref = f"task:{workflow_id}:{task['id']}"
         for ref in task.get("contract_refs", []):
             target = f"contract:{ref['id']}@{ref['version']}"
+            if target not in contract_refs:
+                # A task may legally reference a contract that is not (yet) in
+                # the registry -- validate() permits it and `runnable()` merely
+                # keeps the task from starting. Emitting the edge anyway made
+                # the bundle fail its own endpoint-integrity check; the dangling
+                # reference is reported as a risk by _prune_dangling_task_refs.
+                continue
             edges.append({
                 "from": task_ref, "to": target, "relation": ref["relation"],
                 "observation": _architecture_observation("observed", "source", [display_path(state_file)], confidence=1.0),
@@ -3088,11 +3364,63 @@ def _ownership_artifact(modules: dict, contracts: dict, tasks: dict) -> dict:
     return {"owners": owners, "unowned": sorted(unowned)}
 
 
+def _prune_dangling_task_refs(records: list[dict], context_ids: set, contract_ids: set, *, report: bool) -> list[dict]:
+    """Drop task references naming a context or contract that is not declared, reporting each as a risk.
+
+    `validate()` lets a task name any `context` string and any contract ref --
+    contexts.yaml is optional and G6 module_boundary is off by default -- but
+    the artifact validator demands every ref resolve. So a perfectly legal
+    `add-task T1 --context orders` (with `orders` not in contexts.yaml) made
+    _validate_artifact_payloads raise, and since artifact generation runs after
+    every mutating command, the whole bundle -- visualizer, DAG, board, risks --
+    silently froze at its last good generation behind a one-line stderr
+    warning, for the entire life of that workflow.
+
+    Applied to both the tasks and DAG projections, which build these refs
+    independently. `report` is set for one of them so a risk is not duplicated.
+    """
+    risks: list[dict] = []
+    for task in records:
+        context_ref = task.get("context_ref")
+        if context_ref and context_ref not in context_ids:
+            if report:
+                risks.append({
+                    "id": f"risk:unresolved_context:{task['id']}",
+                    "kind": "task_context_unresolved", "severity": "warning", "status": "open",
+                    "source": "task-projector", "entity_ref": task["id"],
+                    "detail": f"task declares {context_ref} which is not registered in contexts.yaml",
+                    "evidence_refs": [],
+                })
+            task["context_ref"] = None
+            task["unresolved_context"] = context_ref
+        kept = []
+        for ref in task.get("contract_refs", []):
+            if ref.get("contract_ref") in contract_ids:
+                kept.append(ref)
+                continue
+            if report:
+                risks.append({
+                    "id": f"risk:unresolved_contract:{task['id']}:{ref.get('contract_ref')}",
+                    "kind": "task_contract_unresolved", "severity": "warning", "status": "open",
+                    "source": "task-projector", "entity_ref": task["id"],
+                    "detail": f"task declares {ref.get('contract_ref')} which is not in the contract registry",
+                    "evidence_refs": [],
+                })
+            task.setdefault("unresolved_contract_refs", []).append(ref.get("contract_ref"))
+        task["contract_refs"] = kept
+    return risks
+
+
 def _build_artifact_payloads(state_file: Path, state: dict | None, generation_id: str, generated_at: str) -> tuple[dict[str, dict], dict]:
     architecture, modules, dependencies, risks, discovery = _architecture_artifacts(state)
     evidence = _evidence_artifact(state_file, state)
     tasks = _task_artifact(state_file, state, evidence)
     contracts = _contract_artifact(state_file, state)
+    dag = _canonical_dag_artifact(state)
+    declared_contexts = {item.get("id") for item in architecture.get("contexts", [])}
+    declared_contracts = {item.get("id") for item in contracts.get("items", [])}
+    risks.extend(_prune_dangling_task_refs(tasks.get("items", []), declared_contexts, declared_contracts, report=True))
+    _prune_dangling_task_refs(dag.get("tasks", []), declared_contexts, declared_contracts, report=False)
     ownership = _ownership_artifact(modules, contracts, tasks)
     event_data, event_risk = _event_projection(state_file, state)
     if event_risk:
@@ -3118,7 +3446,6 @@ def _build_artifact_payloads(state_file: Path, state: dict | None, generation_id
             "id": "risk:no_verification_command", "kind": "no_verification_command", "severity": "warning", "status": "open",
             "source": "project-analyzer", "entity_ref": "project", "detail": "no project verification command detected", "evidence_refs": [],
         })
-    dag = _canonical_dag_artifact(state)
     payload_data = {
         "project": project,
         "architecture": architecture,
@@ -3597,40 +3924,20 @@ def _publish_artifacts(state_file: Path, payloads: dict[str, dict], manifest: di
     staging = root.parent / f".staging-{manifest['generation_id']}"
     lock = root.parent / ".project.generate.lock"
     root.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = None
+    acquired = False
     for _attempt in range(100):
-        try:
-            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        # Liveness of the recorded owner decides staleness. The previous
+        # 30-second age fallback ran on every Windows host (its pid probe
+        # raised an OSError that fell straight through to it), so a generation
+        # taking longer than that had its lock stolen -- and the thief then
+        # deleted the original's .staging-* directory out from under it.
+        if _acquire_lock_file(lock, {"generation_id": manifest["generation_id"]}, max_age_seconds=600.0):
+            acquired = True
             break
-        except FileExistsError:
-            stale = False
-            try:
-                lock_data = json.loads(lock.read_text(encoding="utf-8"))
-                owner_pid = int(lock_data.get("pid"))
-                try:
-                    os.kill(owner_pid, 0)
-                except ProcessLookupError:
-                    stale = True
-                except PermissionError:
-                    stale = False
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                try:
-                    stale = time.time() - lock.stat().st_mtime > 30
-                except OSError:
-                    stale = True
-            if stale:
-                try:
-                    lock.unlink()
-                except FileNotFoundError:
-                    pass
-                continue
-            time.sleep(0.05)
-    if descriptor is None:
+        time.sleep(0.05)
+    if not acquired:
         raise EngineError(f"artifact generation lock is busy: {display_path(lock)}")
     try:
-        os.write(descriptor, json.dumps({"pid": os.getpid(), "generation_id": manifest["generation_id"]}).encode("utf-8"))
-        os.close(descriptor)
-        descriptor = None
         for abandoned in root.parent.glob(".staging-*"):
             if abandoned != staging and abandoned.is_dir():
                 shutil.rmtree(abandoned)
@@ -3645,8 +3952,6 @@ def _publish_artifacts(state_file: Path, payloads: dict[str, dict], manifest: di
         # final replace and after every payload reports the same generation id.
         os.replace(staging / "manifest.json", root / "manifest.json")
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
         if staging.exists():
             shutil.rmtree(staging)
         try:
@@ -4021,10 +4326,10 @@ def cmd_add_task(args: argparse.Namespace) -> dict:
     state["tasks"].append(task)
     validate(state)
     sync_phases(state)
-    sync_tasks_md(state, path)
     event(state, path, "add-task", task, args.actor, None, "todo", "task added")
     save(state, path, state["revision"])
     _write_contract_payload(contract_payload, task["id"], path)
+    sync_tasks_md(state, path)
     _auto_generate_visualizer_data(path)
     return task
 
@@ -4058,10 +4363,10 @@ def cmd_update_task(args: argparse.Namespace) -> dict:
     task["contract_revision"] = next_revision
     task["contract_hash"] = contract_hash
     sync_phases(state)
-    sync_tasks_md(state, path)
     event(state, path, "update-task", task, args.actor, task["status"], task["status"], " | ".join(detail_parts))
     save(state, path, state["revision"])
     _write_contract_payload(contract_payload, task["id"], path)
+    sync_tasks_md(state, path)
     _auto_generate_visualizer_data(path)
     return task
 
@@ -4165,11 +4470,15 @@ def cmd_transition(args: argparse.Namespace) -> dict:
             task["claim_id"] = None
             task["claim_expires_at"] = None
     sync_phases(state)
-    sync_tasks_md(state, path)
     event(state, path, args.action, task, args.actor, old, target, args.detail or "")
     requested_revision = getattr(args, "expected_revision", None)
     expected = requested_revision if requested_revision is not None else state["revision"]
     save(state, path, expected)
+    # tasks.md is the file prompt-mode runners are told to execute from, so it
+    # must never describe a transition the state write refused. Rendering it
+    # after save() keeps it a projection of committed state rather than of the
+    # in-memory attempt.
+    sync_tasks_md(state, path)
     _auto_generate_visualizer_data(path)
     if args.action == "complete" and _post_completion_enabled():
         # Opt-in only (.ai-config/automation.yaml: post_completion.enabled):
@@ -5286,15 +5595,35 @@ def _resolve_context_package(
             select_context(name, "query token matches context identity")
 
     upstream_contexts: set[str] = set()
+    unresolved_upstreams: set[str] = set()
 
     def add_upstreams(name: str) -> None:
         for dependency in contexts.get(name, {}).get("depends_on") or []:
+            if dependency not in contexts:
+                # A depends_on naming a context that is not registered (renamed,
+                # removed, or mistyped) used to be collected anyway and then
+                # dereferenced as contexts[name] below -- a raw KeyError, not an
+                # EngineError, out of `context resolve` AND out of `route`, so
+                # `dispatch` crashed with a traceback on a config typo. Report it
+                # the way an unresolved contract ref is reported and continue.
+                if dependency not in unresolved_upstreams:
+                    unresolved_upstreams.add(dependency)
+                    selection_trace.append({
+                        "kind": "context-dependency",
+                        "ref": dependency,
+                        "reason": f"declared upstream of '{name}' is not registered in contexts.yaml",
+                    })
+                continue
             if dependency not in upstream_contexts:
                 upstream_contexts.add(dependency)
                 add_upstreams(dependency)
 
     for name in list(selected_contexts):
         add_upstreams(name)
+    # A context can be both directly selected and an upstream of another
+    # selection; keep the two sets disjoint so it is not reported (or counted)
+    # twice.
+    upstream_contexts -= selected_contexts
 
     entries: dict[str, dict] = {}
 
@@ -5435,6 +5764,7 @@ def _resolve_context_package(
             "direct": sorted(selected_contexts),
             "dependencies": sorted(upstream_contexts),
             "excluded": excluded_contexts,
+            "unresolved_dependencies": sorted(unresolved_upstreams),
         },
         "bootstrap": {
             "active": bootstrap_active,
@@ -5811,7 +6141,7 @@ def cmd_drift(args: argparse.Namespace) -> dict:
     base_commit = task.get("base_commit")
     report["base_commit"] = base_commit
     if base_commit:
-        head = _git_head()
+        head = _git_head(refresh=True)
         report["current_head"] = head
         report["commits_since_base"] = bool(head and head != base_commit)
         if head and head != base_commit:
@@ -6188,11 +6518,26 @@ def _load_schema_source(path: Path) -> tuple[dict | None, str]:
         return value, text
     try:
         import yaml  # type: ignore
+    except ImportError:
+        # Dependency-free install: fall through to the text reader, which
+        # reports reduced semantic coverage instead of guessing.
+        return None, text
+    try:
         value = yaml.safe_load(text)
-        if isinstance(value, dict):
-            return value, text
-    except (ImportError, ValueError, TypeError):
-        pass
+    except yaml.YAMLError as exc:
+        # yaml.YAMLError does NOT inherit from ValueError, so the previous
+        # `except (ImportError, ValueError, TypeError)` never caught a parse
+        # error: importing a malformed .yaml crashed with a raw
+        # yaml.parser.ParserError traceback instead of a usable message.
+        # A .yaml/.yml source is expected to parse; .proto and .prisma sources
+        # legitimately fail the YAML scanner and still belong on the text path.
+        if path.suffix.lower() in {".yaml", ".yml"}:
+            raise EngineError(f"invalid YAML schema source: {exc}") from exc
+        return None, text
+    except (ValueError, TypeError):
+        return None, text
+    if isinstance(value, dict):
+        return value, text
     return None, text
 
 
@@ -6596,7 +6941,7 @@ def cmd_contract_import(args: argparse.Namespace) -> dict:
         raise EngineError(f"contract version already exists: {contract_id}@{version_name}")
     _atomic_write_json(destination, normalized)
     contract = existing or {"owner": args.owner, "kind": args.kind or ("event" if fmt == "asyncapi" else "schema" if fmt in {"protobuf","prisma"} else "api"), "represents": args.represents or normalized.get("name") or contract_id, "versions": {}}
-    record = {"path": destination.relative_to(ROOT).as_posix(), "status": "draft", "content_hash": _sha256_required_file(destination), "compatibility": "backward-compatible", "supersedes": None, "generators": [], "generated_output_hashes": {}, "lifecycle_history": [{"ts":now(),"from":None,"to":"draft","actor":args.actor,"detail":f"imported from {fmt}"}], "import": {"format":fmt,"source":str(source),"source_hash":normalized["source_hash"]}}
+    record = {"path": destination.relative_to(ROOT).as_posix(), "status": "draft", "content_hash": _sha256_required_file(destination), "compatibility": "backward-compatible", "supersedes": None, "generators": [], "generated_output_hashes": {}, "lifecycle_history": [{"ts":now(),"from":None,"to":"draft","actor":args.actor,"detail":f"imported from {fmt}"}], "import": {"format":fmt,"source":(source.relative_to(ROOT).as_posix() if source.is_relative_to(ROOT) else str(source)),"source_hash":normalized["source_hash"]}}
     contract["versions"][version_name] = record; registry["contracts"][contract_id] = contract; _write_json_config("contracts.json", registry)
     generated = []
     if args.output:
@@ -6850,6 +7195,24 @@ def _indexed_contract_items(payload: dict, key: str) -> dict[str, dict]:
     }
 
 
+def _enum_narrowed(previous: object, current: object) -> bool:
+    """True when the set of values a consumer may send/receive shrank.
+
+    Absent enum means "unconstrained", so ADDING an enum to a previously
+    unconstrained field narrows it and is breaking -- a caller sending any
+    other value is now rejected. Only the both-lists case used to be checked,
+    so introducing a constraint was reported as fully compatible. Removing an
+    enum widens and stays compatible.
+    """
+    old_values = previous if isinstance(previous, list) else None
+    new_values = current if isinstance(current, list) else None
+    if new_values is None:
+        return False
+    if old_values is None:
+        return True
+    return bool(old_values) and not set(old_values).issubset(set(new_values))
+
+
 def _contract_field_breaks(entity: str, previous: dict, current: dict) -> list[dict]:
     findings: list[dict] = []
     old_fields = _indexed_contract_items({"fields": previous.get("fields") or []}, "fields")
@@ -6864,10 +7227,13 @@ def _contract_field_breaks(entity: str, previous: dict, current: dict) -> list[d
             findings.append({"kind": "field-shape-changed", "severity": "breaking", "entity": location, "detail": "type, format, or reference changed"})
         if not old_field.get("required") and candidate.get("required"):
             findings.append({"kind": "field-now-required", "severity": "breaking", "entity": location, "detail": "optional field became required"})
-        old_enum = old_field.get("enum")
-        new_enum = candidate.get("enum")
-        if isinstance(old_enum, list) and old_enum and isinstance(new_enum, list) and not set(old_enum).issubset(set(new_enum)):
-            findings.append({"kind": "enum-narrowed", "severity": "breaking", "entity": location, "detail": "new enum excludes one or more previous values"})
+        if _enum_narrowed(old_field.get("enum"), candidate.get("enum")):
+            detail = (
+                "field gained an enum, rejecting previously accepted values"
+                if not isinstance(old_field.get("enum"), list)
+                else "new enum excludes one or more previous values"
+            )
+            findings.append({"kind": "enum-narrowed", "severity": "breaking", "entity": location, "detail": detail})
     for name, candidate in sorted(new_fields.items()):
         if name not in old_fields and candidate.get("required"):
             findings.append({"kind": "required-field-added", "severity": "breaking", "entity": f"{entity}.{name}", "detail": "new required field was added"})
@@ -6880,8 +7246,7 @@ def _schema_shape_breaks(previous: object, current: object) -> bool:
     new = current if isinstance(current, dict) else {}
     if tuple(old.get(key) for key in ("ref", "type", "format")) != tuple(new.get(key) for key in ("ref", "type", "format")):
         return True
-    old_enum, new_enum = old.get("enum"), new.get("enum")
-    if isinstance(old_enum, list) and old_enum and isinstance(new_enum, list) and not set(old_enum).issubset(set(new_enum)):
+    if _enum_narrowed(old.get("enum"), new.get("enum")):
         return True
     old_required, new_required = set(old.get("required") or []), set(new.get("required") or [])
     if not new_required.issubset(old_required):
@@ -6897,7 +7262,13 @@ def _schema_shape_breaks(previous: object, current: object) -> bool:
     if old.get("additional_properties") is True and new.get("additional_properties") is False:
         return True
     for key in ("one_of", "any_of", "all_of"):
+        # `key in new and key not in old` matters as much as the reverse: a
+        # composition constraint that did not exist before now rejects shapes
+        # the previous schema accepted, and only the old-side change was
+        # checked.
         if key in old and old.get(key) != new.get(key):
+            return True
+        if key in new and key not in old:
             return True
     return False
 
@@ -7843,10 +8214,30 @@ def _semantic_python_import_target(path: Path, module: str, level: int, root: Pa
     return (target, "configured-root") if target else (None, "external-or-unresolved")
 
 
+def _semantic_source_text(path: Path) -> tuple[str, str]:
+    """Return (normalized text, digest of the file's real bytes).
+
+    The digest must come from the bytes on disk, exactly like _sha256_file and
+    every contract/evidence hash in this engine. Hashing
+    ``path.read_text(...).encode("utf-8")`` instead hashed the text AFTER
+    Python's universal-newline translation, so a CRLF checkout produced a
+    "content_hash" matching no file that exists -- and one that disagreed with
+    _sha256_file for the same path. The TypeScript adapter (which hashes what
+    the compiler read) and this module's own lexical fallback then disagreed
+    with each other too, making semantic-index fingerprints depend on whether
+    the compiler happened to be installed.
+
+    The returned text keeps universal-newline semantics so callers' line and
+    column ranges are unchanged.
+    """
+    raw = path.read_bytes()
+    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    return text, hashlib.sha256(raw).hexdigest()
+
+
 def _semantic_python_file(path: Path, root: Path, lookup: dict[str, str]) -> dict:
     relative = path.relative_to(root).as_posix()
-    text = path.read_text(encoding="utf-8", errors="replace")
-    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    text, content_hash = _semantic_source_text(path)
     result = {"path": relative, "language": "python", "content_hash": content_hash, "symbols": [], "imports": [], "diagnostics": []}
     try:
         tree = ast.parse(text, filename=relative, type_comments=True)
@@ -7892,7 +8283,7 @@ def _semantic_typescript_fallback(root: Path, files: list[Path], lookup: dict[st
         if path.suffix.lower() not in DISCOVERY_TS_EXTENSIONS:
             continue
         relative = path.relative_to(root).as_posix()
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text, content_hash = _semantic_source_text(path)
         imports = []
         for spec in _extract_ts_relative_imports(path):
             try:
@@ -7906,7 +8297,7 @@ def _semantic_typescript_fallback(root: Path, files: list[Path], lookup: dict[st
             # uses it as authoritative AST evidence.
             target = lookup.get(candidate) or candidate
             imports.append({"specifier": spec, "to": target, "kind": "lexical-import", "resolution": "fallback" if target else "unresolved", "names": [], "range": None})
-        payloads.append({"path": relative, "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "parse_status": "unavailable", "symbols": [], "imports": imports, "diagnostics": [diagnostic]})
+        payloads.append({"path": relative, "content_hash": content_hash, "parse_status": "unavailable", "symbols": [], "imports": imports, "diagnostics": [diagnostic]})
     return {"status": "unavailable", "adapter": {"id": "typescript-compiler", "version": 1}, "files": payloads, "diagnostics": [diagnostic]}
 
 
@@ -8500,29 +8891,12 @@ def _acquire_task_lock(lock_path: Path) -> bool:
     triggers for the same task never run their pipelines at the same time.
     Removes a lock whose recorded process no longer exists, then retries the
     acquire. Returns False (without blocking) if the lock is still held.
+
+    A post-completion pipeline dispatches QA and review runners, so it can
+    legitimately hold this lock for a long time; the age fallback is therefore
+    generous and only applies to a lock that records no owner at all.
     """
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        try:
-            owner_pid = int(lock_path.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            return False
-        try:
-            os.kill(owner_pid, 0)
-        except ProcessLookupError:
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
-            return _acquire_task_lock(lock_path)
-        except PermissionError:
-            pass
-        return False
-    with os.fdopen(fd, "w") as handle:
-        handle.write(str(os.getpid()))
-    return True
+    return _acquire_lock_file(lock_path, {"kind": "post-completion"}, max_age_seconds=6 * 3600.0)
 
 
 def _release_task_lock(lock_path: Path) -> None:
@@ -8781,6 +9155,17 @@ def _run_post_completion(task_id: str, state_arg: str | None, agent_id: str | No
         event(state, path, "post-completion-start", task, "system", task["status"], task["status"], "automated post-completion pipeline started")
         save(state, path, state["revision"])
 
+        if task["status"] == "implementation-complete" and not roles["qa"]["enabled"]:
+            # Symmetric with the reviewer branch below. This path previously
+            # loaded `roles` and then never consulted roles.qa.enabled, so an
+            # operator who disabled QA to verify it by hand still had the
+            # automated gate run (and transition) the task anyway -- the one
+            # thing setting it to false is meant to prevent.
+            state = load(path); task = task_map(state).get(task_id)
+            event(state, path, "post-completion-manual-qa", task, "system", task["status"], task["status"], "roles.qa.enabled is false; implementation-complete, waiting for manual 'ai-kit qa run' or 'ai-kit approve --role qa'")
+            save(state, path, state["revision"])
+            return {"task": task_id, "post_completion": "qa-manual", "status": task["status"]}
+
         if task["status"] == "implementation-complete":
             print(f"[post-completion] {task_id}: running authoritative local QA...", file=sys.stderr)
             try:
@@ -8887,7 +9272,7 @@ def cmd_pipeline(args: argparse.Namespace) -> dict:
     task = _resolve_task_definition(args.id, state, state_file)
     roles = _load_automation_roles()
     exec_runner, _exec_entry, exec_model = _resolve_runner(None, None)
-    qa_runner = "ai-kit-local"
+    qa_runner = "ai-kit-local" if roles["qa"]["enabled"] else "manual"
     qa_model = None
     if task.get("governance_baseline") is None and roles["qa"]["enabled"]:
         qa_runner, _qa_entry, qa_model = _resolve_runner(roles["qa"]["runner"], roles["qa"].get("model"))
@@ -9013,6 +9398,30 @@ def cmd_dispatch(args: argparse.Namespace) -> dict:
         task = _resolve_task_definition(task["id"], load(state_file), state_file)
     elif task["status"] != "in-progress":
         raise EngineError(f"cannot dispatch {task['id']} from status {task['status']} (must be todo or in-progress)")
+    else:
+        # Re-dispatching an in-progress task is legitimate resume (pipeline
+        # picks a task back up; dispatch-ready claims first and dispatches
+        # second with the same agent id), but it was accepted from ANY caller:
+        # a second `ai-kit dispatch` on a task another agent was mid-way
+        # through simply reassigned it, and _ensure_task_worktree handed the
+        # newcomer the incumbent's worktree with the agent id overwritten --
+        # two runners writing the same files, detected only when the loser's
+        # `complete` was rejected for a stale claim id. Honour the lease that
+        # already exists: its owner may resume, anyone else must wait for it
+        # to expire and go through `reclaim`.
+        holder = task.get("claimed_by") or ""
+        held_by_agent = holder.partition("#")[2]
+        # A lease-less claim is the pre-v4 manual `transition start` path and
+        # stays dispatchable, as it always was.
+        if task.get("claim_id") and held_by_agent and not _lease_is_expired(task.get("claim_expires_at")):
+            if getattr(args, "agent_id", None) != held_by_agent:
+                raise EngineError(
+                    f"task {task['id']} is already leased to '{holder}' until "
+                    f"{task.get('claim_expires_at')}; pass --agent-id {held_by_agent} to resume that "
+                    f"agent's dispatch, or wait for the lease to expire and run "
+                    f"'ai-kit transition {task['id']} reclaim --actor {task['owner']} --agent-id <new-agent>'"
+                )
+            agent_id = held_by_agent
     state = load(state_file); validate(state)
     live_task = task_map(state)[task["id"]]
     assignment = _ensure_task_worktree(
@@ -9109,17 +9518,47 @@ def cmd_dispatch_ready(args: argparse.Namespace) -> dict:
     if args.epic:
         candidates = [t for t in candidates if t.get("epic") == args.epic]
     configured_capacity = int(runner.get("max_parallel", 1_000_000))
-    free_capacity = max(0, configured_capacity - _runner_active_count(runner_name, state))
-    limit = min(args.limit if args.limit else len(candidates), free_capacity)
+    limit = args.limit if args.limit else len(candidates)
     claimed = []
-    for task in candidates[:limit]:
+    skipped_at_capacity = []
+    state_file = state_path(args.state)
+    for task in candidates:
+        if len(claimed) >= limit:
+            break
+        # Capacity is re-derived from on-disk state on every iteration, not
+        # from the snapshot read at the top. Each claim below (and any claim
+        # made by a concurrent dispatch-ready) changes the active count, so a
+        # budget computed once for the whole batch let two invocations both
+        # see free slots and jointly overshoot max_parallel. This narrows the
+        # window to a single claim; the claim itself is still what decides a
+        # tie, so the counted total can exceed the limit by at most the number
+        # of processes racing on the same slot.
+        live_state = load(state_file)
+        if _runner_active_count(runner_name, live_state) >= max(1, configured_capacity):
+            skipped_at_capacity = [item["id"] for item in candidates[candidates.index(task):]]
+            break
         agent_id = args.agent_id or uuid.uuid4().hex[:8]
         start_args = argparse.Namespace(state=args.state, id=task["id"], action="start", actor=task["owner"], detail=f"auto-claimed by dispatch-ready for runner '{runner_name}'", evidence=None, expected_revision=None, agent_id=agent_id, claim_id=None, by=None)
         try:
             _retry_transition(start_args)
         except EngineError:
             continue  # lost the claim race, or no longer runnable; skip rather than substitute another task
-        claimed.append({"task": task["id"], "agent_id": agent_id})
+        # Reserve the slot in state immediately. _runner_active_count only
+        # sees tasks that carry an assignment naming the runner, and the real
+        # assignment is written by the `dispatch` child process further below
+        # -- so until now a claimed-but-not-yet-dispatched task counted for
+        # nothing. Every claim in this batch (and in any concurrent batch) was
+        # therefore invisible to the capacity check that was supposed to bound
+        # it. The child replaces this stub with the full assignment.
+        claimed_task = _persist_assignment(state_file, task["id"], {
+            "runner": runner_name,
+            "model": selected_model,
+            "agent_id": agent_id,
+            "isolation": "pending-dispatch",
+            "assigned_at": now(),
+            "state_path": str(state_file.resolve()),
+        })
+        claimed.append({"task": claimed_task["id"], "agent_id": agent_id})
     log_dir = workspace(state_path(args.state)) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     spawned = []
@@ -9145,7 +9584,11 @@ def cmd_dispatch_ready(args: argparse.Namespace) -> dict:
         with log_path.open("w", encoding="utf-8") as log_handle:
             proc = _sp.Popen(cmd, cwd=str(ROOT), stdout=log_handle, stderr=_sp.STDOUT, close_fds=True)
         spawned.append({"task": entry["task"], "agent_id": entry["agent_id"], "pid": proc.pid, "log": display_path(log_path)})
-    return {"runner": runner_name, "candidates": len(candidates), "claimed": len(claimed), "spawned": spawned}
+    return {
+        "runner": runner_name, "candidates": len(candidates), "claimed": len(claimed),
+        "capacity": configured_capacity, "deferred_at_capacity": skipped_at_capacity,
+        "spawned": spawned,
+    }
 
 
 def _is_runtime_transient_path(path: str) -> bool:
@@ -9294,16 +9737,28 @@ def cmd_qa_run(args: argparse.Namespace) -> dict:
     _atomic_write_json(evidence_path, evidence)
     evidence_ref = str(evidence_path.resolve())
     _auto_generate_for_args(args)
+    # `passed` is the key main() turns into this command's exit status. QA is
+    # the authoritative gate, so omitting it made `ai-kit qa run` exit 1 even
+    # on a clean pass and every `&&`/`set -e` caller read success as failure.
+    # Only "pass" is a green verdict: "inconclusive" is not a pass (nothing
+    # functional ran), and neither is "fail".
     if status == "inconclusive":
-        return {"task": task["id"], "status": status, "lifecycle": task["status"], "evidence": evidence_ref, "checks": checks}
+        return {"task": task["id"], "status": status, "passed": False, "inconclusive": True, "lifecycle": task["status"], "evidence": evidence_ref, "checks": checks}
     if status == "fail":
         if task["status"] == "implementation-complete":
             cmd_transition(argparse.Namespace(state=args.state, id=task["id"], action="reject", actor="qa-control-plane", detail="authoritative QA failed", evidence=[evidence_ref], expected_revision=None, agent_id=None, claim_id=None, by=None, _control_plane=True))
-        return {"task": task["id"], "status": status, "lifecycle": "todo", "evidence": evidence_ref, "checks": checks}
-    activated = _activate_integration_contracts(task, evidence_ref)
+        return {"task": task["id"], "status": status, "passed": False, "lifecycle": "todo", "evidence": evidence_ref, "checks": checks}
+    # The contract registry is global and shared; the lifecycle transition is
+    # optimistically concurrent and can still refuse (lost revision race,
+    # locked state). Activating first meant a refused qa-pass could leave
+    # contracts marked `active` on the strength of a QA run that never became
+    # the task's verdict, with no rollback. Transition first: the inverse
+    # failure (task qa-passed, activation raised) is visible, and `qa run` is
+    # explicitly re-runnable from qa-passed to finish the job.
     if task["status"] == "implementation-complete":
         cmd_transition(argparse.Namespace(state=args.state, id=task["id"], action="qa-pass", actor="qa-control-plane", detail="deterministic QA passed", evidence=[evidence_ref], expected_revision=None, agent_id=None, claim_id=None, by=None, _control_plane=True))
-    return {"task": task["id"], "status": "pass", "lifecycle": "qa-passed", "evidence": evidence_ref, "activated_contracts": activated, "checks": checks}
+    activated = _activate_integration_contracts(task, evidence_ref)
+    return {"task": task["id"], "status": "pass", "passed": True, "lifecycle": "qa-passed", "evidence": evidence_ref, "activated_contracts": activated, "checks": checks}
 
 
 def cmd_qa_show(args: argparse.Namespace) -> dict:
@@ -9491,9 +9946,21 @@ def cmd_review_apply(args: argparse.Namespace) -> dict:
     if not review_current:
         raise EngineError(review_detail)
     assignment = task.get("assignment") or {}
-    if recommendation.get("agent_id") == assignment.get("agent_id"):
+    # `None == None` counted as "same identity", so a recommendation that
+    # simply omitted agent_id was rejected as self-review against an executor
+    # that had no agent_id either. Absent identities are unknown, not equal:
+    # demand that they be recorded, then compare.
+    reviewer_agent = recommendation.get("agent_id")
+    executor_agent = assignment.get("agent_id")
+    if not reviewer_agent:
+        raise EngineError("review recommendation must record the reviewer's agent_id")
+    if executor_agent and reviewer_agent == executor_agent:
         raise EngineError("reviewer agent_id must differ from executor")
-    if recommendation.get("runner") == assignment.get("runner") and recommendation.get("model") == assignment.get("model"):
+    if (
+        recommendation.get("runner")
+        and recommendation.get("runner") == assignment.get("runner")
+        and recommendation.get("model") == assignment.get("model")
+    ):
         raise EngineError("reviewer runner/model identity must differ from executor")
     qa_current, qa_detail = _qa_evidence_is_current(state_file, task)
     if not qa_current:
@@ -9511,8 +9978,11 @@ def cmd_review_apply(args: argparse.Namespace) -> dict:
         return {"task": task["id"], "decision": "changes-requested", "lifecycle": changed["status"], "recommendation": evidence_ref}
     if recommendation.get("decision") != "approve" or recommendation.get("verdict") != "approve":
         raise EngineError("recommendation decision is invalid")
-    approved_contracts = _approve_defined_contracts(task, evidence_ref)
+    # Approve the contracts only once review-approve has actually committed --
+    # see the matching note in cmd_qa_run. A refused transition must not leave
+    # the shared registry advanced past the task that justified it.
     changed = cmd_transition(argparse.Namespace(state=args.state, id=task["id"], action="review-approve", actor="review-control-plane", detail="independent recommendation applied", evidence=[evidence_ref], expected_revision=None, agent_id=None, claim_id=None, by=None, _control_plane=True))
+    approved_contracts = _approve_defined_contracts(task, evidence_ref)
     return {"task": task["id"], "decision": "approve", "lifecycle": changed["status"], "recommendation": evidence_ref, "approved_contracts": approved_contracts, "qa_evidence": qa_detail}
 
 
@@ -9584,13 +10054,20 @@ def _delivery_check(state_file: Path, task: dict, commit: str) -> dict:
     out_of_scope = [path for path in changed_paths if not _path_in_declared_scope(path, task.get("files") or [])]
     checks.append({"name": "declared-file-scope", "status": "pass" if not out_of_scope else "fail", "detail": ", ".join(out_of_scope)})
     state = load(state_file); validate(state); tasks = task_map(state)
-    unfinished = [dep for dep in task.get("needs", []) if tasks[dep]["status"] != "done"]
+    # DEPENDENCY_SATISFYING_STATUSES, not a bare "done": runnable(), G1 and
+    # sync_phases all treat a superseded or cancelled dependency as satisfied,
+    # so a task with one could be started, QA'd and reviewed and then never
+    # close -- this gate was the only place demanding literal "done", with no
+    # transition able to supply it.
+    unfinished = [dep for dep in task.get("needs", []) if tasks[dep]["status"] not in DEPENDENCY_SATISFYING_STATUSES]
     checks.append({"name": "dependencies-done", "status": "pass" if not unfinished else "fail", "detail": ", ".join(unfinished)})
     qa_current, qa_detail = _qa_evidence_is_current(state_file, task)
     checks.append({"name": "qa-current", "status": "pass" if qa_current else "fail", "detail": qa_detail})
     recommendation = _review_evidence_path(state_file, task["id"])
     review_current, review_detail = _review_recommendation_is_current(state_file, task, recommendation)
-    review_referenced = str(recommendation.resolve()) in [str(Path(item).resolve()) for item in task.get("evidence", [])]
+    review_referenced = str(recommendation.resolve()) in [
+        str(_resolve_workspace_ref(state_file, item)) for item in task.get("evidence", [])
+    ]
     checks.append({"name": "review-current", "status": "pass" if review_current and review_referenced else "fail", "detail": review_detail if review_referenced else "review recommendation is not attached to task lifecycle evidence"})
     design = _design_validation(state_file, task)
     checks.append({"name": "design-current", "status": "pass" if design.get("passed") else "fail"})
@@ -9725,6 +10202,43 @@ def cmd_delivery_close(args: argparse.Namespace) -> dict:
     return {"task": task["id"], "status": result["status"], "delivery": str(evidence_path.resolve()), "cleanup": cleanup}
 
 
+def _verification_commands(manifest: Path) -> dict[str, str]:
+    """Read kit.yaml's `verification:` block into {key: command}.
+
+    Replaces a bare whole-file regex search for "<key>: <value>". That pattern matched the first occurrence anywhere -- inside a
+    comment (``# test_command: pytest -x`` was picked up and executed with
+    shell=True), inside a longer key (``unit_test_command:`` contains
+    ``test_command:``), or inside an unrelated section -- and a commented-out
+    example therefore silently became the project's real verification command.
+    Only top-level ``verification:`` entries count here, and an inline ``#``
+    comment is stripped from the value.
+    """
+    commands: dict[str, str] = {}
+    in_section = False
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not line.startswith((" ", "\t")):
+            in_section = stripped == "verification:"
+            continue
+        if not in_section or not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"^\s+([A-Za-z0-9_]+):\s*(.*)$", line)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2).strip()
+        # Strip a trailing comment only when the value is not quoted; a quoted
+        # command may legitimately contain '#'.
+        if value[:1] not in {'"', "'"}:
+            value = value.split(" #", 1)[0].strip()
+        else:
+            quote = value[0]
+            closing = value.find(quote, 1)
+            value = value[1:closing] if closing > 0 else value[1:]
+        if value:
+            commands[key] = value
+    return commands
+
+
 def cmd_verify(args: argparse.Namespace) -> dict:
     """Run verification checks and produce a report. Does NOT auto-approve."""
     import subprocess as _sp
@@ -9738,11 +10252,10 @@ def cmd_verify(args: argparse.Namespace) -> dict:
     manifest = _config_path("kit.yaml")
     executed_quality_checks = 0
     if manifest.exists():
-        text = manifest.read_text(encoding="utf-8")
+        commands = _verification_commands(manifest)
         for key in ("test_command", "lint_command", "typecheck_command", "build_command"):
-            match = re.search(rf"{key}:\s*(.+)", text)
-            if match:
-                cmd = match.group(1).strip()
+            cmd = commands.get(key)
+            if cmd is not None:
                 if cmd == "true":
                     report["checks"].append({"name": key, "status": "skipped"})
                     continue

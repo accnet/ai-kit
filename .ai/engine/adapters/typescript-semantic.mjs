@@ -53,6 +53,10 @@ const host = ts.createCompilerHost(options, true);
 const program = ts.createProgram({ rootNames: files, options, host });
 const output = { status: 'pass', adapter: { id: 'typescript-compiler', version: 1, parser_version: ts.version, tsconfig: configPath ? path.relative(root, configPath).replaceAll('\\', '/') : null }, files: [], diagnostics: [] };
 
+// content_hash is taken from the file's raw bytes, not from source.text: the
+// compiler's text has had its BOM stripped, and the Python side hashes bytes
+// too. Hashing source.text made the same file hash differently depending on
+// whether this adapter or ai_kit's lexical fallback produced the entry.
 for (const absolute of files.sort()) {
   const source = program.getSourceFile(absolute);
   const relative = path.relative(root, absolute).replaceAll('\\', '/');
@@ -60,7 +64,7 @@ for (const absolute of files.sort()) {
     output.diagnostics.push({ kind: 'parse-error', path: relative, language: 'typescript', detail: 'source file was not included in TypeScript program' });
     continue;
   }
-  const file = { path: relative, content_hash: awaitImportCrypto.createHash('sha256').update(source.text).digest('hex'), parse_status: 'pass', symbols: [], imports: [], diagnostics: [] };
+  const file = { path: relative, content_hash: awaitImportCrypto.createHash('sha256').update(fs.readFileSync(absolute)).digest('hex'), parse_status: 'pass', symbols: [], imports: [], diagnostics: [] };
   const diagnosticSlice = source.parseDiagnostics || [];
   for (const diagnostic of diagnosticSlice) file.diagnostics.push({ kind: 'parse-error', path: relative, language: 'typescript', detail: ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n') });
   if (file.diagnostics.length) file.parse_status = 'fail';

@@ -1,10 +1,10 @@
 """Contract tests between the engine's visualizer payloads and the pages that read them.
 
-`.visualizer/dag.html` is plain JS reading `dag.json` by field name, so a
-rename or drop on the engine side breaks the page silently -- nothing
-errors, the graph just renders blank or without a feature. These tests
-scrape the field names the page actually dereferences and assert the engine
-still emits every one of them, in both the repo copy and the install
+`index.html` is the sole dashboard entry point; `dag.html` only redirects
+legacy bookmarks into its DAG tab. The shared `dag-view.js` still reads the
+payload by field name, so a rename or drop on the engine side breaks the
+graph silently. These tests scrape the renderer's field names and assert the
+engine still emits every one of them, in both the repo copy and the install
 template copy that ships to new projects.
 
 Deliberately dependency-free (no browser, no JS engine) so it runs in the
@@ -87,9 +87,12 @@ class DagPayloadContractTests(unittest.TestCase):
         first, second = (p.read_text(encoding="utf-8") for p in DAG_RENDERERS)
         self.assertEqual(first, second, "shared DAG renderer and install template copy differ")
 
-    def test_page_fetches_dag_json(self) -> None:
+    def test_legacy_dag_entry_redirects_to_the_dashboard_tab(self) -> None:
         page = DAG_PAGES[0].read_text(encoding="utf-8")
-        self.assertIn("fetch('dag.json'", page)
+        self.assertIn("window.location.replace", page)
+        self.assertIn("index.html", page)
+        self.assertIn("view=dag", page)
+        self.assertNotIn("fetch(", page)
 
     def test_every_top_level_field_the_page_reads_is_emitted(self) -> None:
         page = DAG_RENDERERS[0].read_text(encoding="utf-8")
@@ -186,17 +189,25 @@ class VisualizerPayloadKeysTests(unittest.TestCase):
         self.assertIn("loadLegacyArtifacts", app)
         self.assertIn("if (hasLoaded) return false", app)
 
-    def test_dag_is_canonical_first_with_legacy_fallback(self) -> None:
+    def test_legacy_dag_entry_has_no_second_data_loader(self) -> None:
         page = (REPO_ROOT / ".visualizer" / "dag.html").read_text(encoding="utf-8")
-        canonical = page.index("/artifacts/project/manifest.json")
-        legacy = page.index("fetch('dag.json'")
-        self.assertLess(canonical, legacy)
+        self.assertIn("window.location.replace", page)
+        self.assertNotIn("/artifacts/project/manifest.json", page)
+        self.assertNotIn("fetch(", page)
 
     def test_dashboard_mounts_the_shared_dag_renderer_once(self) -> None:
         app = (REPO_ROOT / ".visualizer" / "app.js").read_text(encoding="utf-8")
         self.assertIn("window.AiKitDagView.mount", app)
         self.assertIn("dagData = bundle['dag.json'].data", app)
         self.assertIn("#${params}", app)
+
+    def test_dashboard_bounds_large_graphs_without_mutating_artifacts(self) -> None:
+        app = (REPO_ROOT / ".visualizer" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("ARCHITECTURE_NODE_LIMIT = 180", app)
+        self.assertIn("CONTRACT_NODE_LIMIT = 180", app)
+        self.assertIn("refine filters to see more", app)
+        self.assertIn("boundedArchitectureModel", app)
+        self.assertIn("renderActiveView", app)
 
     def test_architecture_view_exposes_c4_levels_from_canonical_projection(self) -> None:
         app = (REPO_ROOT / ".visualizer" / "app.js").read_text(encoding="utf-8")

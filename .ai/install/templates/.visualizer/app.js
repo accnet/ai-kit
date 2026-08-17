@@ -1,7 +1,9 @@
   (async () => {
 
     // ── LOAD DATA ──────────────────────────────────────────────
-    let board = {todo:[],['in-progress']:[],['implementation-complete']:[],['qa-passed']:[],['review-approved']:[],done:[],blocked:[]};
+    // Must carry every status the engine's STATUSES tuple can produce, or a
+    // render before the first load reads `undefined` for the missing ones.
+    let board = {todo:[],['in-progress']:[],['implementation-complete']:[],['qa-passed']:[],['review-approved']:[],done:[],blocked:[],superseded:[],cancelled:[]};
     let arch = {};
     let impact = {};
     let events = [];
@@ -28,6 +30,10 @@
     let contractEntityFilterVal = 'all';
     let contractRelationFilterVal = 'all';
     let selectedContractEntity = null;
+    const ARCHITECTURE_NODE_LIMIT = 180;
+    const ARCHITECTURE_EDGE_LIMIT = 360;
+    const CONTRACT_NODE_LIMIT = 180;
+    const CONTRACT_EDGE_LIMIT = 360;
 
     const ARTIFACT_FILES = [
       'project.json','architecture.json','modules.json','dependencies.json','contracts.json','tasks.json',
@@ -199,8 +205,11 @@
     const collapsedOwnerGroups = new Set();
     let replayTimestamp = null;
     const replaySeenModules = new Set();
+    let minimapModel = {nodes: [], positions: {}};
+    let architectureRenderQueued = false;
 
     // ── DOM REFS ───────────────────────────────────────────────
+    const center = document.querySelector('.center');
     const sidebarLeft = document.getElementById('sidebarLeft');
     const sidebarRight = document.getElementById('sidebarRight');
     const btnToggleLeft = document.getElementById('btnToggleLeft');
@@ -218,6 +227,7 @@
     const modFilterBar = document.getElementById('modFilterBar');
     const ownerFilterSel = document.getElementById('ownerFilterSel');
     const contextFilterSel = document.getElementById('contextFilterSel');
+    const architectureStatus = document.getElementById('architectureStatus');
     const timelineSlider = document.getElementById('timelineSlider');
     const tcLabel = document.getElementById('tcLabel');
     const btnPlay = document.getElementById('btnPlay');
@@ -267,6 +277,34 @@
 
     const allTasks = () => Object.values(board).flat();
     const allMods = () => Object.keys(arch).filter(passesModuleFilters);
+    function moduleMatchesSearch(name) {
+      const module = arch[name] || {};
+      const haystack = `${name} ${module.path || ''} ${module.owner || ''} ${module.parent || ''}`.toLowerCase();
+      return !searchQ || haystack.includes(searchQ);
+    }
+    function queueArchitectureRender() {
+      if (activeView !== 'architecture' || architectureRenderQueued) return;
+      architectureRenderQueued = true;
+      requestAnimationFrame(() => {
+        architectureRenderQueued = false;
+        if (activeView === 'architecture') renderCanvas();
+      });
+    }
+    function boundedArchitectureModel() {
+      const filtered = allMods().filter(moduleVisibleAtReplay).sort((left, right) => left.localeCompare(right));
+      const searched = searchQ ? filtered.filter(moduleMatchesSearch) : filtered;
+      let nodes = searched.slice(0, ARCHITECTURE_NODE_LIMIT);
+      if (selectedMod && searched.includes(selectedMod) && !nodes.includes(selectedMod)) {
+        nodes = [...nodes.slice(0, Math.max(0, ARCHITECTURE_NODE_LIMIT - 1)), selectedMod].sort((left, right) => left.localeCompare(right));
+      }
+      const visible = new Set(nodes);
+      const allEdges = architectureEdges.filter(edge => visible.has(edge.from) && visible.has(edge.to));
+      const edges = allEdges
+        .slice()
+        .sort((left, right) => `${left.from}\u0000${left.to}\u0000${left.kind || ''}`.localeCompare(`${right.from}\u0000${right.to}\u0000${right.kind || ''}`))
+        .slice(0, ARCHITECTURE_EDGE_LIMIT);
+      return {nodes, edges, filtered: filtered.length, searched: searched.length, allEdges: allEdges.length};
+    }
     function passesModuleFilters(k) {
       const m = arch[k] || {};
       if (sourceFilter !== 'all' && (m.source || 'declared') !== sourceFilter) return false;
@@ -346,8 +384,7 @@
     // ── MINIMAP ───────────────────────────────────────────────
     const MINIMAP_NODE_W = 185, MINIMAP_NODE_H = 90;
     function updateMinimap() {
-      const mods = allMods().filter(moduleVisibleAtReplay);
-      const pos = getPositions();
+      const {nodes: mods, positions: pos} = minimapModel;
       minimapCanvas.querySelectorAll('.minimap-node').forEach(n => n.remove());
       const xs = mods.map(k => pos[k]?.x).filter(Number.isFinite);
       const ys = mods.map(k => pos[k]?.y).filter(Number.isFinite);
@@ -426,10 +463,11 @@
     searchInput.addEventListener('input', e => {
       searchQ = e.target.value.toLowerCase().trim();
       applySearch();
+      queueArchitectureRender();
     });
     window.addEventListener('keydown', e => {
       if ((e.ctrlKey||e.metaKey) && e.key==='k') { e.preventDefault(); searchInput.focus(); }
-      if (e.key==='Escape') { searchInput.value=''; searchQ=''; applySearch(); searchInput.blur(); }
+      if (e.key==='Escape') { searchInput.value=''; searchQ=''; applySearch(); queueArchitectureRender(); searchInput.blur(); }
     });
 
     function applySearch() {
@@ -477,12 +515,13 @@
     }
     function setActiveView(view, updateUrl = true) {
       activeView = view;
+      center.classList.toggle('panel-active', view !== 'architecture');
       document.querySelectorAll('.view-tab').forEach(t=>t.classList.toggle('active', t.dataset.view === view));
       document.querySelectorAll('.view-panel').forEach(p=>p.classList.remove('active'));
       document.getElementById('view'+view.charAt(0).toUpperCase()+view.slice(1))?.classList.add('active');
       canvasWrap.classList.toggle('canvas-hidden', view !== 'architecture');
       document.querySelector('.canvas-bar')?.classList.toggle('canvas-hidden', view !== 'architecture');
-      if (view === 'dag') ensureDagView();
+      if (hasLoaded) renderActiveView();
       if (updateUrl) writeUrlState();
     }
     document.querySelectorAll('.view-tab').forEach(tab => {
@@ -494,7 +533,6 @@
       selectedContractRef = state.contract || 'all';
       selectedContractEntity = state.entity || null;
       if (state.view) setActiveView(state.view, false);
-      if (state.view === 'contracts') renderContracts();
     });
 
     // ── LAYER STATE (shared by canvas chips + sidebar toggles) ─
@@ -556,8 +594,7 @@
     });
 
     // ── NODE POSITIONS ────────────────────────────────────────
-    function getLayeredPositions() {
-      const mods = allMods();
+    function getLayeredPositions(mods = allMods()) {
       const depth = {};
       const visiting = new Set();
       function getDepth(name) {
@@ -579,8 +616,7 @@
       return positions;
     }
 
-    function getRadialPositions() {
-      const mods = allMods();
+    function getRadialPositions(mods = allMods()) {
       const cx = 500, cy = 280, r = 240;
       const pos = {};
       mods.forEach((k, i) => {
@@ -590,8 +626,8 @@
       return pos;
     }
 
-    function getPositions() {
-      return currentLayout === 'ltr' ? getLayeredPositions() : getRadialPositions();
+    function getPositions(mods = allMods()) {
+      return currentLayout === 'ltr' ? getLayeredPositions(mods) : getRadialPositions(mods);
     }
 
     // ── MODULE FILTERS (source / owner / context) ─────────────
@@ -822,11 +858,18 @@
           });
         }
       }
-      const nodes = candidateNodes.filter(node=>visibleIds.has(node.id));
-      const selectedRelations = candidateEdges.filter(edge=>
+      const allVisibleNodes = candidateNodes.filter(node=>visibleIds.has(node.id));
+      let nodes = allVisibleNodes.slice().sort((left,right)=>`${left.type}:${left.label}:${left.id}`.localeCompare(`${right.type}:${right.label}:${right.id}`)).slice(0, CONTRACT_NODE_LIMIT);
+      if (selectedContractEntity && allVisibleNodes.some(node=>node.id===selectedContractEntity) && !nodes.some(node=>node.id===selectedContractEntity)) {
+        nodes = [...nodes.slice(0, Math.max(0, CONTRACT_NODE_LIMIT - 1)), allVisibleNodes.find(node=>node.id===selectedContractEntity)].sort((left,right)=>`${left.type}:${left.label}:${left.id}`.localeCompare(`${right.type}:${right.label}:${right.id}`));
+      }
+      const renderedNodeIds = new Set(nodes.map(node=>node.id));
+      const allSelectedRelations = candidateEdges.filter(edge=>
         visibleIds.has(edge.from) && visibleIds.has(edge.to) &&
         (contractRelationFilterVal==='all' || edge.relation===contractRelationFilterVal || edge.relation==='contains')
       );
+      const selectedRelations = allSelectedRelations.filter(edge=>renderedNodeIds.has(edge.from) && renderedNodeIds.has(edge.to))
+        .sort((left,right)=>`${left.from}:${left.to}:${left.relation}`.localeCompare(`${right.from}:${right.to}:${right.relation}`)).slice(0, CONTRACT_EDGE_LIMIT);
       const nodeById = Object.fromEntries(nodes.map(node=>[node.id,node]));
       if (selectedContractEntity && !nodeById[selectedContractEntity]) selectedContractEntity = null;
 
@@ -881,7 +924,8 @@
         <div class="contract-node"><div class="contract-node-name">${escapeHtml(contract.contract_id)}@${escapeHtml(contract.version)}</div><div class="contract-lifecycle">${lifecycle.map(status=>`<span class="${status===contract.status?'current':''}">${status}</span>`).join('<span>→</span>')}</div></div>
         <div class="contract-relations">${edges.filter(edge=>edge.to===contract.id && edge.relation!=='represents').map(edge=>`<div class="contract-relation"><span>${escapeHtml(edge.from)}</span><span class="contract-relation-arrow">—${escapeHtml(edge.relation)}→</span><span class="contract-relation-label">${escapeHtml(contract.contract_id)}@${escapeHtml(contract.version)}</span></div>`).join('') || '<div class="view-sub" style="margin:0">No task relation.</div>'}</div>
       </div>`).join('');
-      contractGraph.innerHTML = contracts.length ? `<div class="artifact-section-title">Lifecycle and task boundary</div>${lifecycleMarkup}<div class="artifact-section-title" style="margin-top:8px">Canonical impact graph · ${nodes.length} nodes · ${selectedRelations.length} edges</div>${nodes.length ? `<div class="contract-impact-stage-wrap"><div class="contract-impact-stage" style="width:${stageWidth}px;height:${stageHeight}px"><svg class="contract-impact-svg" viewBox="0 0 ${stageWidth} ${stageHeight}"><defs><marker id="contractImpactArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#64748b"/></marker></defs>${edgeMarkup}</svg>${nodeMarkup}</div></div>` : '<div class="view-sub">No impact entities match the active filters.</div>'}` : '<div class="view-sub">No registered contract graph.</div>';
+      const graphLimitNote = nodes.length < allVisibleNodes.length || selectedRelations.length < allSelectedRelations.length ? ' · refine filters to see more' : '';
+      contractGraph.innerHTML = contracts.length ? `<div class="artifact-section-title">Lifecycle and task boundary</div>${lifecycleMarkup}<div class="artifact-section-title" style="margin-top:8px">Canonical impact graph · ${nodes.length}/${allVisibleNodes.length} nodes · ${selectedRelations.length}/${allSelectedRelations.length} edges${graphLimitNote}</div>${nodes.length ? `<div class="contract-impact-stage-wrap"><div class="contract-impact-stage" style="width:${stageWidth}px;height:${stageHeight}px"><svg class="contract-impact-svg" viewBox="0 0 ${stageWidth} ${stageHeight}"><defs><marker id="contractImpactArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#64748b"/></marker></defs>${edgeMarkup}</svg>${nodeMarkup}</div></div>` : '<div class="view-sub">No impact entities match the active filters.</div>'}` : '<div class="view-sub">No registered contract graph.</div>';
 
       contractGraph.querySelectorAll('[data-impact-id]').forEach(element=>element.addEventListener('click',()=>{
         selectedContractEntity = selectedContractEntity===element.dataset.impactId ? null : element.dataset.impactId;
@@ -958,9 +1002,9 @@
                   : i===0 ? 'ev-latest' : '';
         item.className = `ev-item ${cls}`;
         item.innerHTML = `
-          <span class="ev-actor">@${e.actor}</span>
-          <span class="ev-action"> → ${e.action}</span>
-          ${e.task ? `<span class="ev-task"> ${e.task}</span>` : ''}
+          <span class="ev-actor">@${escapeHtml(e.actor)}</span>
+          <span class="ev-action"> → ${escapeHtml(e.action)}</span>
+          ${e.task ? `<span class="ev-task"> ${escapeHtml(e.task)}</span>` : ''}
           <div class="ev-time">${formatTs(e.ts)} · ${timeAgo(e.ts)}</div>
         `;
         eventList.appendChild(item);
@@ -969,12 +1013,22 @@
 
     // ── RENDER EVOLUTION BOARD ────────────────────────────────
     function renderEvolution() {
+      // One column per engine status. review-approved, blocked, superseded and
+      // cancelled were missing entirely, so a task parked awaiting integration
+      // (the normal `delivery-awaiting-integration` state) or a blocked task
+      // simply vanished from the board -- present in the payload, invisible in
+      // the UI. Empty columns still auto-hide below, so the extra ones only
+      // appear when they hold something.
       const cols = [
         { key:'todo', label:'To Do', cls:'col-todo', color:'var(--text-dim)' },
         { key:'in-progress', label:'In Progress', cls:'col-ip', color:'var(--purple)' },
         { key:'implementation-complete', label:'Complete', cls:'col-ic', color:'var(--cyan)' },
         { key:'qa-passed', label:'QA Passed', cls:'col-qa', color:'var(--amber)' },
+        { key:'review-approved', label:'Reviewed', cls:'col-ra', color:'var(--blue)' },
         { key:'done', label:'Done', cls:'col-done', color:'var(--green)' },
+        { key:'blocked', label:'Blocked', cls:'col-blocked', color:'var(--red)' },
+        { key:'superseded', label:'Superseded', cls:'col-closed', color:'var(--text-dim)' },
+        { key:'cancelled', label:'Cancelled', cls:'col-closed', color:'var(--text-dim)' },
       ];
       evoBoard.innerHTML = '';
       cols.forEach(col => {
@@ -989,11 +1043,11 @@
         tasks.forEach(t => {
           const card = document.createElement('div');
           card.className = 'evo-card';
-          const tags = (t.tags||[]).map(tg=>`<span class="tag-chip">${tg}</span>`).join('');
+          const tags = (t.tags||[]).map(tg=>`<span class="tag-chip">${escapeHtml(tg)}</span>`).join('');
           card.innerHTML = `
-            <div class="task-id">${t.id}</div>
-            <div class="task-title">${t.title}</div>
-            <div class="task-owner">@${t.owner_display} · ${t.acceptance_count||0} criteria</div>
+            <div class="task-id">${escapeHtml(t.id)}</div>
+            <div class="task-title">${escapeHtml(t.title)}</div>
+            <div class="task-owner">@${escapeHtml(t.owner_display)} · ${t.acceptance_count||0} criteria</div>
             <div style="margin-top:4px;">${tags}</div>
           `;
           div.appendChild(card);
@@ -1043,10 +1097,10 @@
           <tr style="cursor:pointer;" onclick="replayTo(${i})">
             <td style="font-family:var(--mono); color:var(--text-dim);">${i+1}</td>
             <td style="font-family:var(--mono); font-size:10px;">${formatTs(e.ts)}</td>
-            <td>@${e.actor}</td>
-            <td><span class="badge ${e.action.includes('complete')||e.action==='close'?'bg-green':e.action==='reject'?'bg-amber':'bg-cyan'}">${e.action}</span></td>
-            <td style="font-family:var(--mono); color:var(--cyan);">${e.task||'—'}</td>
-            <td style="color:var(--text-dim); font-size:10px; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${e.detail||''}</td>
+            <td>@${escapeHtml(e.actor)}</td>
+            <td><span class="badge ${e.action.includes('complete')||e.action==='close'?'bg-green':e.action==='reject'?'bg-amber':'bg-cyan'}">${escapeHtml(e.action)}</span></td>
+            <td style="font-family:var(--mono); color:var(--cyan);">${escapeHtml(e.task||'—')}</td>
+            <td style="color:var(--text-dim); font-size:10px; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(e.detail||'')}</td>
           </tr>
         `;
       });
@@ -1065,6 +1119,8 @@
     function renderC4Canvas() {
       const source = c4Level === '1' ? c4Data.systems : c4Level === '2' ? c4Data.containers : c4Data.components;
       if (!source.length) return false;
+      architectureStatus.textContent = `C4 L${c4Level} · ${source.length} elements`;
+      architectureStatus.classList.remove('truncated');
       nodesLayer.innerHTML = ''; archSvg.innerHTML = '';
       const positions = {};
       source.forEach((item, index) => { positions[item.id] = {x:70 + (index % 3) * 250, y:80 + Math.floor(index / 3) * 150}; });
@@ -1085,15 +1141,21 @@
         card.addEventListener('click', () => { selectedC4Id=item.id; renderCanvas(); renderInspector(); });
         nodesLayer.appendChild(card);
       });
-      minimapCanvas.querySelectorAll('.minimap-node').forEach(node=>node.remove());
+      minimapModel = {nodes: [], positions: {}};
       applyZoom();
       return true;
     }
 
     function renderCanvas() {
       if (c4Level !== 'modules' && renderC4Canvas()) return;
-      const pos = getPositions();
-      const mods = allMods().filter(moduleVisibleAtReplay);
+      const model = boundedArchitectureModel();
+      const mods = model.nodes;
+      const pos = getPositions(mods);
+      minimapModel = {nodes: mods, positions: pos};
+      const nodeLimited = model.searched > mods.length;
+      const edgeLimited = model.allEdges > model.edges.length;
+      architectureStatus.textContent = `${mods.length}/${model.searched} modules · ${model.edges.length}/${model.allEdges} edges${nodeLimited || edgeLimited ? ' · refine filters to see more' : ''}`;
+      architectureStatus.classList.toggle('truncated', nodeLimited || edgeLimited);
 
       // Clear
       nodesLayer.innerHTML = '';
@@ -1102,8 +1164,9 @@
 
       // Draw edges (arch dependency)
       if (layers.arch) {
-        architectureEdges.forEach(edge => {
-            if (!mods.includes(edge.from) || !mods.includes(edge.to) || !pos[edge.from] || !pos[edge.to]) return;
+        const edgeFragment = document.createDocumentFragment();
+        model.edges.forEach(edge => {
+          if (!mods.includes(edge.from) || !mods.includes(edge.to) || !pos[edge.from] || !pos[edge.to]) return;
             const x1 = pos[edge.from].x + 93, y1 = pos[edge.from].y + 20;
             const x2 = pos[edge.to].x + 93, y2 = pos[edge.to].y + 80;
             const mx = (x1+x2)/2;
@@ -1112,11 +1175,13 @@
             const classification = edge.observation?.classification || 'observed';
             path.setAttribute('class', `edge-path edge-dep edge-${classification}`);
             path.setAttribute('data-observation', classification);
-            archSvg.appendChild(path);
+          edgeFragment.appendChild(path);
         });
+        archSvg.appendChild(edgeFragment);
       }
 
       // Draw nodes
+      const nodeFragment = document.createDocumentFragment();
       mods.forEach(k => {
         const m = arch[k];
         if (!m || !pos[k]) return;
@@ -1168,8 +1233,9 @@
         `;
 
         card.addEventListener('click', () => selectModule(k));
-        nodesLayer.appendChild(card);
+        nodeFragment.appendChild(card);
       });
+      nodesLayer.appendChild(nodeFragment);
 
       if (isReplayMode()) mods.forEach(k => replaySeenModules.add(k));
       applySearch();
@@ -1303,7 +1369,7 @@
           <div class="ib ib-full">
             <div class="ib-k">Cascade chain</div>
             <div style="margin-top:6px; display:flex; flex-direction:column; gap:4px;">
-              ${allDeps.map(d=>`<div style="font-size:10px; color:var(--text-sub); display:flex; align-items:center; gap:6px;"><span style="color:var(--amber);">↑</span>${d}</div>`).join('')||'<span style="color:var(--text-dim);">No downstream impact</span>'}
+              ${allDeps.map(d=>`<div style="font-size:10px; color:var(--text-sub); display:flex; align-items:center; gap:6px;"><span style="color:var(--amber);">↑</span>${escapeHtml(d)}</div>`).join('')||'<span style="color:var(--text-dim);">No downstream impact</span>'}
             </div>
           </div>
         `;
@@ -1314,9 +1380,9 @@
             <div class="ib-k">Related Tasks (by context, then file path)</div>
             ${relTasks.length ? relTasks.map(t=>`
               <div style="margin-top:8px; background:rgba(255,255,255,.03); border:1px solid var(--border); border-radius:7px; padding:8px;">
-                <div style="font-family:var(--mono); color:var(--cyan); font-size:10px;">${t.id}</div>
-                <div style="font-size:11px; color:var(--text-sub); margin-top:3px;">${t.title}</div>
-                <div style="font-size:10px; color:var(--text-dim); margin-top:3px;">@${t.owner_display} · ${t.acceptance_count||0} criteria</div>
+                <div style="font-family:var(--mono); color:var(--cyan); font-size:10px;">${escapeHtml(t.id)}</div>
+                <div style="font-size:11px; color:var(--text-sub); margin-top:3px;">${escapeHtml(t.title)}</div>
+                <div style="font-size:10px; color:var(--text-dim); margin-top:3px;">@${escapeHtml(t.owner_display)} · ${t.acceptance_count||0} criteria</div>
               </div>
             `).join('') : '<div style="color:var(--text-dim); font-size:11px; margin-top:8px;">No tasks directly reference this module</div>'}
           </div>
@@ -1329,8 +1395,8 @@
             <div class="ib-k">Module Events (from events.json)</div>
             ${relEvs.length ? relEvs.map(e=>`
               <div style="margin-top:6px; border-left:2px solid var(--cyan); padding-left:8px;">
-                <span style="color:var(--text-sub); font-size:11px;">@${e.actor} → <strong>${e.action}</strong></span>
-                ${e.task ? `<span style="font-family:var(--mono); color:var(--cyan); font-size:10px;"> ${e.task}</span>` : ''}
+                <span style="color:var(--text-sub); font-size:11px;">@${escapeHtml(e.actor)} → <strong>${escapeHtml(e.action)}</strong></span>
+                ${e.task ? `<span style="font-family:var(--mono); color:var(--cyan); font-size:10px;"> ${escapeHtml(e.task)}</span>` : ''}
                 <div style="font-size:9px; color:var(--text-dim);">${formatTs(e.ts)}</div>
               </div>
             `).join('') : '<div style="color:var(--text-dim); font-size:11px; margin-top:8px;">No events mention this module directly</div>'}
@@ -1383,24 +1449,30 @@
       timelineSlider.value = String(current);
     }
 
-    // ── FULL RENDER ───────────────────────────────────────────
+    // ── RENDER ONLY THE ACTIVE VIEW ───────────────────────────
+    function renderActiveView() {
+      if (activeView === 'project') renderProject();
+      else if (activeView === 'evolution') renderEvolution();
+      else if (activeView === 'contracts') renderContracts();
+      else if (activeView === 'runtime') renderRuntime();
+      else if (activeView === 'replay') renderReplay();
+      else if (activeView === 'architecture') {
+        renderCanvas();
+        renderInspector();
+      } else if (activeView === 'dag') {
+        ensureDagView();
+        const selected = (dagData.tasks || []).find(task => (task.task_id || String(task.id).split(':').at(-1)) === selectedTaskId);
+        if (selected) renderDagTaskInspector(window.AiKitDagView.normalize(dagData).tasks.find(task => task.id === selectedTaskId) || selected);
+      }
+    }
+
     function renderAll() {
-      renderProject();
-      renderContracts();
       refreshFilterOptions();
       renderModTree();
       renderStats();
       renderAgents();
       renderEvents();
-      renderEvolution();
-      renderRuntime();
-      renderReplay();
-      renderCanvas();
-      if (activeView === 'dag') {
-        ensureDagView();
-        const selected = (dagData.tasks || []).find(task => (task.task_id || String(task.id).split(':').at(-1)) === selectedTaskId);
-        if (selected) renderDagTaskInspector(window.AiKitDagView.normalize(dagData).tasks.find(task => task.id === selectedTaskId) || selected);
-      } else renderInspector();
+      renderActiveView();
       updateTimecode();
     }
 

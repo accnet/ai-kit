@@ -45,7 +45,16 @@ fi
 
 configured_checks=0
 for key in test_command typecheck_command build_command lint_command; do
-  cmd="$(awk -v key="$key" '$1 == key ":" {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}' .ai-config/kit.yaml)"
+  # Scoped to the `verification:` block, exactly like ai_kit.py's
+  # _verification_commands(). A bare first-field match reported a
+  # `test_command:` living in some other section as "configured", while
+  # `ai-kit verify` -- which only reads the verification block -- ignored it
+  # and reported INCONCLUSIVE. Two tools, opposite answers, same file.
+  cmd="$(awk -v key="$key" '
+    /^verification:/ { in_verification=1; next }
+    in_verification && /^[^ 	]/ { in_verification=0 }
+    in_verification && $1 == key ":" { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }
+  ' .ai-config/kit.yaml)"
   # "true" is the kit.yaml sentinel for "no check configured" (ai_kit.py's
   # cmd_verify skips it rather than running it) -- it is not a real command.
   if [[ -n "$cmd" && "$cmd" != "true" ]]; then

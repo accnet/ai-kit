@@ -61,7 +61,34 @@ else
   domains="$stack"
 fi
 
+# registry.yaml's stack_skills maps a skill folder to the stack tags it serves,
+# which is how ai_kit.py's router resolves `project.stack`. Without consulting
+# it, this script could only match a tag against a folder's own directory name
+# or its domain -- so `stack: [nestjs]` found nothing at all (the folders are
+# `nestjs-core`/`nestjs-data-access`), and the same held for compose, vite and
+# vitest. `ai-kit route` returned those skills while this script returned none,
+# for the same project.stack.
+registry_matches=""
+if [[ -n "$stack" && -f "$CONFIG_ROOT/registry.yaml" ]]; then
+  registry_matches="$(awk -v want="$stack" '
+    /^stack_skills:/ { in_section=1; next }
+    in_section && /^[^ 	]/ { in_section=0 }
+    in_section && match($0, /^  [^:]+:[[:space:]]*\{path:[[:space:]]*[^,}]+,[[:space:]]*stack:[[:space:]]*\[[^]]*\]/) {
+      line = $0
+      path = line; sub(/^[^{]*\{path:[[:space:]]*/, "", path); sub(/[[:space:]]*,.*$/, "", path)
+      tags = line; sub(/^.*stack:[[:space:]]*\[/, "", tags); sub(/\].*$/, "", tags)
+      gsub(/,/, " ", tags)
+      n = split(tags, tag, /[[:space:]]+/)
+      m = split(want, wanted, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) for (j = 1; j <= m; j++)
+        if (tag[i] != "" && tag[i] == wanted[j]) { print path; next }
+    }
+  ' "$CONFIG_ROOT/registry.yaml" 2>/dev/null || true)"
+fi
+
 # Emit skill folder paths, de-duplicated.
+{ [[ -n "$registry_matches" ]] && printf '%s
+' "$registry_matches"
 for domain_or_tech in $domains; do
   if [[ "$domain_or_tech" == "any" ]]; then
     find .ai/skills -mindepth 2 -maxdepth 2 -type d ! -path '.ai/skills/core/*' | sort
@@ -73,7 +100,8 @@ for domain_or_tech in $domains; do
     find .ai/skills -mindepth 2 -maxdepth 2 -type d \
       -name "$domain_or_tech" ! -path '.ai/skills/core/*' | sort
   fi
-done | awk '!seen[$0]++' | while IFS= read -r folder; do
+done
+} | awk 'NF && !seen[$0]++' | while IFS= read -r folder; do
   entrypoint="$folder/overview.md"
   if [[ -f "$folder/skill.meta.yaml" ]]; then
     configured_entrypoint="$(awk -F': ' '/^entrypoint:/ {print $2}' "$folder/skill.meta.yaml" | head -n1)"
@@ -81,7 +109,10 @@ done | awk '!seen[$0]++' | while IFS= read -r folder; do
       entrypoint="$configured_entrypoint"
     fi
   fi
-  if [[ -n "${stack:-}" ]]; then
+  # A folder selected via stack_skills is already known to serve one of the
+  # requested tags; only folders found by directory-name matching still need
+  # the name/domain check.
+  if [[ -n "${stack:-}" ]] && ! grep -qxF "$folder" <<< "$registry_matches"; then
     name="$(basename "$folder")"
     domain="$(basename "$(dirname "$folder")")"
     if ! grep -Eiq "(^|[[:space:]])$name([[:space:]]|$)|(^|[[:space:]])$domain([[:space:]]|$)" <<< "$stack"; then

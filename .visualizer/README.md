@@ -12,7 +12,9 @@ python3 .ai/engine/ai_kit.py artifact validate
 python3 .ai/engine/ai_kit.py visualizer serve --host 127.0.0.1 --port 8080
 ```
 
-Mở `http://127.0.0.1:8080/index.html`. `visualizer serve` chọn đúng workspace
+Mở `http://127.0.0.1:8080/index.html`. Đây là entry point duy nhất.
+`dag.html` được giữ để tương thích bookmark cũ và lập tức chuyển vào
+`index.html#view=dag` (kể cả deep-link task). `visualizer serve` chọn đúng workspace
 của `--state`, phục vụ static assets và endpoint chỉ đọc
 `/artifacts/project/*`. `visualizer generate` vẫn tồn tại như alias deprecated
 và chỉ delegate sang `artifact generate`.
@@ -42,9 +44,14 @@ Các tab có ý nghĩa:
 
 `dag-view.js` là renderer DAG dùng chung. Dashboard chuyển `dag.json` đã tải
 từ canonical bundle vào renderer, nên chuyển tab hay refresh không tạo thêm
-một loader độc lập. `dag.html` chỉ là compatibility shell (canonical-first,
-legacy fallback) và cũng gọi cùng renderer. Deep-link dùng
+một loader độc lập. Deep-link dùng
 `#view=dag&task=T1`; selection của DAG đồng bộ với inspector của dashboard.
+
+Để giữ tương tác nhanh cho project lớn, đồ thị Architecture và Contract có
+giới hạn presentation deterministic là 180 node và 360 edge sau khi áp dụng
+filter. UI luôn hiển thị `shown/eligible`; khi bị giới hạn, người dùng lọc theo
+context, owner, source, contract hoặc entity để xem phần còn lại. Đây chỉ là
+presentation bound — không thay đổi artifact, lifecycle hay impact authority.
 
 Observation luôn có label và line style riêng: `observed` nét liền,
 `inferred` nét đứt, `proposed` nét chấm. Proposed edge chỉ hiển thị; nó không

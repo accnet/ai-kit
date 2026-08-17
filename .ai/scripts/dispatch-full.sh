@@ -1,5 +1,21 @@
 #!/usr/bin/env bash
-# AI-Kit Full Dispatch: dispatch → verify → approve → close
+# AI-Kit Full Dispatch: take one task from its current status all the way to `done`.
+#
+# Two lifecycles exist and they need different commands:
+#
+#   governed (schema v5, every task created by `add-task`/`plan`): QA, review
+#     and close are control-plane-only. `approve` and `transition close` are
+#     refused for these tasks ("qa-pass is control-plane-only for governed
+#     assigned tasks"), which used to make this script fail at its QA step for
+#     every task it had just dispatched. The supported chain is
+#     `dispatch` -> `pipeline`, where pipeline runs authoritative QA, dispatches
+#     an independent reviewer, and closes delivery.
+#
+#   legacy (pre-v5 tasks with no governance baseline): the original
+#     verify -> approve -> approve -> close flow still applies.
+#
+# REASON is only used on the legacy path; on the governed path QA and review
+# verdicts come from the configured runners, never from a canned string here.
 set -euo pipefail
 
 TASK_ID="${1:?Usage: $0 TASK_ID RUNNER [REASON]}"
@@ -8,9 +24,30 @@ REASON="${3:-Auto-approved after successful verification}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AI_KIT="$SCRIPT_DIR/ai-kit"
+source "$SCRIPT_DIR/python-command.sh"
+PYTHON_CMD="$(ai_kit_python_command)" || { echo "AI-Kit: Python runtime not found" >&2; exit 127; }
 
-echo "🚀 Dispatching $TASK_ID to $RUNNER..."
+MODE="$("$AI_KIT" show "$TASK_ID" | "$PYTHON_CMD" -c '
+import json, sys
+task = json.load(sys.stdin).get("task", {})
+print("legacy" if task.get("governance_baseline") is None else "governed")
+')"
+
+echo "🚀 Dispatching $TASK_ID to $RUNNER ($MODE lifecycle)..."
 "$AI_KIT" dispatch "$TASK_ID" --runner "$RUNNER"
+
+if [[ "$MODE" == "governed" ]]; then
+    echo ""
+    echo "🔁 Running control-plane pipeline (authoritative QA → independent review → delivery close)..."
+    # pipeline resumes from whatever status the executor left behind, so the
+    # dispatch above is not repeated. It refuses to let QA or review run under
+    # the executor's own runner/model, and never fabricates a verdict.
+    "$AI_KIT" pipeline "$TASK_ID"
+    echo ""
+    echo "🎉 Task $TASK_ID complete!"
+    "$AI_KIT" status
+    exit 0
+fi
 
 echo ""
 echo "✅ Dispatch complete. Waiting 2s before verification..."

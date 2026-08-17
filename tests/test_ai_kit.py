@@ -1911,7 +1911,14 @@ class LocalScriptContractTests(unittest.TestCase):
                 env=env,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(Path(result.stdout.strip()), binary_dir / "python")
+            # Compare on name + containing directory, not the whole path: the
+            # selector runs inside bash, which on Windows reports a POSIX view
+            # of the path (Git Bash maps %LOCALAPPDATA%\Temp to /tmp), so a
+            # literal comparison against the Windows tempdir failed even when
+            # the script picked exactly the right shim.
+            selected = Path(result.stdout.strip())
+            self.assertEqual(selected.name, "python")
+            self.assertEqual(selected.parent.name, binary_dir.name)
 
     def test_doctor_avoids_windows_python3_shim_and_honors_ai_kit_python(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
