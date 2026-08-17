@@ -141,7 +141,7 @@ the engine actually writes.
 | Project Analyzer | Detects stack, tooling, and container/database runtime from the repo | `ai-kit onboard [--apply]` |
 | Project Analyzer / Knowledge Graph Builder | Combines onboard's detection with contexts.yaml's module + ownership graph and static-analysis risk signals (unowned context, dangling dependency, no verification command); reuses a valid versioned project-context snapshot | `ai-kit analyze [--refresh]` -> `.ai-work/analysis/project-summary.json` |
 | Truth Registry | Resolves an architecture, module, contract, decision, migration, source, or test topic to its canonical project authority without copying that authority | `ai-kit truth resolve <topic>` |
-| Context Resolver | Selects deterministic L0-L3 minimum-sufficient references, upstream contexts, contract sources, governance inputs, reasons, and token estimates for free text or a task | `ai-kit context resolve <request> [--task T<n>]` |
+| Context Resolver | Selects deterministic L0-L3 minimum-sufficient references, symbol ranges/provenance, upstream contexts, a bounded canonical contract impact slice/generated outputs, governance inputs, reasons, and token estimates for free text or a task | `ai-kit context resolve <request> [--task T<n>]` |
 | Impact Analyzer | Direct/transitive dependents and affected tasks for a module | `ai-kit context impact <name>` |
 | Task DAG Builder | Task graph with waves, ready set, and critical path | `ai-kit artifact generate` -> `.ai-work/artifacts/project/dag.json`, rendered at `.visualizer/dag.html` |
 | Execution Contract Builder | Self-contained JSON handoff for a dispatched task (owner, acceptance, routing, instructions) | written by `ai-kit dispatch` / `dispatch-ready` / `pipeline` to `.ai-work/handoffs/<task-id>.json` |
@@ -151,9 +151,10 @@ the engine actually writes.
 | Architecture Model Validator | Validates Truth Registry authorities, C4 references, context mappings, and per-entity multidimensional profiles without changing lifecycle state | `ai-kit architecture validate` |
 | Architecture Discovery | Read-only scan of the source tree for feature modules (NestJS/React/Python/generic) and internal import-based dependency edges, never mutating or publishing project state | `ai-kit architecture discover` |
 | Architecture Fitness | Configured dependency rules and executable fitness commands, also enforced by verify/QA | `ai-kit architecture fitness` |
-| Schema Contract Importer | Normalizes OpenAPI, AsyncAPI, Protobuf, or Prisma into a draft Contract Spine version | `ai-kit contract import` |
+| Schema Contract Importer | Normalizes OpenAPI operations (request, response/status, auth, error) and AsyncAPI events/payloads, plus Protobuf or Prisma, into a draft Contract Spine version | `ai-kit contract import` |
 | Contract DTO/Mock Generator | Generates typed interfaces and contract mocks with output hashes recorded for convergence checks | `ai-kit contract codegen` |
-| Contract Compatibility Checker | Compares two normalized imported contract versions for supported breaking changes; manual formats remain explicitly inconclusive | `ai-kit contract diff/check <id> <from> <to>` |
+| Contract Compatibility Checker | Compares schema, operation, auth/error, and event-payload semantics when coverage is complete; manual/legacy/fallback formats remain explicitly inconclusive | `ai-kit contract diff/check <id> <from> <to>` |
+| Contract Impact Graph | Projects contract, operation, event/message, schema, field, generated output, domain, and task relations from one canonical builder | `ai-kit contract impact <id> <version>` and `.ai-work/artifacts/project/contracts.json` |
 | Project Scaffold | Installs opt-in documentation-only or Store pilot starters without changing workflow lifecycle state | `ai-kit scaffold minimal|store-pilot` |
 | Artifact Validator | Integrity, schema, cross-reference, freshness, and observation checks without lifecycle authority | `ai-kit artifact validate` |
 
@@ -492,7 +493,12 @@ only to the appropriate committed v2 documentation, never by treating
 Use `context resolve` (or the `context_package` returned by `route`) before
 implementation. L0 locates authorities and task metadata, L1 contains direct
 scope, L2 adds upstream contexts/contracts/tests, and L3 adds policy, fitness,
-and durable decisions. Optimize for minimum sufficient context: correctness
+and durable decisions. Context package v3 also carries a bounded contract
+operation/schema/field/generated-output impact slice selected directly from
+the registry and normalized contract source; it is context metadata, never
+lifecycle or QA authority. At L1+ it carries a bounded `symbol_context` from
+AST/Compiler metadata (range, content hash, adapter and selection reason),
+never source bodies or a call graph claim. Optimize for minimum sufficient context: correctness
 and completeness take precedence over reference count or estimated tokens.
 
 **Bootstrap Exception.** When no bounded context is registered, the resolver

@@ -18,9 +18,11 @@ what the CI job does, so a broken install can't silently skip the suite.
 from __future__ import annotations
 
 import contextlib
+import argparse
 import http.server
 import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -103,10 +105,29 @@ class DagBrowserTests(unittest.TestCase):
         ai_kit.VISUALIZER_DIR = cls.serve_dir
         ai_kit.AUTO_ARTIFACT_GENERATION = False
         try:
+            contract_source = root / "store-api.json"
+            contract_source.write_text(json.dumps({
+                "openapi": "3.1.0", "info": {"title": "Store API", "version": "1.0.0"},
+                "paths": {"/stores": {"post": {
+                    "operationId": "createStore",
+                    "requestBody": {"required": True, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateStore"}}}},
+                    "responses": {"201": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/Store"}}}}},
+                }}},
+                "components": {"schemas": {
+                    "CreateStore": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}},
+                    "Store": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}},
+                }},
+            }), encoding="utf-8")
+            ai_kit.cmd_contract_import(argparse.Namespace(
+                source=str(contract_source), format="openapi", id="store-api", version="1.0.0",
+                owner="backend", kind="api", represents="store", output=str(root / "generated"),
+                language="typescript", no_mocks=False, force=False, actor="architect", state=None,
+            ))
             state_file = root / "work" / "state" / "workflow.json"
             cls._build_workflow(str(state_file))
             cls._spread_event_timestamps(state_file)
             ai_kit._generate_visualizer_data(str(state_file))
+            shutil.copytree(ai_kit._artifact_root(state_file), cls.serve_dir / "artifacts" / "project")
         finally:
             for name, value in saved.items():
                 setattr(ai_kit, name, value)
@@ -134,6 +155,8 @@ class DagBrowserTests(unittest.TestCase):
         except Exception as exc:  # pragma: no cover - environment dependent
             cls._pw.stop()
             cls.httpd.shutdown()
+            cls.httpd.server_close()
+            cls.thread.join(timeout=2)
             cls._tmp.cleanup()
             message = f"cannot launch chromium: {exc}"
             if REQUIRED:
@@ -202,6 +225,10 @@ class DagBrowserTests(unittest.TestCase):
             cls._pw.stop()
         with contextlib.suppress(Exception):
             cls.httpd.shutdown()
+        with contextlib.suppress(Exception):
+            cls.httpd.server_close()
+        with contextlib.suppress(Exception):
+            cls.thread.join(timeout=2)
         with contextlib.suppress(Exception):
             cls._tmp.cleanup()
 
@@ -301,6 +328,22 @@ class DagBrowserTests(unittest.TestCase):
             page.wait_for_timeout(100)
             self.assertIn("task=T2", page.url)
             self.assertIn("T2", page.locator("#selCard").inner_text())
+            self.assertEqual([e for e in errors if is_real_error(e)], [])
+
+    def test_contract_impact_graph_filters_inspects_and_deep_links(self) -> None:
+        with self.page_at("index.html#view=contracts") as (page, errors):
+            self.assertGreater(page.locator('.contract-impact-node[data-type="operation"]').count(), 0)
+            self.assertGreater(page.locator('.contract-impact-node[data-type="schema"]').count(), 0)
+            self.assertGreater(page.locator('.contract-impact-node[data-type="field"]').count(), 0)
+            self.assertGreater(page.locator('.contract-impact-node[data-type="generated-output"]').count(), 0)
+            page.click('.contract-impact-node[data-type="operation"]')
+            page.wait_for_timeout(100)
+            self.assertIn("operation", page.locator("#contractImpactInspector").inner_text().lower())
+            self.assertIn("entity=", page.url)
+            page.select_option("#contractEntityFilter", "field")
+            page.wait_for_timeout(100)
+            self.assertGreater(page.locator('.contract-impact-node[data-type="field"]').count(), 0)
+            self.assertEqual(page.locator('.contract-impact-node[data-type="generated-output"]').count(), 0)
             self.assertEqual([e for e in errors if is_real_error(e)], [])
 
 

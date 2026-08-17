@@ -24,6 +24,10 @@
     let sourceFilter = 'all'; // 'all' | 'declared' | 'discovered'
     let ownerFilterVal = 'all';
     let contextFilterVal = 'all';
+    let selectedContractRef = 'all';
+    let contractEntityFilterVal = 'all';
+    let contractRelationFilterVal = 'all';
+    let selectedContractEntity = null;
 
     const ARTIFACT_FILES = [
       'project.json','architecture.json','modules.json','dependencies.json','contracts.json','tasks.json',
@@ -234,6 +238,10 @@
     const projectRisks = document.getElementById('projectRisks');
     const contractSummary = document.getElementById('contractSummary');
     const contractGraph = document.getElementById('contractGraph');
+    const contractImpactInspector = document.getElementById('contractImpactInspector');
+    const contractFilter = document.getElementById('contractFilter');
+    const contractEntityFilter = document.getElementById('contractEntityFilter');
+    const contractRelationFilter = document.getElementById('contractRelationFilter');
     const contractBody = document.getElementById('contractBody');
     const dagMount = document.getElementById('dagMount');
 
@@ -432,18 +440,24 @@
         if (mk.includes(searchQ)||name.includes(searchQ)) { card.classList.add('match'); card.classList.remove('dimmed'); }
         else { card.classList.add('dimmed'); card.classList.remove('match'); }
       });
+      document.querySelectorAll('.contract-impact-node').forEach(node => {
+        const value = (node.dataset.search || '').toLowerCase();
+        node.classList.toggle('search-dimmed', Boolean(searchQ) && !value.includes(searchQ));
+      });
       applyModTreeSearch();
     }
 
     // ── VIEW TABS ─────────────────────────────────────────────
     function urlState() {
       const params = new URLSearchParams(location.hash.replace(/^#/, ''));
-      return {view: params.get('view'), task: params.get('task')};
+      return {view: params.get('view'), task: params.get('task'), contract: params.get('contract'), entity: params.get('entity')};
     }
     function writeUrlState() {
       const params = new URLSearchParams();
       params.set('view', activeView);
       if (selectedTaskId) params.set('task', selectedTaskId);
+      if (selectedContractRef !== 'all') params.set('contract', selectedContractRef);
+      if (selectedContractEntity) params.set('entity', selectedContractEntity);
       history.replaceState(null, '', `#${params}`);
     }
     function renderDagTaskInspector(task) {
@@ -474,7 +488,14 @@
     document.querySelectorAll('.view-tab').forEach(tab => {
       tab.addEventListener('click', () => setActiveView(tab.dataset.view));
     });
-    window.addEventListener('hashchange', () => { const state=urlState(); if (state.task) selectedTaskId=state.task; if (state.view) setActiveView(state.view, false); });
+    window.addEventListener('hashchange', () => {
+      const state=urlState();
+      if (state.task) selectedTaskId=state.task;
+      selectedContractRef = state.contract || 'all';
+      selectedContractEntity = state.entity || null;
+      if (state.view) setActiveView(state.view, false);
+      if (state.view === 'contracts') renderContracts();
+    });
 
     // ── LAYER STATE (shared by canvas chips + sidebar toggles) ─
     const chipLayerMap = { deps: 'arch', heatmap: 'rev', labels: 'labels' };
@@ -719,46 +740,175 @@
       `).join('') : '<div class="view-sub">No open projected risks.</div>';
     }
 
+    function renderContractImpactInspector(nodes, edges) {
+      const node = nodes.find(item=>item.id===selectedContractEntity);
+      if (!node) {
+        contractImpactInspector.innerHTML = '<div class="view-sub" style="margin:0">Select an impact node to inspect canonical attributes and relations.</div>';
+        return;
+      }
+      const facts = Object.entries(node).filter(([key])=>!['id','type','label'].includes(key)).map(([key,value])=>`
+        <div class="project-fact"><div class="project-fact-label">${escapeHtml(key.replaceAll('_',' '))}</div><div class="project-fact-value">${escapeHtml(typeof value==='object' ? JSON.stringify(value) : value)}</div></div>
+      `).join('');
+      const related = edges.filter(edge=>edge.from===node.id || edge.to===node.id);
+      contractImpactInspector.innerHTML = `
+        <div class="artifact-section-title">${escapeHtml(node.type)} · ${escapeHtml(node.label)}</div>
+        <div class="contract-impact-inspector-grid">
+          <div class="project-fact"><div class="project-fact-label">Stable ID</div><div class="project-fact-value">${escapeHtml(node.id)}</div></div>
+          ${facts}
+        </div>
+        <div class="contract-impact-inspector-rel">
+          <strong>Relations (${related.length})</strong>
+          ${related.map(edge=>`<div>${escapeHtml(edge.from)} —${escapeHtml(edge.relation)}→ ${escapeHtml(edge.to)}</div>`).join('') || '<div>None</div>'}
+        </div>`;
+    }
+
     function renderContracts() {
       const contracts = contractsData.items || [];
       const edges = contractsData.edges || [];
+      const impactGraph = contractsData.impact_graph || {nodes:[],edges:[],summary:{}};
+      const impactNodes = impactGraph.nodes || [];
+      const impactEdges = impactGraph.edges || [];
       const statusCounts = contracts.reduce((acc,item)=>{ acc[item.status]=(acc[item.status]||0)+1; return acc; },{});
+      const byType = impactGraph.summary?.by_type || {};
       contractSummary.innerHTML = [
         projectFact('Versions', contracts.length),
         projectFact('Active', statusCounts.active || 0),
-        projectFact('Approved', statusCounts.approved || 0),
-        projectFact('Relations', edges.length),
+        projectFact('Operations / events', `${byType.operation||0} / ${byType.event||0}`),
+        projectFact('Schemas / fields', `${byType.schema||0} / ${byType.field||0}`),
+        projectFact('Generated outputs', byType['generated-output'] || 0),
+        projectFact('Impact edges', impactEdges.length),
       ].join('');
-      const taskLabels = Object.fromEntries(taskItemsData.map(task=>[task.id, `${task.task_id} · ${task.owner}`]));
-      const lifecycle = ['draft','proposed','approved','active','deprecated','removed'];
-      contractGraph.innerHTML = contracts.map(contract=>{
-        const incoming = edges.filter(edge=>edge.to===contract.id && edge.relation!=='represents');
-        const relations = incoming.length ? incoming.map(edge=>`
-          <div class="contract-relation">
-            <span>${escapeHtml(taskLabels[edge.from] || edge.from)}</span>
-            <span class="contract-relation-arrow">—${escapeHtml(edge.relation)}→</span>
-            <span class="contract-relation-label">${escapeHtml(contract.contract_id)}@${escapeHtml(contract.version)}</span>
-          </div>`).join('') : '<div class="view-sub" style="margin:0">No producer/consumer/verifier task relation.</div>';
-        return `<div class="contract-graph-row">
-          <div class="contract-domain">represents → ${escapeHtml(contract.represents || 'unassigned domain')}</div>
-          <div class="contract-node">
-            <div class="contract-node-name">${escapeHtml(contract.contract_id)}@${escapeHtml(contract.version)}</div>
-            <div class="contract-lifecycle">${lifecycle.map(status=>`<span class="${status===contract.status?'current':''}">${status}</span>`).join('<span>→</span>')}</div>
-          </div>
-          <div class="contract-relations">${relations}</div>
-        </div>`;
+
+      function fillSelect(select, entries, allLabel, current) {
+        select.innerHTML = `<option value="all">${escapeHtml(allLabel)}</option>` + entries.map(([value,label])=>`<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`).join('');
+        select.value = entries.some(([value])=>value===current) ? current : 'all';
+        return select.value;
+      }
+      selectedContractRef = fillSelect(contractFilter, contracts.map(item=>[item.id, `${item.contract_id}@${item.version}`]), 'All contracts', selectedContractRef);
+      const entityTypes = Array.from(new Set(impactNodes.map(node=>node.type))).sort();
+      contractEntityFilterVal = fillSelect(contractEntityFilter, entityTypes.map(type=>[type,type]), 'All entities', contractEntityFilterVal);
+      const relationTypes = Array.from(new Set(impactEdges.map(edge=>edge.relation))).sort();
+      contractRelationFilterVal = fillSelect(contractRelationFilter, relationTypes.map(type=>[type,type]), 'All relations', contractRelationFilterVal);
+
+      let baseIds = new Set(impactNodes.map(node=>node.id));
+      if (selectedContractRef !== 'all') {
+        baseIds = new Set(impactNodes.filter(node=>node.id===selectedContractRef || node.id.startsWith(selectedContractRef+'#')).map(node=>node.id));
+        impactEdges.forEach(edge=>{
+          if (edge.from===selectedContractRef) baseIds.add(edge.to);
+          if (edge.to===selectedContractRef) baseIds.add(edge.from);
+        });
+      }
+      const candidateNodes = impactNodes.filter(node=>baseIds.has(node.id));
+      const candidateEdges = impactEdges.filter(edge=>baseIds.has(edge.from) && baseIds.has(edge.to));
+      let visibleIds = new Set(candidateNodes.map(node=>node.id));
+      if (contractEntityFilterVal !== 'all' || contractRelationFilterVal !== 'all') {
+        const entitySeeds = new Set(candidateNodes.filter(node=>contractEntityFilterVal==='all' || node.type===contractEntityFilterVal).map(node=>node.id));
+        const relationEdges = candidateEdges.filter(edge=>contractRelationFilterVal==='all' || edge.relation===contractRelationFilterVal);
+        if (contractRelationFilterVal === 'all') visibleIds = entitySeeds;
+        else if (contractEntityFilterVal === 'all') visibleIds = new Set(relationEdges.flatMap(edge=>[edge.from,edge.to]));
+        else {
+          visibleIds = new Set();
+          relationEdges.forEach(edge=>{
+            if (entitySeeds.has(edge.from) || entitySeeds.has(edge.to)) {
+              visibleIds.add(edge.from); visibleIds.add(edge.to);
+            }
+          });
+        }
+        let changed = true;
+        while (changed) {
+          changed = false;
+          candidateEdges.forEach(edge=>{
+            if (visibleIds.has(edge.to) && !visibleIds.has(edge.from)) { visibleIds.add(edge.from); changed = true; }
+          });
+        }
+      }
+      const nodes = candidateNodes.filter(node=>visibleIds.has(node.id));
+      const selectedRelations = candidateEdges.filter(edge=>
+        visibleIds.has(edge.from) && visibleIds.has(edge.to) &&
+        (contractRelationFilterVal==='all' || edge.relation===contractRelationFilterVal || edge.relation==='contains')
+      );
+      const nodeById = Object.fromEntries(nodes.map(node=>[node.id,node]));
+      if (selectedContractEntity && !nodeById[selectedContractEntity]) selectedContractEntity = null;
+
+      const layers = {task:0,domain:0,contract:1,operation:2,event:2,message:3,schema:3,'generated-output':3,field:4};
+      const columns = {};
+      nodes.forEach(node=>(columns[layers[node.type]??3] ||= []).push(node));
+      Object.values(columns).forEach(column=>column.sort((a,b)=>String(a.label).localeCompare(String(b.label))));
+      const positions = {};
+      Object.entries(columns).forEach(([layer,column])=>column.forEach((node,index)=>{
+        positions[node.id] = {x:24+Number(layer)*222,y:24+index*82};
+      }));
+      const maxLayer = Math.max(0,...Object.keys(columns).map(Number));
+      const maxRows = Math.max(1,...Object.values(columns).map(column=>column.length));
+      const stageWidth = Math.max(760,48+(maxLayer+1)*222);
+      const stageHeight = Math.max(250,48+maxRows*82);
+      const relatedIds = new Set([selectedContractEntity]);
+      if (selectedContractEntity) selectedRelations.forEach(edge=>{
+        if (edge.from===selectedContractEntity) relatedIds.add(edge.to);
+        if (edge.to===selectedContractEntity) relatedIds.add(edge.from);
+      });
+      const edgeMarkup = selectedRelations.map(edge=>{
+        const from=positions[edge.from], to=positions[edge.to];
+        if (!from || !to) return '';
+        const forward = to.x >= from.x;
+        const x1 = forward ? from.x+176 : from.x;
+        const x2 = forward ? to.x : to.x+176;
+        const y1=from.y+29, y2=to.y+29, mid=(x1+x2)/2;
+        return `<path class="contract-impact-edge" d="M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}" marker-end="url(#contractImpactArrow)"/><text class="contract-impact-edge-label" x="${mid}" y="${(y1+y2)/2-4}" text-anchor="middle">${escapeHtml(edge.relation)}</text>`;
       }).join('');
-      if (!contracts.length) contractGraph.innerHTML = '<div class="view-sub">No registered contract graph.</div>';
+      function nodeMeta(node) {
+        if (node.type==='operation') return [node.method,node.path].filter(Boolean).join(' ');
+        if (node.type==='field') return [node.data_type,node.required?'required':'optional'].filter(Boolean).join(' · ');
+        if (node.type==='generated-output') return node.materialized ? 'materialized' : 'configured';
+        if (node.type==='event') return [node.direction,node.channel].filter(Boolean).join(' · ');
+        if (node.type==='task') return [node.status,node.context].filter(Boolean).join(' · ');
+        if (node.type==='schema') return node.inline ? 'inline schema' : (node.schema_kind||'schema');
+        return '';
+      }
+      const nodeMarkup = nodes.map(node=>{
+        const pos=positions[node.id];
+        const selected=node.id===selectedContractEntity;
+        const dimmed=selectedContractEntity && !relatedIds.has(node.id);
+        return `<button class="contract-impact-node${selected?' selected':''}${dimmed?' dimmed':''}" data-impact-id="${escapeHtml(node.id)}" data-type="${escapeHtml(node.type)}" data-search="${escapeHtml(`${node.type} ${node.label} ${node.id}`)}" style="left:${pos.x}px;top:${pos.y}px">
+          <div class="contract-impact-node-type">${escapeHtml(node.type)}</div><div class="contract-impact-node-label">${escapeHtml(node.label)}</div><div class="contract-impact-node-meta">${escapeHtml(nodeMeta(node))}</div>
+        </button>`;
+      }).join('');
+      const lifecycle = ['draft','proposed','approved','active','deprecated','removed'];
+      // Preserve producer/consumer/verifier task context beside the deeper
+      // canonical entity graph; neither view derives new contract facts.
+      const lifecycleMarkup = contracts.map(contract=>`<div class="contract-graph-row">
+        <div class="contract-domain">represents → ${escapeHtml(contract.represents || 'unassigned domain')}</div>
+        <div class="contract-node"><div class="contract-node-name">${escapeHtml(contract.contract_id)}@${escapeHtml(contract.version)}</div><div class="contract-lifecycle">${lifecycle.map(status=>`<span class="${status===contract.status?'current':''}">${status}</span>`).join('<span>→</span>')}</div></div>
+        <div class="contract-relations">${edges.filter(edge=>edge.to===contract.id && edge.relation!=='represents').map(edge=>`<div class="contract-relation"><span>${escapeHtml(edge.from)}</span><span class="contract-relation-arrow">—${escapeHtml(edge.relation)}→</span><span class="contract-relation-label">${escapeHtml(contract.contract_id)}@${escapeHtml(contract.version)}</span></div>`).join('') || '<div class="view-sub" style="margin:0">No task relation.</div>'}</div>
+      </div>`).join('');
+      contractGraph.innerHTML = contracts.length ? `<div class="artifact-section-title">Lifecycle and task boundary</div>${lifecycleMarkup}<div class="artifact-section-title" style="margin-top:8px">Canonical impact graph · ${nodes.length} nodes · ${selectedRelations.length} edges</div>${nodes.length ? `<div class="contract-impact-stage-wrap"><div class="contract-impact-stage" style="width:${stageWidth}px;height:${stageHeight}px"><svg class="contract-impact-svg" viewBox="0 0 ${stageWidth} ${stageHeight}"><defs><marker id="contractImpactArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#64748b"/></marker></defs>${edgeMarkup}</svg>${nodeMarkup}</div></div>` : '<div class="view-sub">No impact entities match the active filters.</div>'}` : '<div class="view-sub">No registered contract graph.</div>';
+
+      contractGraph.querySelectorAll('[data-impact-id]').forEach(element=>element.addEventListener('click',()=>{
+        selectedContractEntity = selectedContractEntity===element.dataset.impactId ? null : element.dataset.impactId;
+        if (selectedContractEntity) {
+          const directRoot = selectedContractEntity.split('#')[0];
+          if (directRoot.startsWith('contract:')) selectedContractRef = directRoot;
+          else {
+            const relation = impactEdges.find(edge=>(edge.from===selectedContractEntity || edge.to===selectedContractEntity) && (edge.from.startsWith('contract:') || edge.to.startsWith('contract:')));
+            if (relation) selectedContractRef = relation.from.startsWith('contract:') ? relation.from : relation.to;
+          }
+        }
+        renderContracts(); writeUrlState(); applySearch();
+      }));
+      renderContractImpactInspector(impactNodes, impactEdges);
+
+      contractFilter.onchange = ()=>{ selectedContractRef=contractFilter.value; selectedContractEntity=null; renderContracts(); writeUrlState(); };
+      contractEntityFilter.onchange = ()=>{ contractEntityFilterVal=contractEntityFilter.value; selectedContractEntity=null; renderContracts(); writeUrlState(); };
+      contractRelationFilter.onchange = ()=>{ contractRelationFilterVal=contractRelationFilter.value; selectedContractEntity=null; renderContracts(); writeUrlState(); };
+
       contractBody.innerHTML = contracts.map(contract=>{
         const relations = edges.filter(edge=>edge.to===contract.id && edge.relation!=='represents').map(edge=>edge.relation);
-        return `<tr>
-          <td><strong>${escapeHtml(contract.contract_id)}@${escapeHtml(contract.version)}</strong></td>
-          <td>${escapeHtml(contract.kind)}</td><td>${escapeHtml(contract.owner || '—')}</td>
-          <td><span class="badge bg-cyan">${escapeHtml(contract.status)}</span></td>
-          <td>${escapeHtml(contract.represents || '—')}</td><td>${escapeHtml(relations.join(', ') || '—')}</td>
-        </tr>`;
+        return `<tr data-contract-ref="${escapeHtml(contract.id)}"><td><strong>${escapeHtml(contract.contract_id)}@${escapeHtml(contract.version)}</strong></td><td>${escapeHtml(contract.kind)}</td><td>${escapeHtml(contract.owner || '—')}</td><td><span class="badge bg-cyan">${escapeHtml(contract.status)}</span></td><td>${escapeHtml(contract.represents || '—')}</td><td>${escapeHtml(relations.join(', ') || '—')}</td></tr>`;
       }).join('');
       if (!contracts.length) contractBody.innerHTML = '<tr><td colspan="6" style="color:var(--text-dim)">No registered contracts.</td></tr>';
+      contractBody.querySelectorAll('[data-contract-ref]').forEach(row=>row.addEventListener('click',()=>{
+        selectedContractRef=row.dataset.contractRef; selectedContractEntity=row.dataset.contractRef; renderContracts(); writeUrlState();
+      }));
     }
 
     // ── RENDER STATS ──────────────────────────────────────────
@@ -1256,6 +1406,8 @@
 
     const initialState = urlState();
     if (initialState.task) selectedTaskId = initialState.task;
+    selectedContractRef = initialState.contract || 'all';
+    selectedContractEntity = initialState.entity || null;
     setActiveView(initialState.view || 'project', false);
     renderAll();
 

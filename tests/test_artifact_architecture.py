@@ -229,10 +229,16 @@ class ArtifactArchitectureTests(EngineTestCase):
             "kind": "api", "represents": "sample", "path": "contracts/sample.json", "status": "approved",
             "content_hash": "abc", "compatibility": "backward-compatible", "supersedes": None,
             "generated_outputs": [],
+            "semantic": {"available": False, "complete": False, "reason": "manual fixture"},
+            "impact_refs": [contract_ref],
         }
         relationship = {"id": "sample", "version": "1.0.0", "relation": "implements", "contract_ref": contract_ref}
         enriched["contracts.json"]["data"].update({
             "items": [contract], "contract_refs": [contract_ref],
+            "impact_graph": {
+                "nodes": [{"id": contract_ref, "type": "contract", "label": "sample@1.0.0"}],
+                "edges": [], "summary": {"nodes": 1, "edges": 0, "by_type": {"contract": 1}},
+            },
             "edges": [{
                 "from": task_ref, "to": contract_ref, "relation": "implements",
                 "observation": ai_kit._architecture_observation("observed", "source", [str(self.state_file)], confidence=1),
@@ -244,6 +250,18 @@ class ArtifactArchitectureTests(EngineTestCase):
             "modules": [], "contracts": [contract_ref], "tasks": [],
         }
         ai_kit._validate_artifact_payloads(enriched)
+        broken_semantic = copy.deepcopy(enriched)
+        broken_semantic["contracts.json"]["data"]["items"][0]["semantic"]["complete"] = True
+        with self.assertRaisesRegex(ai_kit.EngineError, "cannot be complete"):
+            ai_kit._validate_artifact_payloads(broken_semantic)
+        broken_impact = copy.deepcopy(enriched)
+        broken_impact["contracts.json"]["data"]["impact_graph"]["edges"] = [{
+            "id": "contract-impact-edge:broken", "from": contract_ref,
+            "to": "contract:missing@1.0.0#schema:Missing", "relation": "contains",
+        }]
+        broken_impact["contracts.json"]["data"]["impact_graph"]["summary"]["edges"] = 1
+        with self.assertRaisesRegex(ai_kit.EngineError, "unknown endpoint"):
+            ai_kit._validate_artifact_payloads(broken_impact)
         enriched["contracts.json"]["data"]["edges"][0]["to"] = "contract:missing@1.0.0"
         with self.assertRaisesRegex(ai_kit.EngineError, "unknown endpoint"):
             ai_kit._validate_artifact_payloads(enriched)

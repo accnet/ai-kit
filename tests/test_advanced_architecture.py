@@ -56,6 +56,8 @@ class AdvancedArchitectureTests(unittest.TestCase):
         protobuf = ai_kit._normalize_imported_contract("protobuf", None, 'syntax = "proto3";\npackage orders;\nmessage Order {\n string id = 1;\n}\nservice Orders {\n rpc Get (Order) returns (Order);\n}\n', self.root / "orders.proto")
         prisma = ai_kit._normalize_imported_contract("prisma", None, "model Order {\n id String\n total Float?\n}\n", self.root / "schema.prisma")
         self.assertEqual(asyncapi["events"][0]["id"], "orderPlaced")
+        self.assertEqual(asyncapi["schema_version"], 2)
+        self.assertEqual(set(asyncapi["semantic_coverage"]), {"schemas", "events", "event-payloads"})
         self.assertEqual(protobuf["definitions"][0]["name"], "Order")
         self.assertEqual(prisma["models"][0]["fields"][1]["required"], False)
 
@@ -71,6 +73,17 @@ class AdvancedArchitectureTests(unittest.TestCase):
         self.assertEqual(result["checks"][0]["violations"][0]["to"], "src/database/models.py")
         self.assertIn("_architecture_fitness(run_root)", inspect.getsource(ai_kit.cmd_verify))
         self.assertIn("_architecture_model_diagnostics()", inspect.getsource(ai_kit.cmd_verify))
+
+    def test_ast_required_typescript_fitness_is_inconclusive_without_compiler(self) -> None:
+        presentation = self.root / "src" / "presentation"; database = self.root / "src" / "database"
+        presentation.mkdir(parents=True); database.mkdir(parents=True)
+        (presentation / "controller.ts").write_text("import { Model } from '../database/models';\n", encoding="utf-8")
+        (database / "models.ts").write_text("export class Model {}\n", encoding="utf-8")
+        rules = {"schema_version":2, "analysis":{"require_ast":True}, "rules":[{"id":"no-presentation-db","type":"forbid-dependency","from":["src/presentation/*"],"to":["src/database/*"]}],"commands":[]}
+        (self.root / ".ai" / "install" / "config" / "architecture-fitness.json").write_text(json.dumps(rules), encoding="utf-8")
+        result = ai_kit._architecture_fitness(self.root)
+        self.assertTrue(result["inconclusive"])
+        self.assertEqual(result["checks"][0]["status"], "inconclusive")
 
     def test_c4_projection_contains_three_levels(self) -> None:
         observation = ai_kit._architecture_observation("observed", "config", ["contexts.yaml"], confidence=1.0)

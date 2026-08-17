@@ -31,7 +31,10 @@ Các tab có ý nghĩa:
 - **Architecture**: contexts, modules, dependency/ownership graph và provenance.
 - **Architecture C4**: chuyển giữa System Context, Containers, Components và
   module graph từ trường `architecture.json.data.c4` canonical.
-- **Contracts**: lifecycle và `represents/implements/consumes/verifies` graph.
+- **Contracts**: lifecycle và impact graph canonical tới operation,
+  event/message, schema, field và generated output. Bộ lọc entity/relation,
+  node inspector và deep-link `#view=contracts&contract=...&entity=...` chỉ
+  chiếu dữ liệu đã publish; chúng không tự suy luận contract relationship.
 - **Evolution**: board projection từ `tasks.json`.
 - **Runtime**: assignment và gate/evidence state.
 - **Replay**: cửa sổ tối đa 200 lifecycle event từ `events.json`.

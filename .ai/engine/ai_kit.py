@@ -111,6 +111,13 @@ CONTRACT_RELATIONS = {"defines", "implements", "consumes", "verifies"}
 CONTRACT_KINDS = {"domain", "api", "event", "schema", "interface"}
 CONTRACT_STATUSES = {"draft", "proposed", "approved", "active", "deprecated", "removed"}
 CONTRACT_IMPORT_FORMATS = {"openapi", "asyncapi", "protobuf", "prisma"}
+NORMALIZED_CONTRACT_SCHEMA_VERSION = 2
+SEMANTIC_COVERAGE_REQUIRED = {
+    "openapi": {"schemas", "operations", "request-bodies", "responses", "status-codes", "auth", "errors"},
+    "asyncapi": {"schemas", "events", "event-payloads"},
+    "protobuf": {"schemas", "operations"},
+    "prisma": {"models"},
+}
 SCAFFOLD_PROFILES = ("minimal", "store-pilot")
 TRUTH_KINDS = {"config", "contract-registry", "decisions", "migrations", "source", "tests"}
 ARCHITECTURE_PROFILE_DIMENSIONS = {
@@ -2600,14 +2607,14 @@ def _architecture_artifacts(state: dict | None) -> tuple[dict, dict, dict, list[
     dependency_ids_by_source: dict[str, list[str]] = {}
     active_dependencies: dict[str, list[str]] = {}
     for edge in discovery.get("edges", []):
-        classification = "observed" if edge.get("kind") == "declared" else "inferred"
+        classification = "observed" if edge.get("kind") == "declared" else edge.get("classification", "inferred")
         confidence = 1.0 if classification == "observed" else float(edge.get("confidence", 0.5))
         observation = _architecture_observation(
             classification,
-            "config" if classification == "observed" else "import",
-            [".ai-config/contexts.yaml"] if classification == "observed" else [f"module:{edge['from']}", f"module:{edge['to']}"],
+            "config" if edge.get("kind") == "declared" else "import",
+            [".ai-config/contexts.yaml"] if edge.get("kind") == "declared" else [str(edge.get("source_file") or f"module:{edge['from']}")],
             confidence=confidence,
-            rationale=None if classification == "observed" else "internal import resolved to a discovered module boundary",
+            rationale=None if classification == "observed" else "internal import resolved through configured source roots",
         )
         edge_key = f"{edge['from']}\0{edge['to']}\0{edge.get('kind')}"
         edge_id = "dependency:" + hashlib.sha256(edge_key.encode("utf-8")).hexdigest()[:16]
@@ -2620,6 +2627,8 @@ def _architecture_artifacts(state: dict | None) -> tuple[dict, dict, dict, list[
             "active": active,
             "observation": observation,
         }
+        if edge.get("source_file"):
+            item["provenance"] = {"source_file": edge["source_file"], "target_file": edge.get("target_file"), "source_range": edge.get("source_range"), "import_kind": edge.get("import_kind")}
         dependency_items.append(item)
         dependency_ids_by_source.setdefault(edge["from"], []).append(edge_id)
         if active:
@@ -2700,21 +2709,274 @@ def _architecture_artifacts(state: dict | None) -> tuple[dict, dict, dict, list[
     return architecture, {"items": modules}, {"items": dependency_items}, risks, discovery
 
 
+def _contract_entity_ref(contract_ref: str, kind: str, value: str) -> str:
+    from urllib.parse import quote
+    return f"{contract_ref}#{kind}:{quote(str(value), safe='._-~')}"
+
+
+def _contract_schema_ref_name(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"#/components/schemas/([^/]+)", value)
+    if not match:
+        return None
+    return match.group(1).replace("~1", "/").replace("~0", "~")
+
+
+def _contract_generated_output_records(version: dict) -> list[dict]:
+    hashes = version.get("generated_output_hashes") or {}
+    generators_by_output: dict[str, set[str]] = {}
+    for generator in version.get("generators") or []:
+        if not isinstance(generator, dict):
+            continue
+        for output in generator.get("outputs") or []:
+            generators_by_output.setdefault(str(output), set())
+            if generator.get("name"):
+                generators_by_output[str(output)].add(str(generator["name"]))
+    return [
+        {
+            "path": output,
+            "content_hash": hashes.get(output),
+            "materialized": output in hashes,
+            "generators": sorted(generators_by_output.get(output, set())),
+        }
+        for output in sorted(set(str(item) for item in hashes) | set(generators_by_output))
+    ]
+
+
+def _contract_impact_graph(contract_id: str, version_name: str, contract: dict, version: dict, tasks: list[dict]) -> dict:
+    """Build one deterministic, source-backed graph for CLI and artifacts."""
+    contract_ref = f"contract:{contract_id}@{version_name}"
+    nodes: dict[str, dict] = {}
+    edges: dict[str, dict] = {}
+
+    def add_node(identifier: str, node_type: str, label: str, **values: object) -> str:
+        candidate = {"id": identifier, "type": node_type, "label": label, **values}
+        existing = nodes.get(identifier)
+        if existing is not None and existing != candidate:
+            raise EngineError(f"contract impact node collision: {identifier}")
+        nodes[identifier] = candidate
+        return identifier
+
+    def add_edge(source: str, target: str, relation: str, **values: object) -> None:
+        identity = json.dumps([source, target, relation, values], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        identifier = f"contract-impact-edge:{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:20]}"
+        edges[identifier] = {"id": identifier, "from": source, "to": target, "relation": relation, **values}
+
+    add_node(
+        contract_ref, "contract", f"{contract_id}@{version_name}",
+        contract_id=contract_id, version=version_name, status=version.get("status"),
+        owner=contract.get("owner"), kind=contract.get("kind"),
+    )
+    if contract.get("represents"):
+        domain_ref = f"domain:{contract['represents']}"
+        add_node(domain_ref, "domain", str(contract["represents"]))
+        add_edge(contract_ref, domain_ref, "represents")
+
+    semantic, semantic_reason = _imported_contract_payload(version)
+    schema_refs: dict[str, str] = {}
+    if semantic is not None:
+        schemas: list[tuple[dict, str]] = []
+        for collection, schema_kind in (("definitions", "definition"), ("models", "model")):
+            for schema in semantic.get(collection) or []:
+                if not isinstance(schema, dict) or not schema.get("name"):
+                    continue
+                name = str(schema["name"])
+                schema_ref = _contract_entity_ref(contract_ref, "schema", name)
+                schema_refs[name] = add_node(schema_ref, "schema", name, schema_kind=schema_kind, inline=False)
+                add_edge(contract_ref, schema_ref, "contains")
+                schemas.append((schema, schema_ref))
+        for schema, schema_ref in schemas:
+            name = str(schema["name"])
+            for field in schema.get("fields") or []:
+                if not isinstance(field, dict) or not field.get("name"):
+                    continue
+                field_name = str(field["name"])
+                field_ref = _contract_entity_ref(contract_ref, "field", f"{name}.{field_name}")
+                add_node(
+                    field_ref, "field", field_name, schema_ref=schema_ref,
+                    field_path=field_name, data_type=field.get("type"), format=field.get("format"),
+                    required=bool(field.get("required")), ref=field.get("ref"), enum=field.get("enum"),
+                )
+                add_edge(schema_ref, field_ref, "contains")
+                target_name = _contract_schema_ref_name(field.get("ref"))
+                if target_name and target_name in schema_refs:
+                    add_edge(field_ref, schema_refs[target_name], "references")
+
+        def attach_schema(owner_ref: str, relation: str, schema: object, locator: str, **edge_values: object) -> str:
+            shape = schema if isinstance(schema, dict) else {}
+            referenced_name = _contract_schema_ref_name(shape.get("ref"))
+            if referenced_name and referenced_name in schema_refs:
+                schema_ref = schema_refs[referenced_name]
+            else:
+                schema_ref = _contract_entity_ref(contract_ref, "schema", f"inline:{locator}")
+                add_node(
+                    schema_ref, "schema", locator, schema_kind="inline", inline=True,
+                    data_type=shape.get("type"), format=shape.get("format"), ref=shape.get("ref"),
+                )
+
+                def add_properties(parent_ref: str, parent_shape: object, prefix: str) -> None:
+                    parent_shape = parent_shape if isinstance(parent_shape, dict) else {}
+                    properties = parent_shape.get("properties")
+                    if not isinstance(properties, dict):
+                        return
+                    required = set(parent_shape.get("required") or [])
+                    for field_name, field_shape in sorted(properties.items()):
+                        field_shape = field_shape if isinstance(field_shape, dict) else {}
+                        field_path = f"{prefix}.{field_name}" if prefix else str(field_name)
+                        field_ref = _contract_entity_ref(contract_ref, "field", f"inline:{locator}.{field_path}")
+                        add_node(
+                            field_ref, "field", str(field_name), schema_ref=schema_ref,
+                            field_path=field_path, data_type=field_shape.get("type"), format=field_shape.get("format"),
+                            required=field_name in required, ref=field_shape.get("ref"), enum=field_shape.get("enum"),
+                        )
+                        add_edge(parent_ref, field_ref, "contains")
+                        target_name = _contract_schema_ref_name(field_shape.get("ref"))
+                        if target_name and target_name in schema_refs:
+                            add_edge(field_ref, schema_refs[target_name], "references")
+                        add_properties(field_ref, field_shape, field_path)
+
+                add_properties(schema_ref, shape, "")
+            add_edge(owner_ref, schema_ref, relation, **edge_values)
+            return schema_ref
+
+        for operation in semantic.get("operations") or []:
+            if not isinstance(operation, dict):
+                continue
+            if operation.get("method") or operation.get("path"):
+                operation_key = f"{operation.get('method', '')}:{operation.get('path', '')}"
+            else:
+                operation_key = str(operation.get("id") or "operation")
+            operation_ref = _contract_entity_ref(contract_ref, "operation", operation_key)
+            add_node(
+                operation_ref, "operation", str(operation.get("id") or operation_key),
+                method=operation.get("method"), path=operation.get("path"),
+            )
+            add_edge(contract_ref, operation_ref, "contains")
+            request = operation.get("request")
+            if isinstance(request, dict):
+                for content in request.get("content") or []:
+                    if isinstance(content, dict):
+                        attach_schema(
+                            operation_ref, "request-body", content.get("schema"),
+                            f"{operation_key}:request:{content.get('media_type')}",
+                            media_type=content.get("media_type"), required=bool(request.get("required")),
+                        )
+            for response in operation.get("responses") or []:
+                if not isinstance(response, dict):
+                    continue
+                relation = "error-response" if response.get("category") in {"client-error", "server-error", "default"} else "response"
+                for content in response.get("content") or []:
+                    if isinstance(content, dict):
+                        attach_schema(
+                            operation_ref, relation, content.get("schema"),
+                            f"{operation_key}:response:{response.get('status')}:{content.get('media_type')}",
+                            status=response.get("status"), category=response.get("category"), media_type=content.get("media_type"),
+                        )
+
+        for event in semantic.get("events") or []:
+            if not isinstance(event, dict):
+                continue
+            event_key = f"{event.get('direction', '')}:{event.get('channel', '')}"
+            event_ref = _contract_entity_ref(contract_ref, "event", event_key)
+            add_node(
+                event_ref, "event", str(event.get("id") or event_key),
+                channel=event.get("channel"), direction=event.get("direction"),
+            )
+            add_edge(contract_ref, event_ref, "contains")
+            for index, message in enumerate(event.get("messages") or []):
+                if not isinstance(message, dict):
+                    continue
+                message_name = str(message.get("name") or f"message-{index + 1}")
+                message_ref = _contract_entity_ref(contract_ref, "message", f"{event_key}:{message_name}:{index}")
+                add_node(message_ref, "message", message_name, content_type=message.get("content_type"), ref=message.get("ref"))
+                add_edge(event_ref, message_ref, "contains")
+                attach_schema(
+                    message_ref, "event-payload", message.get("payload"),
+                    f"{event_key}:message:{message_name}:payload", content_type=message.get("content_type"),
+                )
+
+    for output_record in _contract_generated_output_records(version):
+        output = output_record["path"]
+        output_ref = _contract_entity_ref(contract_ref, "generated-output", str(output))
+        add_node(output_ref, "generated-output", str(output), **output_record)
+        add_edge(contract_ref, output_ref, "generates")
+
+    for task in sorted(tasks, key=lambda item: (str(item.get("workflow_id")), str(item.get("task")))):
+        task_ref = f"task:{task.get('workflow_id')}:{task.get('task')}"
+        add_node(
+            task_ref, "task", str(task.get("task")), workflow_id=task.get("workflow_id"),
+            task_id=task.get("task"), status=task.get("status"), context=task.get("context"),
+        )
+        for relation in sorted(set(task.get("relations") or [])):
+            add_edge(task_ref, contract_ref, str(relation))
+
+    node_list = sorted(nodes.values(), key=lambda item: item["id"])
+    edge_list = sorted(edges.values(), key=lambda item: item["id"])
+    counts: dict[str, int] = {}
+    for node in node_list:
+        counts[node["type"]] = counts.get(node["type"], 0) + 1
+    return {
+        "contract_ref": contract_ref,
+        "semantic_available": semantic is not None,
+        "semantic_reason": semantic_reason,
+        "nodes": node_list,
+        "edges": edge_list,
+        "summary": {"nodes": len(node_list), "edges": len(edge_list), "by_type": dict(sorted(counts.items()))},
+    }
+
+
 def _contract_artifact(state_file: Path, state: dict | None) -> dict:
     registry = _load_contract_registry()
     workflow_id = state.get("workflow_id") if state else None
     contracts, edges = [], []
+    impact_nodes: dict[str, dict] = {}
+    impact_edges: dict[str, dict] = {}
     contract_refs = set()
     for contract_id, contract in sorted(registry.get("contracts", {}).items()):
         for version_name, version in sorted(contract.get("versions", {}).items(), key=lambda item: _semver(item[0])):
             stable_id = f"contract:{contract_id}@{version_name}"
             contract_refs.add(stable_id)
+            semantic_payload, semantic_reason = _imported_contract_payload(version)
+            if semantic_payload is None:
+                semantic = {"available": False, "complete": False, "reason": semantic_reason}
+            else:
+                semantic_coverage, semantic_missing = _semantic_coverage(semantic_payload)
+                semantic = {
+                    "available": True,
+                    "complete": not semantic_missing,
+                    "schema_version": semantic_payload.get("schema_version"),
+                    "source_format": semantic_payload.get("source_format"),
+                    "coverage": sorted(semantic_coverage),
+                    "missing_coverage": sorted(semantic_missing),
+                    "definitions": semantic_payload.get("definitions") or [],
+                    "models": semantic_payload.get("models") or [],
+                    "security_schemes": semantic_payload.get("security_schemes") or [],
+                    "operations": semantic_payload.get("operations") or [],
+                    "events": semantic_payload.get("events") or [],
+                }
+            related_tasks = []
+            for task in state.get("tasks", []) if state else []:
+                relations = sorted(
+                    ref["relation"] for ref in task.get("contract_refs", [])
+                    if ref["id"] == contract_id and ref["version"] == version_name
+                )
+                if relations:
+                    related_tasks.append({
+                        "workflow_id": workflow_id, "task": task["id"], "status": task["status"],
+                        "context": task.get("context"), "relations": relations,
+                    })
+            impact = _contract_impact_graph(contract_id, version_name, contract, version, related_tasks)
+            impact_nodes.update({item["id"]: item for item in impact["nodes"]})
+            impact_edges.update({item["id"]: item for item in impact["edges"]})
             contracts.append({
                 "id": stable_id, "contract_id": contract_id, "version": version_name,
                 "owner": contract.get("owner"), "kind": contract.get("kind"), "represents": contract.get("represents"),
                 "path": version.get("path"), "status": version.get("status"), "content_hash": version.get("content_hash"),
                 "compatibility": version.get("compatibility"), "supersedes": version.get("supersedes"),
-                "generated_outputs": sorted((version.get("generated_output_hashes") or {}).keys()),
+                "generated_outputs": [item["path"] for item in _contract_generated_output_records(version)],
+                "semantic": semantic,
+                "impact_refs": [item["id"] for item in impact["nodes"] if item["type"] not in {"task", "domain"}],
             })
             if contract.get("represents"):
                 edges.append({
@@ -2729,7 +2991,18 @@ def _contract_artifact(state_file: Path, state: dict | None) -> dict:
                 "from": task_ref, "to": target, "relation": ref["relation"],
                 "observation": _architecture_observation("observed", "source", [display_path(state_file)], confidence=1.0),
             })
-    return {"items": contracts, "edges": edges, "contract_refs": sorted(contract_refs)}
+    impact_node_list = sorted(impact_nodes.values(), key=lambda item: item["id"])
+    impact_edge_list = sorted(impact_edges.values(), key=lambda item: item["id"])
+    impact_counts: dict[str, int] = {}
+    for node in impact_node_list:
+        impact_counts[node["type"]] = impact_counts.get(node["type"], 0) + 1
+    return {
+        "items": contracts, "edges": edges, "contract_refs": sorted(contract_refs),
+        "impact_graph": {
+            "nodes": impact_node_list, "edges": impact_edge_list,
+            "summary": {"nodes": len(impact_node_list), "edges": len(impact_edge_list), "by_type": dict(sorted(impact_counts.items()))},
+        },
+    }
 
 
 def _canonical_dag_artifact(state: dict | None) -> dict:
@@ -3011,6 +3284,59 @@ def _validate_artifact_payloads(payloads: dict[str, dict], manifest: dict | None
     declared_contract_refs = set(contracts.get("contract_refs", []))
     if declared_contract_refs != contract_ids:
         raise EngineError("contracts contract_refs do not match contract items")
+    impact_graph = contracts.get("impact_graph")
+    if not isinstance(impact_graph, dict):
+        raise EngineError("contracts impact_graph must be an object")
+    impact_nodes = impact_graph.get("nodes")
+    impact_edges = impact_graph.get("edges")
+    if not isinstance(impact_nodes, list) or not isinstance(impact_edges, list):
+        raise EngineError("contracts impact_graph nodes/edges must be lists")
+    impact_ids = unique_ids(impact_nodes, "contract impact nodes")
+    allowed_impact_types = {"contract", "domain", "operation", "event", "message", "schema", "field", "generated-output", "task"}
+    impact_counts: dict[str, int] = {}
+    for node in impact_nodes:
+        node_type = node.get("type")
+        if node_type not in allowed_impact_types:
+            raise EngineError(f"{node.get('id')}: unknown contract impact node type {node_type!r}")
+        impact_counts[node_type] = impact_counts.get(node_type, 0) + 1
+        if node_type == "contract" and node.get("id") not in contract_ids:
+            raise EngineError(f"{node.get('id')}: contract impact root is unknown")
+        if node_type == "task" and node.get("id") not in task_ids:
+            raise EngineError(f"{node.get('id')}: contract impact task is unknown")
+    unique_ids(impact_edges, "contract impact edges")
+    allowed_impact_relations = {
+        "contains", "references", "request-body", "response", "error-response",
+        "event-payload", "generates", "represents", *CONTRACT_RELATIONS,
+    }
+    for edge in impact_edges:
+        if edge.get("from") not in impact_ids or edge.get("to") not in impact_ids:
+            raise EngineError(f"{edge.get('id')}: contract impact edge has an unknown endpoint")
+        if edge.get("relation") not in allowed_impact_relations:
+            raise EngineError(f"{edge.get('id')}: unknown contract impact relation {edge.get('relation')!r}")
+    expected_impact_summary = {
+        "nodes": len(impact_nodes), "edges": len(impact_edges), "by_type": dict(sorted(impact_counts.items())),
+    }
+    if impact_graph.get("summary") != expected_impact_summary:
+        raise EngineError("contract impact graph summary is inconsistent")
+    for item in contract_items:
+        semantic = item.get("semantic")
+        if not isinstance(semantic, dict) or not isinstance(semantic.get("available"), bool) or not isinstance(semantic.get("complete"), bool):
+            raise EngineError(f"{item.get('id')}: semantic projection requires available/complete booleans")
+        impact_refs = item.get("impact_refs")
+        if not isinstance(impact_refs, list) or item.get("id") not in impact_refs or set(impact_refs) - impact_ids:
+            raise EngineError(f"{item.get('id')}: impact_refs are incomplete or unresolved")
+        if not semantic["available"]:
+            if semantic["complete"]:
+                raise EngineError(f"{item.get('id')}: unavailable semantic projection cannot be complete")
+            continue
+        if semantic.get("schema_version") not in {1, NORMALIZED_CONTRACT_SCHEMA_VERSION}:
+            raise EngineError(f"{item.get('id')}: unsupported normalized semantic schema version")
+        for key in ("coverage", "missing_coverage", "definitions", "models", "security_schemes", "operations", "events"):
+            if not isinstance(semantic.get(key), list):
+                raise EngineError(f"{item.get('id')}: semantic {key} must be a list")
+        expected_missing = SEMANTIC_COVERAGE_REQUIRED.get(str(semantic.get("source_format")), set()) - set(semantic["coverage"])
+        if set(semantic["missing_coverage"]) != expected_missing or semantic["complete"] != (not expected_missing):
+            raise EngineError(f"{item.get('id')}: semantic coverage flags are inconsistent")
     domain_ids = {f"domain:{item.get('represents')}" for item in contract_items if item.get("represents")}
     for edge in contracts.get("edges", []):
         _validate_architecture_observation(edge.get("observation"), f"contract edge {edge.get('relation')}")
@@ -4493,6 +4819,7 @@ def cmd_route(args: argparse.Namespace) -> dict:
         str(task.get("title") or task["id"]),
         task=task,
         state_file=state_file,
+        analysis_root=Path((task.get("assignment") or {}).get("worktree") or ROOT),
         explain=getattr(args, "explain", False),
     )
     context_paths = [
@@ -4617,7 +4944,11 @@ def cmd_context_impact(args: argparse.Namespace) -> dict:
     return {"name": args.name, "direct_dependents": direct, "all_dependents": all_dependents, "affected_tasks": affected}
 
 
-CONTEXT_PACKAGE_SCHEMA_VERSION = 1
+CONTEXT_PACKAGE_SCHEMA_VERSION = 3
+CONTEXT_IMPACT_MAX_NODES = 240
+CONTEXT_IMPACT_MAX_EDGES = 480
+CONTEXT_SYMBOL_MAX_SYMBOLS = 160
+CONTEXT_SYMBOL_MAX_EDGES = 320
 CONTEXT_QUERY_STOP_WORDS = {
     "add", "and", "change", "create", "fix", "for", "from", "implement", "into",
     "the", "this", "update", "with", "without",
@@ -4625,9 +4956,252 @@ CONTEXT_QUERY_STOP_WORDS = {
 
 
 def _context_query_tokens(query: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{1,}", query):
+        expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw).replace("_", " ").replace("-", " ").lower()
+        tokens.update(token for token in re.findall(r"[a-z0-9]{2,}", expanded) if token not in CONTEXT_QUERY_STOP_WORDS)
+    return tokens
+
+
+def _semantic_symbol_tokens(symbol: dict) -> set[str]:
+    return _context_query_tokens(" ".join(str(symbol.get(key) or "") for key in ("name", "qualified_name", "kind", "path")))
+
+
+def _context_symbol_slice(tokens: set[str], task: dict | None, analysis_root: Path, level: int, generated_outputs: list[str]) -> dict:
+    """Select source symbols deterministically; never read or copy bodies."""
+    empty = {"schema_version": 1, "source_fingerprint": None, "symbols": [], "edges": [], "diagnostics": [], "truncated": False, "limits": {"symbols": CONTEXT_SYMBOL_MAX_SYMBOLS, "edges": CONTEXT_SYMBOL_MAX_EDGES}}
+    if level < 1:
+        return empty
+    index = _semantic_index(analysis_root)
+    symbols_by_path: dict[str, list[dict]] = {}
+    for symbol in index["symbols"]:
+        symbols_by_path.setdefault(symbol["path"], []).append(symbol)
+    task_paths = {str(value) for value in (task.get("files") if task else []) or []}
+    generated = set(generated_outputs)
+    priorities: dict[str, tuple[int, str]] = {}
+    reasons: dict[str, list[str]] = {}
+
+    def select(symbol: dict, priority: int, reason: str) -> None:
+        identifier = symbol["id"]
+        current = priorities.get(identifier)
+        candidate = (priority, identifier)
+        if current is None or candidate < current:
+            priorities[identifier] = candidate
+        reasons.setdefault(identifier, [])
+        if reason not in reasons[identifier]:
+            reasons[identifier].append(reason)
+
+    for symbol in index["symbols"]:
+        if symbol["path"] in task_paths:
+            select(symbol, 0, "declared task scope")
+        if symbol["path"] in generated:
+            select(symbol, 0, "generated contract boundary")
+        if tokens and tokens.intersection(_semantic_symbol_tokens(symbol)):
+            select(symbol, 0, "exact normalized query token match")
+
+    # L2 follows exact imports both directions by file, then selects public
+    # boundary symbols from the neighboring file. It intentionally does not
+    # claim a call graph or infer method targets from syntax alone.
+    if level >= 2:
+        selected_paths = {symbol["path"] for symbol in index["symbols"] if symbol["id"] in priorities}
+        neighbors: set[str] = set()
+        for edge in index["edges"]:
+            if edge.get("resolution") not in {"exact", "configured-root"} or not edge.get("to"):
+                continue
+            if edge["from"] in selected_paths:
+                neighbors.add(str(edge["to"]))
+            if edge["to"] in selected_paths:
+                neighbors.add(str(edge["from"]))
+        for path in sorted(neighbors):
+            for symbol in symbols_by_path.get(path, []):
+                if symbol.get("public"):
+                    select(symbol, 1, "one-hop exact import boundary")
+        selected_stems = {Path(path).stem.lower() for path in selected_paths}
+        for symbol in index["symbols"]:
+            if "/tests/" in f"/{symbol['path']}" and any(stem and stem in symbol["path"].lower() for stem in selected_stems):
+                select(symbol, 2, "test path matches selected source file")
+
+    ordered_ids = [identifier for identifier, _value in sorted(priorities.items(), key=lambda item: item[1])]
+    truncated = len(ordered_ids) > CONTEXT_SYMBOL_MAX_SYMBOLS
+    kept_ids = set(ordered_ids[:CONTEXT_SYMBOL_MAX_SYMBOLS])
+    selected = []
+    by_id = {item["id"]: item for item in index["symbols"]}
+    file_hashes = {item["path"]: item.get("content_hash") for item in index["files"]}
+    for identifier in ordered_ids[:CONTEXT_SYMBOL_MAX_SYMBOLS]:
+        symbol = dict(by_id[identifier])
+        symbol["selection"] = {"level": 1 if priorities[identifier][0] == 0 else 2, "reasons": reasons[identifier]}
+        symbol["observation"] = _architecture_observation("observed", "source", [symbol["path"]], confidence=1.0)
+        symbol["provenance"] = {"content_hash": file_hashes.get(symbol["path"]), "adapter": next((item["id"] for item in index["adapters"] if item["id"].startswith(symbol["language"])), f"{symbol['language']}-adapter"), "range": symbol["range"]}
+        selected.append(symbol)
+    selected_edges = []
+    for edge in index["edges"]:
+        # File edges are retained only when they connect selected symbols' files.
+        source_symbols = [item["id"] for item in selected if item["path"] == edge["from"]]
+        target_symbols = [item["id"] for item in selected if item["path"] == edge.get("to")]
+        for source in source_symbols:
+            for target in target_symbols:
+                selected_edges.append({"id": "symbol-edge:" + hashlib.sha256(f"{source}\0{target}\0{edge.get('kind')}".encode("utf-8")).hexdigest()[:20], "from": source, "to": target, "kind": edge.get("kind"), "specifier": edge.get("specifier"), "resolution": edge.get("resolution"), "source_range": edge.get("range")})
+    selected_edges = sorted({item["id"]: item for item in selected_edges}.values(), key=lambda item: item["id"])
+    if len(selected_edges) > CONTEXT_SYMBOL_MAX_EDGES:
+        truncated = True
+    return {"schema_version": 1, "source_fingerprint": index["source_fingerprint"], "symbols": selected, "edges": selected_edges[:CONTEXT_SYMBOL_MAX_EDGES], "diagnostics": index["diagnostics"], "truncated": truncated, "limits": {"symbols": CONTEXT_SYMBOL_MAX_SYMBOLS, "edges": CONTEXT_SYMBOL_MAX_EDGES}}
+
+
+def _context_contract_impact_slice(tokens: set[str], task: dict | None, state_file: Path) -> dict:
+    """Select a bounded, source-backed contract graph slice for a handoff.
+
+    The contract registry and normalized imported source remain authoritative.
+    This is only context selection metadata; it never reads the derived artifact
+    bundle and cannot participate in lifecycle or QA decisions.
+    """
+    registry = _load_contract_registry()
+    explicit_refs = {
+        (str(ref.get("id")), str(ref.get("version"))): str(ref.get("relation"))
+        for ref in (task.get("contract_refs") if task else []) or []
+        if isinstance(ref, dict) and ref.get("id") and ref.get("version")
+    }
+    workflow_id = None
+    workflow_tasks: list[dict] = []
+    if state_file.exists():
+        state = load(state_file)
+        validate(state)
+        workflow_id = state.get("workflow_id")
+        workflow_tasks = state.get("tasks") or []
+
+    selected_nodes: dict[str, dict] = {}
+    selected_edges: dict[str, dict] = {}
+    root_refs: set[str] = set()
+    matched_refs: set[str] = set()
+    generated_outputs: set[str] = set()
+    contract_sources: set[str] = set()
+    semantic_gaps: list[dict] = []
+
+    def node_tokens(node: dict) -> set[str]:
+        values = [
+            node.get("label"), node.get("type"), node.get("method"),
+            node.get("path"), node.get("field_path"), node.get("data_type"),
+            node.get("channel"), node.get("direction"), node.get("content_type"),
+        ]
+        return _context_query_tokens(" ".join(str(value) for value in values if value is not None))
+
+    for contract_id, contract in sorted((registry.get("contracts") or {}).items()):
+        versions = contract.get("versions") or {}
+        for version_name, version in sorted(versions.items(), key=lambda item: _semver(item[0])):
+            key = (str(contract_id), str(version_name))
+            root_ref = f"contract:{contract_id}@{version_name}"
+            identity_tokens = _context_query_tokens(" ".join(str(value) for value in (
+                contract_id, version_name, contract.get("owner"), contract.get("kind"), contract.get("represents")
+            ) if value is not None))
+            related_tasks = []
+            for candidate in workflow_tasks:
+                relations = sorted(
+                    str(ref.get("relation")) for ref in candidate.get("contract_refs") or []
+                    if isinstance(ref, dict) and str(ref.get("id")) == str(contract_id)
+                    and str(ref.get("version")) == str(version_name)
+                )
+                if relations:
+                    related_tasks.append({
+                        "workflow_id": workflow_id, "task": candidate.get("id"),
+                        "status": candidate.get("status"), "context": candidate.get("context"),
+                        "relations": relations,
+                    })
+            graph = _contract_impact_graph(str(contract_id), str(version_name), contract, version, related_tasks)
+            node_by_id = {node["id"]: node for node in graph["nodes"]}
+            entity_matches = {
+                node["id"] for node in graph["nodes"]
+                if node.get("type") not in {"contract", "domain", "task"}
+                and tokens.intersection(node_tokens(node))
+            }
+            explicit = key in explicit_refs
+            identity_match = bool(tokens.intersection(identity_tokens))
+            if not explicit and not identity_match and not entity_matches:
+                continue
+
+            root_refs.add(root_ref)
+            matched_refs.update(entity_matches)
+            if version.get("path"):
+                contract_sources.add(str(version["path"]))
+            for output in _contract_generated_output_records(version):
+                generated_outputs.add(str(output["path"]))
+            if not graph.get("semantic_available"):
+                semantic_gaps.append({"contract_ref": root_ref, "reason": graph.get("semantic_reason")})
+
+            # A task-level contract reference without a precise entity match
+            # gets boundary entrypoints, not a dump of every contract node.
+            # Descendant traversal then includes only each entrypoint's schemas
+            # and fields. Query matches use the same branch-oriented closure.
+            seeds = set(entity_matches)
+            if explicit:
+                seeds.update(
+                    node["id"] for node in graph["nodes"]
+                    if node.get("type") == "generated-output"
+                )
+            if explicit and not entity_matches:
+                seeds.update(
+                    node["id"] for node in graph["nodes"]
+                    if node.get("type") in {"operation", "event", "schema", "generated-output"}
+                )
+            chosen = {root_ref, *seeds}
+            incoming: dict[str, list[dict]] = {}
+            outgoing: dict[str, list[dict]] = {}
+            for edge in graph["edges"]:
+                incoming.setdefault(edge["to"], []).append(edge)
+                outgoing.setdefault(edge["from"], []).append(edge)
+
+            queue = list(seeds)
+            while queue:
+                current = queue.pop(0)
+                for edge in incoming.get(current, []):
+                    parent = edge["from"]
+                    if parent not in chosen:
+                        chosen.add(parent)
+                        if parent != root_ref:
+                            queue.append(parent)
+
+            queue = list(seeds)
+            while queue:
+                current = queue.pop(0)
+                if current == root_ref:
+                    continue
+                for edge in outgoing.get(current, []):
+                    child = edge["to"]
+                    if child not in chosen:
+                        chosen.add(child)
+                        if node_by_id.get(child, {}).get("type") not in {"contract", "domain", "task"}:
+                            queue.append(child)
+
+            for identifier in chosen:
+                if identifier in node_by_id:
+                    selected_nodes[identifier] = node_by_id[identifier]
+            for edge in graph["edges"]:
+                if edge["from"] in chosen and edge["to"] in chosen:
+                    selected_edges[edge["id"]] = edge
+
+    ordered_node_ids = [
+        *sorted(root_refs), *sorted(matched_refs - root_refs),
+        *sorted(set(selected_nodes) - root_refs - matched_refs),
+    ]
+    truncated = len(ordered_node_ids) > CONTEXT_IMPACT_MAX_NODES
+    kept_ids = set(ordered_node_ids[:CONTEXT_IMPACT_MAX_NODES])
+    nodes = [selected_nodes[identifier] for identifier in ordered_node_ids[:CONTEXT_IMPACT_MAX_NODES]]
+    eligible_edges = sorted(
+        (edge for edge in selected_edges.values() if edge["from"] in kept_ids and edge["to"] in kept_ids),
+        key=lambda edge: edge["id"],
+    )
+    if len(eligible_edges) > CONTEXT_IMPACT_MAX_EDGES:
+        truncated = True
+    edges = eligible_edges[:CONTEXT_IMPACT_MAX_EDGES]
     return {
-        token for token in re.findall(r"[a-z0-9][a-z0-9_-]{1,}", query.lower())
-        if token not in CONTEXT_QUERY_STOP_WORDS
+        "schema_version": 1,
+        "roots": sorted(root_refs),
+        "matched_entity_refs": sorted(matched_refs),
+        "nodes": nodes,
+        "edges": edges,
+        "contract_sources": sorted(contract_sources),
+        "generated_outputs": sorted(generated_outputs),
+        "semantic_gaps": sorted(semantic_gaps, key=lambda item: item["contract_ref"]),
+        "truncated": truncated,
+        "limits": {"nodes": CONTEXT_IMPACT_MAX_NODES, "edges": CONTEXT_IMPACT_MAX_EDGES},
     }
 
 
@@ -4679,6 +5253,7 @@ def _resolve_context_package(
     *,
     task: dict | None,
     state_file: Path,
+    analysis_root: Path | None = None,
     max_level: int | None = None,
     explain: bool = False,
 ) -> dict:
@@ -4687,6 +5262,7 @@ def _resolve_context_package(
     if not query:
         raise EngineError("context resolve requires a non-empty task description or --task")
     level = _context_requested_level(query, task, max_level)
+    analysis_root = (analysis_root or ROOT).resolve()
     tokens = _context_query_tokens(query)
     contexts = _load_contexts()
     selected_contexts: set[str] = set()
@@ -4794,6 +5370,26 @@ def _resolve_context_package(
             continue
         add_reference(str(payload.get("path") or ""), 2, "contract", f"task contract ref: {ref['relation']}:{ref['id']}@{ref['version']}")
 
+    contract_impact = (
+        _context_contract_impact_slice(tokens, task, state_file)
+        if level >= 2 else {
+            "schema_version": 1, "roots": [], "matched_entity_refs": [], "nodes": [], "edges": [],
+            "contract_sources": [], "generated_outputs": [], "semantic_gaps": [], "truncated": False,
+            "limits": {"nodes": CONTEXT_IMPACT_MAX_NODES, "edges": CONTEXT_IMPACT_MAX_EDGES},
+        }
+    )
+    for source in contract_impact["contract_sources"]:
+        add_reference(source, 2, "contract-impact-source", "contract entity or task reference selected by impact graph")
+    for output in contract_impact["generated_outputs"]:
+        add_reference(output, 2, "generated-contract-output", "generated boundary consumed by selected contract impact")
+    for root_ref in contract_impact["roots"]:
+        selection_trace.append({"kind": "contract-impact-root", "ref": root_ref, "reason": "task contract reference or query identity match"})
+    for entity_ref in contract_impact["matched_entity_refs"]:
+        selection_trace.append({"kind": "contract-impact-entity", "ref": entity_ref, "reason": "query token matches canonical contract entity"})
+    symbol_context = _context_symbol_slice(tokens, task, analysis_root, level, contract_impact["generated_outputs"])
+    for symbol in symbol_context["symbols"]:
+        selection_trace.append({"kind": "symbol", "ref": symbol["id"], "reason": "; ".join(symbol["selection"]["reasons"])})
+
     boundary_tokens = {"api", "contract", "endpoint", "event", "schema", "webhook"}
     if tokens & boundary_tokens and "api" in _load_truth_registry():
         resolution = _truth_resolution("api")
@@ -4850,6 +5446,8 @@ def _resolve_context_package(
             ),
         },
         "contracts": contract_refs,
+        "contract_impact": contract_impact,
+        "symbol_context": symbol_context,
         "metrics": {
             "references_selected": len(flat_entries),
             "existing_references": sum(1 for item in flat_entries if item["exists"]),
@@ -4858,6 +5456,11 @@ def _resolve_context_package(
             "estimated_tokens": estimated_tokens,
             "contexts_selected": len(selected_contexts) + len(upstream_contexts),
             "contexts_excluded": len(excluded_contexts),
+            "impact_entities": len(contract_impact["nodes"]),
+            "impact_relations": len(contract_impact["edges"]),
+            "generated_outputs": len(contract_impact["generated_outputs"]),
+            "symbols_selected": len(symbol_context["symbols"]),
+            "symbol_relations": len(symbol_context["edges"]),
         },
         "principle": "minimum-sufficient-context",
     }
@@ -4879,6 +5482,7 @@ def cmd_context_resolve(args: argparse.Namespace) -> dict:
         query,
         task=task,
         state_file=state_file,
+        analysis_root=ROOT,
         max_level=getattr(args, "level", None),
         explain=getattr(args, "explain", False),
     )
@@ -5672,8 +6276,187 @@ def _yaml_component_schemas(text: str) -> dict:
     return schemas
 
 
+def _resolve_local_contract_ref(document: dict, value: object) -> tuple[dict, str | None]:
+    """Resolve a local JSON pointer while preserving its identity in projections."""
+    if not isinstance(value, dict):
+        return {}, None
+    original_ref = value.get("$ref")
+    if not isinstance(original_ref, str) or not original_ref.startswith("#/"):
+        return value, original_ref if isinstance(original_ref, str) else None
+    current = value
+    seen = set()
+    while isinstance(current, dict) and isinstance(current.get("$ref"), str) and current["$ref"].startswith("#/"):
+        ref = current["$ref"]
+        if ref in seen:
+            return current, original_ref
+        seen.add(ref)
+        resolved: object = document
+        for token in ref[2:].split("/"):
+            token = token.replace("~1", "/").replace("~0", "~")
+            if not isinstance(resolved, dict) or token not in resolved:
+                return current, original_ref
+            resolved = resolved[token]
+        current = resolved if isinstance(resolved, dict) else {}
+    return current if isinstance(current, dict) else {}, original_ref
+
+
+def _normalize_schema_shape(schema: object) -> dict:
+    """Keep the deterministic schema subset used by semantic compatibility."""
+    if not isinstance(schema, dict):
+        return {}
+    result: dict = {}
+    scalar_keys = ("$ref", "type", "format", "nullable")
+    for key in scalar_keys:
+        if key in schema:
+            result["ref" if key == "$ref" else key] = schema[key]
+    if isinstance(schema.get("enum"), list):
+        result["enum"] = list(schema["enum"])
+    if isinstance(schema.get("required"), list):
+        result["required"] = sorted(str(item) for item in schema["required"])
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        result["properties"] = {
+            str(name): _normalize_schema_shape(value)
+            for name, value in sorted(properties.items())
+        }
+    if "items" in schema:
+        result["items"] = _normalize_schema_shape(schema.get("items"))
+    additional = schema.get("additionalProperties")
+    if isinstance(additional, bool):
+        result["additional_properties"] = additional
+    elif isinstance(additional, dict):
+        result["additional_properties"] = _normalize_schema_shape(additional)
+    for source_key, target_key in (("oneOf", "one_of"), ("anyOf", "any_of"), ("allOf", "all_of")):
+        if isinstance(schema.get(source_key), list):
+            result[target_key] = [_normalize_schema_shape(item) for item in schema[source_key]]
+    return result
+
+
+def _normalize_media_content(content: object) -> list[dict]:
+    if not isinstance(content, dict):
+        return []
+    return [
+        {"media_type": str(media_type), "schema": _normalize_schema_shape((entry or {}).get("schema"))}
+        for media_type, entry in sorted(content.items())
+        if isinstance(entry, dict)
+    ]
+
+
+def _normalize_security_requirements(value: object) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    alternatives = []
+    for requirement in value:
+        if not isinstance(requirement, dict):
+            continue
+        alternatives.append({
+            "schemes": [
+                {"name": str(name), "scopes": sorted(str(scope) for scope in (scopes or []))}
+                for name, scopes in sorted(requirement.items())
+                if isinstance(scopes, list)
+            ]
+        })
+    return alternatives
+
+
+def _normalize_security_schemes(document: dict) -> list[dict]:
+    result = []
+    schemes = ((document.get("components") or {}).get("securitySchemes") or {})
+    for name, raw in sorted(schemes.items()):
+        if not isinstance(raw, dict):
+            continue
+        scheme = {
+            "name": str(name),
+            "type": raw.get("type"),
+            "scheme": raw.get("scheme"),
+            "bearer_format": raw.get("bearerFormat"),
+            "location": raw.get("in"),
+            "parameter": raw.get("name"),
+            "open_id_connect_url": raw.get("openIdConnectUrl"),
+        }
+        flows = raw.get("flows") or {}
+        if isinstance(flows, dict):
+            scheme["flows"] = {
+                str(flow_name): {
+                    "authorization_url": (flow or {}).get("authorizationUrl"),
+                    "token_url": (flow or {}).get("tokenUrl"),
+                    "refresh_url": (flow or {}).get("refreshUrl"),
+                    "scopes": sorted(str(scope) for scope in ((flow or {}).get("scopes") or {})),
+                }
+                for flow_name, flow in sorted(flows.items())
+                if isinstance(flow, dict)
+            }
+        result.append(scheme)
+    return result
+
+
+def _response_category(status: str) -> str:
+    if status == "default":
+        return "default"
+    return {
+        "1": "informational", "2": "success", "3": "redirect",
+        "4": "client-error", "5": "server-error",
+    }.get(status[:1], "unknown")
+
+
+def _normalize_openapi_operation(document: dict, route: str, method: str, operation: dict) -> dict:
+    request = None
+    if "requestBody" in operation:
+        request_body, request_ref = _resolve_local_contract_ref(document, operation.get("requestBody"))
+        request = {
+            "ref": request_ref,
+            "required": bool(request_body.get("required")),
+            "content": _normalize_media_content(request_body.get("content")),
+        }
+    responses = []
+    for status, raw_response in sorted((operation.get("responses") or {}).items(), key=lambda item: str(item[0])):
+        response, response_ref = _resolve_local_contract_ref(document, raw_response)
+        status_text = str(status)
+        responses.append({
+            "status": status_text,
+            "category": _response_category(status_text),
+            "ref": response_ref,
+            "content": _normalize_media_content(response.get("content")),
+        })
+    security_source = operation["security"] if "security" in operation else document.get("security") or []
+    return {
+        "id": operation.get("operationId") or f"{method}:{route}",
+        "method": method.upper(),
+        "path": route,
+        "request": request,
+        "responses": responses,
+        "errors": [dict(item) for item in responses if item["category"] in {"client-error", "server-error", "default"}],
+        "auth": _normalize_security_requirements(security_source),
+    }
+
+
+def _normalize_asyncapi_messages(document: dict, holder: object, fallback_name: str) -> list[dict]:
+    if not isinstance(holder, dict):
+        return []
+    if "message" in holder:
+        raw_message = holder.get("message")
+        candidates = raw_message.get("oneOf") if isinstance(raw_message, dict) and isinstance(raw_message.get("oneOf"), list) else [raw_message]
+    elif isinstance(holder.get("messages"), list):
+        candidates = holder["messages"]
+    elif isinstance(holder.get("messages"), dict):
+        candidates = list(holder["messages"].values())
+    else:
+        return []
+    messages = []
+    for index, candidate in enumerate(candidates):
+        message, message_ref = _resolve_local_contract_ref(document, candidate)
+        ref_name = message_ref.rsplit("/", 1)[-1] if message_ref else None
+        messages.append({
+            "name": message.get("name") or message.get("title") or ref_name or (fallback_name if len(candidates) == 1 else f"{fallback_name}-{index + 1}"),
+            "ref": message_ref,
+            "content_type": message.get("contentType") or document.get("defaultContentType"),
+            "payload": _normalize_schema_shape(message.get("payload")),
+        })
+    return messages
+
+
 def _normalize_imported_contract(fmt: str, document: dict | None, text: str, source: Path) -> dict:
-    normalized = {"schema_version": 1, "source_format": fmt, "source": display_path(source), "source_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "definitions": [], "operations": [], "events": [], "models": []}
+    normalized = {"schema_version": NORMALIZED_CONTRACT_SCHEMA_VERSION, "source_format": fmt, "source": display_path(source), "source_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "semantic_coverage": [], "definitions": [], "operations": [], "events": [], "models": []}
     if fmt in {"openapi", "asyncapi"}:
         info = (document or {}).get("info") or {}
         normalized["name"] = info.get("title") or _schema_scalar(text, "title") or source.stem
@@ -5683,20 +6466,37 @@ def _normalize_imported_contract(fmt: str, document: dict | None, text: str, sou
             normalized["definitions"].append({"name": name, "fields": _json_schema_fields(schema if isinstance(schema, dict) else {})})
         if document:
             if fmt == "openapi":
+                normalized["semantic_coverage"] = sorted(SEMANTIC_COVERAGE_REQUIRED["openapi"])
+                normalized["security_schemes"] = _normalize_security_schemes(document)
                 for route, path_item in (document.get("paths") or {}).items():
                     if not isinstance(path_item, dict): continue
                     for method, operation in path_item.items():
                         if method.lower() not in {"get","post","put","patch","delete","options","head"}: continue
-                        normalized["operations"].append({"id": (operation or {}).get("operationId") or f"{method}:{route}", "method": method.upper(), "path": route})
+                        if not isinstance(operation, dict): operation = {}
+                        normalized["operations"].append(_normalize_openapi_operation(document, route, method, operation))
             else:
-                for channel, item in (document.get("channels") or {}).items():
-                    if not isinstance(item, dict): continue
-                    for direction in ("publish", "subscribe"):
-                        if direction in item:
-                            operation = item[direction] or {}
-                            normalized["events"].append({"id": operation.get("operationId") or f"{direction}:{channel}", "channel": channel, "direction": direction})
+                normalized["semantic_coverage"] = sorted(SEMANTIC_COVERAGE_REQUIRED["asyncapi"])
+                if isinstance(document.get("operations"), dict):
+                    for operation_name, raw_operation in sorted(document["operations"].items()):
+                        if not isinstance(raw_operation, dict):
+                            continue
+                        channel_value, channel_ref = _resolve_local_contract_ref(document, raw_operation.get("channel"))
+                        channel_name = channel_value.get("address") or (channel_ref.rsplit("/", 1)[-1] if channel_ref else operation_name)
+                        action = raw_operation.get("action")
+                        direction = {"send": "publish", "receive": "subscribe"}.get(action, action or "unspecified")
+                        normalized["events"].append({"id": operation_name, "channel": channel_name, "direction": direction, "messages": _normalize_asyncapi_messages(document, raw_operation, operation_name)})
+                else:
+                    for channel, item in (document.get("channels") or {}).items():
+                        if not isinstance(item, dict): continue
+                        for direction in ("publish", "subscribe"):
+                            if direction in item:
+                                operation = item[direction] or {}
+                                if not isinstance(operation, dict): operation = {}
+                                event_id = operation.get("operationId") or f"{direction}:{channel}"
+                                normalized["events"].append({"id": event_id, "channel": channel, "direction": direction, "messages": _normalize_asyncapi_messages(document, operation, event_id)})
         else:
             if fmt == "openapi":
+                normalized["semantic_coverage"] = ["operations", "schemas"]
                 current = None
                 for line in text.splitlines():
                     route = re.match(r"^\s{2}(/[^:]+):\s*$", line)
@@ -5704,9 +6504,11 @@ def _normalize_imported_contract(fmt: str, document: dict | None, text: str, sou
                     method = re.match(r"^\s{4}(get|post|put|patch|delete):\s*$", line, re.I)
                     if current and method: normalized["operations"].append({"id": f"{method.group(1).lower()}:{current}", "method": method.group(1).upper(), "path": current})
             else:
+                normalized["semantic_coverage"] = ["events"]
                 for match in re.finditer(r"(?m)^\s{2}([^\s:][^:]*):\s*$", text):
-                    normalized["events"].append({"id": f"channel:{match.group(1)}", "channel": match.group(1), "direction": "unspecified"})
+                    normalized["events"].append({"id": f"channel:{match.group(1)}", "channel": match.group(1), "direction": "unspecified", "messages": []})
     elif fmt == "protobuf":
+        normalized["semantic_coverage"] = sorted(SEMANTIC_COVERAGE_REQUIRED["protobuf"])
         normalized["name"] = re.search(r"(?m)^\s*package\s+([\w.]+)\s*;", text).group(1) if re.search(r"(?m)^\s*package\s+([\w.]+)\s*;", text) else source.stem
         normalized["source_version"] = None
         for match in re.finditer(r"(?ms)^\s*message\s+(\w+)\s*\{(.*?)^\s*\}", text):
@@ -5716,6 +6518,7 @@ def _normalize_imported_contract(fmt: str, document: dict | None, text: str, sou
             for rpc in re.finditer(r"rpc\s+(\w+)\s*\(([^)]+)\)\s*returns\s*\(([^)]+)\)", service.group(2)):
                 normalized["operations"].append({"id": f"{service.group(1)}.{rpc.group(1)}", "request": rpc.group(2).strip(), "response": rpc.group(3).strip()})
     else:
+        normalized["semantic_coverage"] = sorted(SEMANTIC_COVERAGE_REQUIRED["prisma"])
         normalized["name"] = source.stem; normalized["source_version"] = None
         for match in re.finditer(r"(?ms)^\s*(model|enum)\s+(\w+)\s*\{(.*?)^\s*\}", text):
             fields = []
@@ -5776,6 +6579,8 @@ def cmd_contract_import(args: argparse.Namespace) -> dict:
     if not source.is_file(): raise EngineError(f"schema source not found: {source}")
     document, text = _load_schema_source(source)
     fmt = _detect_contract_import_format(source, document, text, args.format)
+    if document is not None and fmt in {"openapi", "asyncapi"} and not isinstance(document.get(fmt), str):
+        raise EngineError(f"{fmt} import requires a top-level string '{fmt}' version marker")
     normalized = _normalize_imported_contract(fmt, document, text, source)
     contract_id = args.id or _contract_identifier(str(normalized.get("name") or source.stem))
     version_name = args.version or str(normalized.get("source_version") or "1.0.0")
@@ -5881,10 +6686,10 @@ def _transition_contract(registry: dict, contract_id: str, version_name: str, ac
             compatibility = _contract_compatibility_check(
                 contract_id, str(version["supersedes"]), version_name, registry
             )
-            # A manual contract has no normalized semantic representation. Its
-            # configured verifier remains the authority in that case; only
-            # block approval when the imported formats gave us a conclusive
-            # compatibility failure.
+            # Manual contracts and legacy/fallback imports may not have full
+            # semantic coverage. Their configured verifier remains the
+            # authority; only block approval on a conclusive compatibility
+            # failure.
             if compatibility["status"] == "fail":
                 failed = ", ".join(check["name"] for check in compatibility["checks"] if check["status"] == "fail")
                 raise EngineError(f"semantic contract compatibility failed: {failed}")
@@ -5935,8 +6740,20 @@ def _contract_impact_payload(contract_id: str, version: str) -> dict:
             relations = sorted(ref["relation"] for ref in task.get("contract_refs", []) if ref["id"] == contract_id and ref["version"] == version)
             if relations:
                 tasks.append({"workflow_id": state.get("workflow_id"), "task": task["id"], "status": task["status"], "context": task.get("context"), "relations": relations})
-    generated = sorted((payload.get("generated_output_hashes") or {}).keys())
-    return {"contract": contract_id, "version": version, "owner": contract.get("owner"), "kind": contract.get("kind"), "represents": contract.get("represents"), "status": payload.get("status"), "tasks": tasks, "generated_outputs": generated, "integration_verification": [task for task in tasks if "verifies" in task["relations"]]}
+    generated = [item["path"] for item in _contract_generated_output_records(payload)]
+    graph = _contract_impact_graph(contract_id, version, contract, payload, tasks)
+    entity_refs: dict[str, list[str]] = {}
+    for node in graph["nodes"]:
+        entity_refs.setdefault(node["type"], []).append(node["id"])
+    return {
+        "schema_version": 2,
+        "contract": contract_id, "version": version, "owner": contract.get("owner"),
+        "kind": contract.get("kind"), "represents": contract.get("represents"), "status": payload.get("status"),
+        "tasks": tasks, "generated_outputs": generated,
+        "integration_verification": [task for task in tasks if "verifies" in task["relations"]],
+        "entity_refs": dict(sorted(entity_refs.items())),
+        "graph": graph,
+    }
 
 
 def cmd_contract_impact(args: argparse.Namespace) -> dict:
@@ -6018,8 +6835,8 @@ def _imported_contract_payload(version: dict) -> tuple[dict | None, str | None]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None, "normalized imported contract is not valid JSON"
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
-        return None, "normalized imported contract must use schema_version 1"
+    if not isinstance(payload, dict) or payload.get("schema_version") not in {1, NORMALIZED_CONTRACT_SCHEMA_VERSION}:
+        return None, f"normalized imported contract must use schema_version 1 or {NORMALIZED_CONTRACT_SCHEMA_VERSION}"
     if payload.get("source_format") != fmt:
         return None, "normalized import format does not match registry metadata"
     return payload, None
@@ -6055,6 +6872,152 @@ def _contract_field_breaks(entity: str, previous: dict, current: dict) -> list[d
         if name not in old_fields and candidate.get("required"):
             findings.append({"kind": "required-field-added", "severity": "breaking", "entity": f"{entity}.{name}", "detail": "new required field was added"})
     return findings
+
+
+def _schema_shape_breaks(previous: object, current: object) -> bool:
+    """Return whether the current schema rejects a previously valid shape."""
+    old = previous if isinstance(previous, dict) else {}
+    new = current if isinstance(current, dict) else {}
+    if tuple(old.get(key) for key in ("ref", "type", "format")) != tuple(new.get(key) for key in ("ref", "type", "format")):
+        return True
+    old_enum, new_enum = old.get("enum"), new.get("enum")
+    if isinstance(old_enum, list) and old_enum and isinstance(new_enum, list) and not set(old_enum).issubset(set(new_enum)):
+        return True
+    old_required, new_required = set(old.get("required") or []), set(new.get("required") or [])
+    if not new_required.issubset(old_required):
+        return True
+    old_properties = old.get("properties") or {}
+    new_properties = new.get("properties") or {}
+    if isinstance(old_properties, dict) and isinstance(new_properties, dict):
+        for name, old_property in old_properties.items():
+            if name not in new_properties or _schema_shape_breaks(old_property, new_properties[name]):
+                return True
+    if "items" in old and ("items" not in new or _schema_shape_breaks(old.get("items"), new.get("items"))):
+        return True
+    if old.get("additional_properties") is True and new.get("additional_properties") is False:
+        return True
+    for key in ("one_of", "any_of", "all_of"):
+        if key in old and old.get(key) != new.get(key):
+            return True
+    return False
+
+
+def _media_content_index(value: object) -> dict[str, dict]:
+    return {
+        str(item.get("media_type")): item.get("schema") or {}
+        for item in (value if isinstance(value, list) else [])
+        if isinstance(item, dict) and item.get("media_type")
+    }
+
+
+def _security_alternative(item: object) -> dict[str, set[str]]:
+    if not isinstance(item, dict):
+        return {}
+    return {
+        str(scheme.get("name")): set(str(scope) for scope in (scheme.get("scopes") or []))
+        for scheme in item.get("schemes") or []
+        if isinstance(scheme, dict) and scheme.get("name")
+    }
+
+
+def _auth_requirement_tightened(previous: object, current: object) -> bool:
+    old = [_security_alternative(item) for item in (previous if isinstance(previous, list) else [])]
+    new = [_security_alternative(item) for item in (current if isinstance(current, list) else [])]
+    if not old:
+        return bool(new) and not any(not alternative for alternative in new)
+    if not new:
+        return False
+    for old_alternative in old:
+        satisfiable = False
+        for new_alternative in new:
+            if set(new_alternative).issubset(set(old_alternative)) and all(
+                new_alternative[name].issubset(old_alternative[name]) for name in new_alternative
+            ):
+                satisfiable = True
+                break
+        if not satisfiable:
+            return True
+    return False
+
+
+def _security_scheme_breaks(previous: dict, current: dict) -> bool:
+    keys = ("type", "scheme", "bearer_format", "location", "parameter", "open_id_connect_url")
+    if tuple(previous.get(item) for item in keys) != tuple(current.get(item) for item in keys):
+        return True
+    old_flows, new_flows = previous.get("flows") or {}, current.get("flows") or {}
+    if not isinstance(old_flows, dict) or not isinstance(new_flows, dict):
+        return old_flows != new_flows
+    for name, old_flow in old_flows.items():
+        new_flow = new_flows.get(name)
+        if not isinstance(old_flow, dict) or not isinstance(new_flow, dict):
+            return True
+        url_keys = ("authorization_url", "token_url", "refresh_url")
+        if tuple(old_flow.get(item) for item in url_keys) != tuple(new_flow.get(item) for item in url_keys):
+            return True
+        if not set(old_flow.get("scopes") or []).issubset(set(new_flow.get("scopes") or [])):
+            return True
+    return False
+
+
+def _operation_semantic_breaks(key: str, previous: dict, current: dict) -> list[dict]:
+    findings: list[dict] = []
+    old_request, new_request = previous.get("request"), current.get("request")
+    if not isinstance(old_request, dict) and isinstance(new_request, dict) and new_request.get("required"):
+        findings.append({"kind": "required-request-body-added", "severity": "breaking", "entity": key, "detail": "operation now requires a request body"})
+    elif isinstance(old_request, dict) and isinstance(new_request, dict):
+        if not old_request.get("required") and new_request.get("required"):
+            findings.append({"kind": "request-body-now-required", "severity": "breaking", "entity": key, "detail": "optional request body became required"})
+        old_content = _media_content_index(old_request.get("content"))
+        new_content = _media_content_index(new_request.get("content"))
+        for media_type in sorted(set(old_content) - set(new_content)):
+            findings.append({"kind": "request-media-type-removed", "severity": "breaking", "entity": f"{key} request {media_type}", "detail": "accepted request media type was removed"})
+        for media_type in sorted(set(old_content) & set(new_content)):
+            if _schema_shape_breaks(old_content[media_type], new_content[media_type]):
+                findings.append({"kind": "request-schema-changed", "severity": "breaking", "entity": f"{key} request {media_type}", "detail": "request schema became incompatible"})
+
+    old_responses = {str(item.get("status")): item for item in previous.get("responses") or [] if isinstance(item, dict) and item.get("status") is not None}
+    new_responses = {str(item.get("status")): item for item in current.get("responses") or [] if isinstance(item, dict) and item.get("status") is not None}
+    for status in sorted(set(old_responses) - set(new_responses)):
+        findings.append({"kind": "response-status-removed", "severity": "breaking", "entity": f"{key} response {status}", "detail": "documented response status was removed"})
+    for status in sorted(set(new_responses) - set(old_responses)):
+        if new_responses[status].get("category") in {"client-error", "server-error", "default"}:
+            findings.append({"kind": "error-status-added", "severity": "breaking", "entity": f"{key} response {status}", "detail": "operation added a documented error outcome"})
+    for status in sorted(set(old_responses) & set(new_responses)):
+        old_content = _media_content_index(old_responses[status].get("content"))
+        new_content = _media_content_index(new_responses[status].get("content"))
+        for media_type in sorted(set(old_content) - set(new_content)):
+            findings.append({"kind": "response-media-type-removed", "severity": "breaking", "entity": f"{key} response {status} {media_type}", "detail": "response media type was removed"})
+        for media_type in sorted(set(old_content) & set(new_content)):
+            if _schema_shape_breaks(old_content[media_type], new_content[media_type]):
+                category = old_responses[status].get("category")
+                kind = "error-schema-changed" if category in {"client-error", "server-error", "default"} else "response-schema-changed"
+                findings.append({"kind": kind, "severity": "breaking", "entity": f"{key} response {status} {media_type}", "detail": "response schema became incompatible"})
+    if _auth_requirement_tightened(previous.get("auth"), current.get("auth")):
+        findings.append({"kind": "auth-requirement-tightened", "severity": "breaking", "entity": key, "detail": "operation requires additional authentication schemes or scopes"})
+    return findings
+
+
+def _event_semantic_breaks(key: str, previous: dict, current: dict) -> list[dict]:
+    findings: list[dict] = []
+    old_messages = {str(item.get("name")): item for item in previous.get("messages") or [] if isinstance(item, dict) and item.get("name")}
+    new_messages = {str(item.get("name")): item for item in current.get("messages") or [] if isinstance(item, dict) and item.get("name")}
+    for name in sorted(set(old_messages) - set(new_messages)):
+        findings.append({"kind": "event-message-removed", "severity": "breaking", "entity": f"{key} message {name}", "detail": "event message was removed"})
+    for name in sorted(set(new_messages) - set(old_messages)):
+        findings.append({"kind": "event-message-added", "severity": "breaking", "entity": f"{key} message {name}", "detail": "event stream added a message variant consumers may not handle"})
+    for name in sorted(set(old_messages) & set(new_messages)):
+        old_message, new_message = old_messages[name], new_messages[name]
+        if old_message.get("content_type") != new_message.get("content_type"):
+            findings.append({"kind": "event-content-type-changed", "severity": "breaking", "entity": f"{key} message {name}", "detail": "event content type changed"})
+        if _schema_shape_breaks(old_message.get("payload"), new_message.get("payload")):
+            findings.append({"kind": "event-payload-changed", "severity": "breaking", "entity": f"{key} message {name}", "detail": "event payload became incompatible"})
+    return findings
+
+
+def _semantic_coverage(payload: dict) -> tuple[set[str], set[str]]:
+    actual = set(str(item) for item in (payload.get("semantic_coverage") or []))
+    required = SEMANTIC_COVERAGE_REQUIRED.get(str(payload.get("source_format")), set())
+    return actual, required - actual
 
 
 def _contract_semantic_diff(
@@ -6102,6 +7065,13 @@ def _contract_semantic_diff(
     new_operations = {operation_key(item): item for item in new_payload.get("operations") or [] if isinstance(item, dict)}
     for key in sorted(set(old_operations) - set(new_operations)):
         findings.append({"kind": "operation-removed", "severity": "breaking", "entity": key, "detail": "operation was removed"})
+    for key in sorted(set(old_operations) & set(new_operations)):
+        if old_format == "openapi" and new_format == "openapi":
+            findings.extend(_operation_semantic_breaks(key, old_operations[key], new_operations[key]))
+        elif old_format == "protobuf" and new_format == "protobuf":
+            for field in ("request", "response"):
+                if old_operations[key].get(field) != new_operations[key].get(field):
+                    findings.append({"kind": f"operation-{field}-changed", "severity": "breaking", "entity": key, "detail": f"RPC {field} type changed"})
 
     def event_key(item: dict) -> str:
         return f"{item.get('direction', '')}:{item.get('channel', '')}"
@@ -6110,17 +7080,39 @@ def _contract_semantic_diff(
     new_events = {event_key(item): item for item in new_payload.get("events") or [] if isinstance(item, dict)}
     for key in sorted(set(old_events) - set(new_events)):
         findings.append({"kind": "event-removed", "severity": "breaking", "entity": key, "detail": "event channel/direction was removed"})
+    for key in sorted(set(old_events) & set(new_events)):
+        if old_format == "asyncapi" and new_format == "asyncapi":
+            findings.extend(_event_semantic_breaks(key, old_events[key], new_events[key]))
+
+    old_schemes = _indexed_contract_items(old_payload, "security_schemes")
+    new_schemes = _indexed_contract_items(new_payload, "security_schemes")
+    for name in sorted(set(old_schemes) - set(new_schemes)):
+        findings.append({"kind": "auth-scheme-removed", "severity": "breaking", "entity": name, "detail": "security scheme was removed"})
+    for name in sorted(set(old_schemes) & set(new_schemes)):
+        if _security_scheme_breaks(old_schemes[name], new_schemes[name]):
+            findings.append({"kind": "auth-scheme-changed", "severity": "breaking", "entity": name, "detail": "security scheme definition changed"})
 
     findings.sort(key=lambda item: (item["kind"], item["entity"], item["detail"]))
+    old_coverage, old_missing = _semantic_coverage(old_payload)
+    new_coverage, new_missing = _semantic_coverage(new_payload)
+    complete = not old_missing and not new_missing
     return {
         "schema_version": 1,
         "contract": contract_id,
         "from_version": from_version,
         "to_version": to_version,
         "applicable": True,
+        "complete": complete,
         "source_format": old_format,
         "breaking": bool(findings),
         "findings": findings,
+        "coverage": {
+            "previous": sorted(old_coverage),
+            "current": sorted(new_coverage),
+            "missing_previous": sorted(old_missing),
+            "missing_current": sorted(new_missing),
+        },
+        "warnings": [] if complete else ["semantic coverage is incomplete; compatibility cannot be asserted"],
         "summary": {
             "breaking_findings": len(findings),
             "previous_source_hash": old_payload.get("source_hash"),
@@ -6144,6 +7136,14 @@ def _contract_compatibility_check(
             "status": "inconclusive",
             "passed": False,
             "checks": [{"name": "semantic-diff", "status": "inconclusive", "detail": diff["reason"]}],
+        }
+    if not diff.get("complete", False):
+        missing = sorted(set(diff["coverage"]["missing_previous"] + diff["coverage"]["missing_current"]))
+        return {
+            **diff,
+            "status": "inconclusive",
+            "passed": False,
+            "checks": [{"name": "semantic-coverage", "status": "inconclusive", "detail": f"missing coverage: {', '.join(missing)}"}],
         }
     checks: list[dict] = [{"name": "semantic-diff", "status": "pass", "detail": "breaking changes detected" if diff["breaking"] else "no supported breaking changes detected"}]
     if diff["breaking"]:
@@ -6760,6 +7760,8 @@ def cmd_analyze(args: argparse.Namespace) -> dict:
 # only the handful of top-level contexts a project happens to have
 # registered. It never writes to contexts.yaml or any source file.
 ARCHITECTURE_DISCOVERY_SCHEMA_VERSION = 1
+SEMANTIC_INDEX_SCHEMA_VERSION = 1
+SEMANTIC_INDEX_MAX_DIAGNOSTICS = 200
 
 # Directory names a discovery scan never descends into: build output,
 # dependency caches, VCS metadata, and other conventionally-generated or
@@ -6773,6 +7775,200 @@ DISCOVERY_IGNORE_DIRS = {
 DISCOVERY_SOURCE_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py"}
 DISCOVERY_TS_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
 REACT_FEATURE_BUCKETS = ("pages", "components", "features", "services", "contexts")
+
+
+def _semantic_source_files(root: Path) -> list[Path]:
+    """Return the deterministic, hand-authored source scan set for *root*."""
+    configured = configured_source_dirs()
+    source_roots = [root / item for item in configured] if configured else [root]
+    files: list[Path] = []
+    for source_root in source_roots:
+        if not source_root.is_dir():
+            continue
+        for path in source_root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in DISCOVERY_SOURCE_EXTENSIONS:
+                continue
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                continue
+            if not _discovery_is_ignored(relative.parent, _discovery_gitignore_patterns()):
+                files.append(path)
+    return sorted(set(files), key=lambda item: item.relative_to(root).as_posix())
+
+
+def _semantic_file_lookup(root: Path, files: list[Path]) -> dict[str, str]:
+    """Map language-neutral module candidates to their project-relative file."""
+    lookup: dict[str, str] = {}
+    for path in files:
+        relative = path.relative_to(root).as_posix()
+        stem = relative[: -len(path.suffix)]
+        lookup.setdefault(stem, relative)
+        if stem.endswith("/__init__") or stem.endswith("/index"):
+            lookup.setdefault(stem.rsplit("/", 1)[0], relative)
+    return lookup
+
+
+def _semantic_symbol_id(language: str, path: str, kind: str, qualified_name: str, signature: str = "") -> str:
+    """Stable across line moves: position is provenance, never identity."""
+    from urllib.parse import quote
+    digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12] if signature else ""
+    suffix = f":{digest}" if digest else ""
+    return f"symbol:{language}:{quote(path, safe='/._-~')}#{kind}:{quote(qualified_name, safe='._-~')}{suffix}"
+
+
+def _semantic_range(node: ast.AST) -> dict[str, int | None]:
+    return {
+        "start_line": getattr(node, "lineno", None), "start_column": getattr(node, "col_offset", None),
+        "end_line": getattr(node, "end_lineno", None), "end_column": getattr(node, "end_col_offset", None),
+    }
+
+
+def _semantic_python_import_target(path: Path, module: str, level: int, root: Path, lookup: dict[str, str]) -> tuple[str | None, str]:
+    """Resolve only unambiguous Python modules inside the configured project."""
+    if level:
+        base = path.parent
+        for _ in range(max(0, level - 1)):
+            base = base.parent
+        try:
+            candidate = (base / module.replace(".", "/")).relative_to(root).as_posix() if module else base.relative_to(root).as_posix()
+        except ValueError:
+            return None, "unresolved"
+        target = lookup.get(candidate) or lookup.get(candidate + "/__init__")
+        return (target, "exact") if target else (None, "unresolved")
+    if not module:
+        return None, "unresolved"
+    candidate = module.replace(".", "/")
+    target = lookup.get(candidate)
+    return (target, "configured-root") if target else (None, "external-or-unresolved")
+
+
+def _semantic_python_file(path: Path, root: Path, lookup: dict[str, str]) -> dict:
+    relative = path.relative_to(root).as_posix()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    result = {"path": relative, "language": "python", "content_hash": content_hash, "symbols": [], "imports": [], "diagnostics": []}
+    try:
+        tree = ast.parse(text, filename=relative, type_comments=True)
+    except (SyntaxError, ValueError, RecursionError) as exc:
+        result["diagnostics"].append({"kind": "parse-error", "path": relative, "language": "python", "detail": str(exc)})
+        return result
+
+    def visit(body: list[ast.stmt], prefix: str = "") -> None:
+        for node in body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                kind = "class" if isinstance(node, ast.ClassDef) else "async-function" if isinstance(node, ast.AsyncFunctionDef) else "function"
+                qualified = f"{prefix}.{node.name}" if prefix else node.name
+                signature = ast.dump(node.args, annotate_fields=False, include_attributes=False) if hasattr(node, "args") else ""
+                result["symbols"].append({
+                    "id": _semantic_symbol_id("python", relative, kind, qualified, signature), "language": "python", "kind": kind,
+                    "name": node.name, "qualified_name": qualified, "path": relative, "range": _semantic_range(node),
+                    "public": not node.name.startswith("_"), "signature_hash": hashlib.sha256(signature.encode("utf-8")).hexdigest() if signature else None,
+                    "decorators": [ast.unparse(item) for item in getattr(node, "decorator_list", [])],
+                    "bases": [ast.unparse(item) for item in getattr(node, "bases", [])] if isinstance(node, ast.ClassDef) else [],
+                })
+                if isinstance(node, ast.ClassDef):
+                    visit(node.body, qualified)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    target, resolution = _semantic_python_import_target(path, alias.name, 0, root, lookup)
+                    result["imports"].append({"specifier": alias.name, "to": target, "kind": "runtime-import", "resolution": resolution, "names": [alias.name], "range": _semantic_range(node)})
+            elif isinstance(node, ast.ImportFrom):
+                target, resolution = _semantic_python_import_target(path, node.module or "", node.level or 0, root, lookup)
+                result["imports"].append({"specifier": "." * (node.level or 0) + (node.module or ""), "to": target, "kind": "runtime-import", "resolution": resolution, "names": [alias.name for alias in node.names], "range": _semantic_range(node)})
+
+    visit(tree.body)
+    return result
+
+
+def _typescript_adapter_path() -> Path:
+    return ROOT / ".ai" / "engine" / "adapters" / "typescript-semantic.mjs"
+
+
+def _semantic_typescript_fallback(root: Path, files: list[Path], lookup: dict[str, str], diagnostic: dict) -> dict:
+    """Compatibility-only lexical discovery. Never sufficient for AST fitness."""
+    payloads = []
+    for path in files:
+        if path.suffix.lower() not in DISCOVERY_TS_EXTENSIONS:
+            continue
+        relative = path.relative_to(root).as_posix()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        imports = []
+        for spec in _extract_ts_relative_imports(path):
+            try:
+                candidate = (path.parent / spec).resolve().relative_to(root).as_posix()
+            except ValueError:
+                continue
+            # Discovery may still map a conventionally named import to its
+            # enclosing feature module even when the exact leaf file is not
+            # present in a fixture/partially generated tree. This lexical
+            # compatibility edge remains inferred and schema-v2 fitness never
+            # uses it as authoritative AST evidence.
+            target = lookup.get(candidate) or candidate
+            imports.append({"specifier": spec, "to": target, "kind": "lexical-import", "resolution": "fallback" if target else "unresolved", "names": [], "range": None})
+        payloads.append({"path": relative, "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "parse_status": "unavailable", "symbols": [], "imports": imports, "diagnostics": [diagnostic]})
+    return {"status": "unavailable", "adapter": {"id": "typescript-compiler", "version": 1}, "files": payloads, "diagnostics": [diagnostic]}
+
+
+def _semantic_typescript_files(root: Path, files: list[Path], lookup: dict[str, str]) -> dict:
+    targets = [path.relative_to(root).as_posix() for path in files if path.suffix.lower() in DISCOVERY_TS_EXTENSIONS]
+    if not targets:
+        return {"status": "not-applicable", "adapter": {"id": "typescript-compiler", "version": 1}, "files": [], "diagnostics": []}
+    adapter = _typescript_adapter_path()
+    if not adapter.is_file() or not shutil.which("node"):
+        diagnostic = {"kind": "adapter-unavailable", "language": "typescript", "detail": "Node.js or the TypeScript semantic adapter is unavailable"}
+        return _semantic_typescript_fallback(root, files, lookup, diagnostic)
+    request = {"schema_version": 1, "root": str(root.resolve()), "files": targets}
+    run = subprocess.run(["node", str(adapter)], input=json.dumps(request), text=True, capture_output=True, cwd=str(root))
+    try:
+        payload = json.loads(run.stdout) if run.stdout.strip() else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if run.returncode != 0 or not isinstance(payload, dict):
+        diagnostic = {"kind": "adapter-failed", "language": "typescript", "detail": (run.stderr or "invalid adapter output")[-500:]}
+        return _semantic_typescript_fallback(root, files, lookup, diagnostic)
+    if payload.get("status") == "unavailable":
+        diagnostic = next((item for item in payload.get("diagnostics", []) if isinstance(item, dict)), {"kind": "adapter-unavailable", "language": "typescript", "detail": "TypeScript Compiler API unavailable"})
+        return _semantic_typescript_fallback(root, files, lookup, diagnostic)
+    payload.setdefault("adapter", {"id": "typescript-compiler", "version": 1})
+    payload.setdefault("files", []); payload.setdefault("diagnostics", [])
+    return payload
+
+
+def _semantic_index(root: Path) -> dict:
+    """Build one in-memory deterministic source model for all consumers.
+
+    It is deliberately not an artifact and is never lifecycle authority.
+    """
+    root = root.resolve()
+    files = _semantic_source_files(root)
+    lookup = _semantic_file_lookup(root, files)
+    python_payloads = [_semantic_python_file(path, root, lookup) for path in files if path.suffix.lower() == ".py"]
+    ts_payload = _semantic_typescript_files(root, files, lookup)
+    file_items: list[dict] = []
+    symbols: list[dict] = []
+    edges: list[dict] = []
+    diagnostics: list[dict] = []
+    adapters = [{"id": "python-stdlib-ast", "version": 1, "status": "pass"}]
+    for payload in python_payloads:
+        file_items.append({"path": payload["path"], "language": "python", "content_hash": payload["content_hash"], "parse_status": "fail" if payload["diagnostics"] else "pass"})
+        symbols.extend(payload["symbols"]); diagnostics.extend(payload["diagnostics"])
+        for item in payload["imports"]:
+            edges.append({"from": payload["path"], **item, "language": "python"})
+    adapters.append({**ts_payload.get("adapter", {"id": "typescript-compiler", "version": 1}), "status": ts_payload.get("status", "unavailable")})
+    for payload in ts_payload.get("files", []):
+        if not isinstance(payload, dict) or not payload.get("path"):
+            continue
+        file_items.append({"path": payload["path"], "language": "typescript", "content_hash": payload.get("content_hash"), "parse_status": payload.get("parse_status", "pass")})
+        symbols.extend(payload.get("symbols") or [])
+        for item in payload.get("imports") or []:
+            edges.append({"from": payload["path"], **item, "language": "typescript"})
+        diagnostics.extend(payload.get("diagnostics") or [])
+    diagnostics.extend(ts_payload.get("diagnostics") or [])
+    file_items.sort(key=lambda item: item["path"]); symbols.sort(key=lambda item: item["id"])
+    edges = sorted({json.dumps(item, sort_keys=True, separators=(",", ":")): item for item in edges}.values(), key=lambda item: (item["from"], str(item.get("to")), item.get("specifier", "")))
+    fingerprint_source = {"files": [(item["path"], item.get("content_hash")) for item in file_items], "adapters": adapters, "schema_version": SEMANTIC_INDEX_SCHEMA_VERSION}
+    return {"schema_version": SEMANTIC_INDEX_SCHEMA_VERSION, "root": str(root), "source_fingerprint": hashlib.sha256(json.dumps(fingerprint_source, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(), "adapters": adapters, "files": file_items, "symbols": symbols, "edges": edges, "diagnostics": sorted(diagnostics, key=lambda item: (item.get("path", ""), item.get("kind", ""), item.get("detail", "")))[:SEMANTIC_INDEX_MAX_DIAGNOSTICS]}
 
 
 def _discovery_gitignore_patterns() -> list[str]:
@@ -7004,39 +8200,36 @@ def _resolve_python_dependency(
     return None, 0.0
 
 
-def _discover_dependencies(modules: list[dict], source_roots: list[Path]) -> list[dict]:
-    """Best-effort internal dependency edges from relative TS/JS imports and
-    Python imports (relative, or absolute-but-resolving-inside a configured
-    source root). An import that cannot be resolved to a discovered/declared
-    module path -- an external package, a stdlib module, an unresolvable
-    absolute import -- is silently dropped rather than guessed at, per the
-    'do not invent relationships' requirement."""
+def _discover_dependencies(modules: list[dict], source_roots: list[Path]) -> tuple[list[dict], list[dict]]:
+    """Aggregate the shared semantic index into module dependency edges."""
     path_to_name = {module["path"]: module["name"] for module in modules}
     edges: dict[tuple[str, str], dict] = {}
 
-    def _record(source_name: str, target: str | None, confidence: float) -> None:
-        if not target or target == source_name or confidence <= 0:
+    def _record(source_name: str | None, target_name: str | None, edge: dict) -> None:
+        confidence = 1.0 if edge.get("resolution") == "exact" else 0.8
+        classification = "observed" if edge.get("resolution") == "exact" else "inferred"
+        if not source_name or not target_name or target_name == source_name:
             return
-        key = (source_name, target)
+        key = (source_name, target_name)
         if key not in edges or confidence > edges[key]["confidence"]:
-            edges[key] = {"from": source_name, "to": target, "kind": "source-import", "confidence": confidence}
+            edges[key] = {
+                "from": source_name, "to": target_name, "kind": "source-import", "confidence": confidence,
+                "classification": classification, "source_file": edge["from"], "target_file": edge["to"],
+                "source_range": edge.get("range"), "import_kind": edge.get("kind"),
+            }
 
-    for module in modules:
-        module_dir = ROOT / module["path"]
-        if not module_dir.is_dir():
+    index = _semantic_index(ROOT)
+    for edge in index["edges"]:
+        if not edge.get("to") or edge.get("resolution") not in {"exact", "configured-root", "fallback"}:
             continue
-        for file_path in module_dir.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if file_path.suffix in DISCOVERY_TS_EXTENSIONS:
-                for spec in _extract_ts_relative_imports(file_path):
-                    target, confidence = _resolve_ts_dependency(file_path, spec, path_to_name)
-                    _record(module["name"], target, confidence)
-            elif file_path.suffix == ".py":
-                for spec, level in _extract_python_imports(file_path):
-                    target, confidence = _resolve_python_dependency(file_path, spec, level, source_roots, path_to_name)
-                    _record(module["name"], target, confidence)
-    return sorted(edges.values(), key=lambda edge: (edge["from"], edge["to"]))
+        source_name = _discovery_owning_module(Path(str(edge["from"])), path_to_name)
+        target_name = _discovery_owning_module(Path(str(edge["to"])), path_to_name)
+        _record(source_name, target_name, edge)
+    warnings = [
+        {"kind": item.get("kind", "semantic-diagnostic"), "detail": item.get("detail", "semantic analysis unavailable"), "path": item.get("path")}
+        for item in index["diagnostics"]
+    ]
+    return sorted(edges.values(), key=lambda edge: (edge["from"], edge["to"])), warnings
 
 
 def _map_task_to_module(task: dict, modules: dict[str, dict]) -> str | None:
@@ -7130,7 +8323,8 @@ def _build_discovered_architecture() -> dict:
         }
 
     discovered_only = [m for m in modules_out.values() if m["source"] == "discovered"]
-    edges = _discover_dependencies(discovered_only, source_roots)
+    edges, semantic_warnings = _discover_dependencies(discovered_only, source_roots)
+    warnings.extend(semantic_warnings)
     for edge in edges:
         if edge["to"] not in modules_out:
             warnings.append({"kind": "dangling_dependency", "detail": f"discovered dependency from '{edge['from']}' to unresolved module '{edge['to']}'"})
@@ -7183,8 +8377,12 @@ def cmd_architecture_discover(args: argparse.Namespace) -> dict:
 
 def _architecture_fitness_config() -> dict:
     config = _load_json_config("architecture-fitness.json", {"schema_version": 1, "rules": [], "commands": []})
-    if config.get("schema_version") != 1 or not isinstance(config.get("rules"), list) or not isinstance(config.get("commands"), list):
-        raise EngineError("architecture-fitness.json must use schema_version 1 with rules/commands arrays")
+    if config.get("schema_version") not in {1, 2} or not isinstance(config.get("rules"), list) or not isinstance(config.get("commands"), list):
+        raise EngineError("architecture-fitness.json must use schema_version 1 or 2 with rules/commands arrays")
+    analysis = config.get("analysis") or {}
+    if not isinstance(analysis, dict):
+        raise EngineError("architecture-fitness.json analysis must be an object")
+    config["analysis"] = {"require_ast": bool(analysis.get("require_ast", config.get("schema_version") == 2))}
     for rule in config["rules"]:
         if not isinstance(rule, dict) or not str(rule.get("id") or "").strip():
             raise EngineError("every architecture fitness rule requires an id")
@@ -7215,65 +8413,44 @@ def _architecture_source_files(root: Path) -> list[Path]:
     return sorted(set(files))
 
 
-def _architecture_import_edges(root: Path) -> list[dict]:
-    files = _architecture_source_files(root)
-    lookup: dict[str, str] = {}
-    for path in files:
-        relative = path.relative_to(root).as_posix()
-        stem = relative[: -len(path.suffix)]
-        lookup[stem] = relative
-        if stem.endswith("/__init__") or stem.endswith("/index"):
-            lookup[stem.rsplit("/", 1)[0]] = relative
+def _architecture_import_edges(root: Path) -> tuple[list[dict], dict]:
+    """Exact internal file edges from the shared AST/Compiler semantic index."""
+    index = _semantic_index(root)
     edges = []
-    for path in files:
-        relative = path.relative_to(root).as_posix()
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        specs = []
-        if path.suffix.lower() == ".py":
-            specs.extend(match.group(1) for match in re.finditer(r"(?m)^\s*from\s+([.\w]+)\s+import\s+", text))
-            specs.extend(match.group(1) for match in re.finditer(r"(?m)^\s*import\s+([\w.]+)", text))
-        else:
-            for match in re.finditer(r"(?:from\s*|import\s*)['\"]([^'\"]+)['\"]|require\(\s*['\"]([^'\"]+)['\"]\s*\)", text):
-                specs.append(match.group(1) or match.group(2))
-        for spec in specs:
-            if path.suffix.lower() == ".py":
-                leading = len(spec) - len(spec.lstrip(".")); module = spec.lstrip(".").replace(".", "/")
-                base = path.parent
-                for _ in range(max(0, leading - 1)):
-                    base = base.parent
-                try:
-                    candidate = ((base / module).relative_to(root).as_posix() if leading else module)
-                except ValueError:
-                    continue
-            elif spec.startswith("."):
-                try:
-                    candidate = os.path.normpath((path.parent / spec).relative_to(root)).replace("\\", "/")
-                except ValueError:
-                    continue
-            else:
-                candidate = spec
-            target = lookup.get(candidate) or next((value for key, value in lookup.items() if key.endswith("/" + candidate)), None)
-            if target and target != relative:
-                edges.append({"from": relative, "to": target, "import": spec})
-    unique = {(edge["from"], edge["to"], edge["import"]): edge for edge in edges}
-    return [unique[key] for key in sorted(unique)]
+    for edge in index["edges"]:
+        if edge.get("to") and edge.get("resolution") in {"exact", "configured-root", "fallback"} and edge["from"] != edge["to"]:
+            edges.append({"from": edge["from"], "to": edge["to"], "import": edge.get("specifier"), "kind": edge.get("kind"), "resolution": edge.get("resolution"), "range": edge.get("range"), "language": edge.get("language")})
+    unique = {(edge["from"], edge["to"], edge.get("import"), edge.get("kind")): edge for edge in edges}
+    return [unique[key] for key in sorted(unique)], index
 
 
 def _architecture_fitness(root: Path) -> dict:
     config = _architecture_fitness_config()
     if not config["rules"] and not config["commands"]:
         return {"schema_version": 1, "passed": True, "not_applicable": True, "files_scanned": 0, "dependency_edges": 0, "checks": []}
-    edges = _architecture_import_edges(root)
+    edges, index = _architecture_import_edges(root)
     checks = []
     for rule in config["rules"]:
-        violations = [edge for edge in edges if any(fnmatch.fnmatch(edge["from"], pattern) for pattern in rule["from"]) and any(fnmatch.fnmatch(edge["to"], pattern) for pattern in rule["to"])]
-        checks.append({"name": f"fitness:{rule['id']}", "rule_id": rule["id"], "status": "fail" if violations else "pass", "message": rule.get("message"), "violations": violations})
+        rule_edges = [edge for edge in edges if not config["analysis"]["require_ast"] or edge.get("resolution") != "fallback"]
+        violations = [edge for edge in rule_edges if any(fnmatch.fnmatch(edge["from"], pattern) for pattern in rule["from"]) and any(fnmatch.fnmatch(edge["to"], pattern) for pattern in rule["to"])]
+        unavailable_languages = {
+            item.get("language") for item in index.get("diagnostics", [])
+            if item.get("kind") in {"adapter-unavailable", "adapter-failed", "parse-error"}
+        }
+        covered_languages = {
+            item.get("language") for item in index.get("files", [])
+            if any(fnmatch.fnmatch(item["path"], pattern) for pattern in rule["from"])
+        }
+        inconclusive = bool(config["analysis"]["require_ast"] and unavailable_languages.intersection(covered_languages))
+        status = "fail" if violations else "inconclusive" if inconclusive else "pass"
+        checks.append({"name": f"fitness:{rule['id']}", "rule_id": rule["id"], "status": status, "message": rule.get("message"), "violations": violations, "diagnostics": [item for item in index.get("diagnostics", []) if item.get("language") in unavailable_languages] if inconclusive else []})
     for command in config["commands"]:
         if not isinstance(command, dict) or not str(command.get("command") or "").strip():
             raise EngineError("architecture fitness commands require name and command")
         run = _run_captured(str(command["command"]), shell=True, cwd=root)
         checks.append({"name": f"fitness-command:{command.get('name') or 'unnamed'}", "command": command["command"], "status": "pass" if run.returncode == 0 else "fail", "exit_code": run.returncode, "stderr": run.stderr[-500:]})
-    return {"schema_version": 1, "passed": all(check["status"] == "pass" for check in checks), "not_applicable": not checks, "files_scanned": len(_architecture_source_files(root)), "dependency_edges": len(edges), "checks": checks}
+    inconclusive = any(check["status"] == "inconclusive" for check in checks)
+    return {"schema_version": 2, "passed": all(check["status"] == "pass" for check in checks), "inconclusive": inconclusive, "not_applicable": not checks, "files_scanned": len(index["files"]), "dependency_edges": len(edges), "semantic_index": {"schema_version": index["schema_version"], "source_fingerprint": index["source_fingerprint"], "adapters": index["adapters"], "diagnostics": index["diagnostics"]}, "checks": checks}
 
 
 def cmd_architecture_fitness(args: argparse.Namespace) -> dict:
@@ -8630,13 +9807,15 @@ def cmd_verify(args: argparse.Namespace) -> dict:
     fitness = _architecture_fitness(run_root)
     report["checks"].append({
         "name": "architecture-fitness",
-        "status": "skipped" if fitness.get("not_applicable") else "pass" if fitness.get("passed") else "fail",
+        "status": "skipped" if fitness.get("not_applicable") else "pass" if fitness.get("passed") else "inconclusive" if fitness.get("inconclusive") else "fail",
         "files_scanned": fitness.get("files_scanned"),
         "dependency_edges": fitness.get("dependency_edges"),
         "checks": fitness.get("checks", []),
     })
     if not fitness.get("passed"):
         report["passed"] = False
+    if fitness.get("inconclusive"):
+        report["inconclusive"] = True
     verdict = "PASS" if report["passed"] else ("INCONCLUSIVE" if report.get("inconclusive") else "FAIL")
     report["workdir"] = str(run_root)
     print(f"Verification {verdict}. Use 'ai-kit qa run {task['id']}' for authoritative QA.", file=sys.stderr)

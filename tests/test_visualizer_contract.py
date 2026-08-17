@@ -168,8 +168,12 @@ class VisualizerPayloadKeysTests(unittest.TestCase):
                 self.assertIn(f'data-view="{view}"', markup)
                 self.assertIn(f'id="view{view.title()}"', markup)
             self.assertIn('id="contractGraph"', markup)
+            for element in ("contractFilter", "contractEntityFilter", "contractRelationFilter", "contractImpactInspector"):
+                self.assertIn(f'id="{element}"', markup)
         app = (REPO_ROOT / ".visualizer" / "app.js").read_text(encoding="utf-8")
         self.assertIn("contract-lifecycle", app)
+        for token in ("contractsData.impact_graph", "contract-impact-node", "contractRelationFilterVal", "selectedContractEntity"):
+            self.assertIn(token, app)
         for relation in ("producer/consumer/verifier", "edge.relation"):
             self.assertIn(relation, app)
 

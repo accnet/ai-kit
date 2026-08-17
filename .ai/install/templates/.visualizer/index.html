@@ -155,9 +155,15 @@
 
       <div class="view-panel" id="viewContracts">
         <div class="view-h" style="color:var(--purple);">Contract Spine</div>
-        <div class="view-sub">Contract versions and observed task relations from the canonical projection.</div>
+        <div class="view-sub">Canonical contract lifecycle and impact down to operation, schema, field, event payload, and generated output.</div>
         <div id="contractSummary" class="project-grid"></div>
-        <div id="contractGraph" class="contract-graph" aria-label="Contract producer consumer verifier graph"></div>
+        <div class="contract-impact-toolbar" id="contractImpactToolbar">
+          <label>Contract<select id="contractFilter"><option value="all">All contracts</option></select></label>
+          <label>Entity<select id="contractEntityFilter"><option value="all">All entities</option></select></label>
+          <label>Relation<select id="contractRelationFilter"><option value="all">All relations</option></select></label>
+        </div>
+        <div id="contractGraph" class="contract-graph" aria-label="Contract operation schema field and generated output impact graph"></div>
+        <div id="contractImpactInspector" class="contract-impact-inspector"><div class="view-sub">Select an impact node to inspect canonical attributes and relations.</div></div>
         <table class="dt" id="contractTable">
           <thead><tr><th>Contract</th><th>Kind</th><th>Owner</th><th>Status</th><th>Represents</th><th>Task relations</th></tr></thead>
           <tbody id="contractBody"></tbody>

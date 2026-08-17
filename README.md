@@ -42,6 +42,7 @@ python .ai/engine/ai_kit.py contract import contracts/openapi.yaml --owner archi
 python .ai/engine/ai_kit.py contract codegen order-api 1.0.0 --output src/generated/contracts --language typescript
 python .ai/engine/ai_kit.py contract diff order-api 1.0.0 2.0.0
 python .ai/engine/ai_kit.py contract check order-api 1.0.0 2.0.0
+python .ai/engine/ai_kit.py contract impact order-api 1.0.0
 ```
 
 OpenAPI, AsyncAPI, Protobuf, and Prisma sources are normalized into immutable
@@ -49,12 +50,24 @@ AI-Kit contract versions. Generated outputs are hashed into the contract
 registry, so `contract verify` and authoritative QA detect drift.
 
 `contract diff` and `contract check` add deterministic compatibility evidence
-for versions created by `contract import`: they detect removed operations,
-schemas/fields, optional-to-required changes, type/reference changes, and enum
-narrowing. A breaking diff requires an explicit `breaking` declaration,
-`supersedes` link, and major version bump. Manually registered formats return
-an explicit **inconclusive** result rather than a false semantic verdict; use a
-configured external verifier for those formats.
+for versions created by `contract import`. Normalized contract schema v2 binds
+OpenAPI operations to request bodies/media types, responses/status codes,
+security requirements and error outcomes; AsyncAPI 2.x/3.x events retain their
+message payloads and content types. Compatibility checks cover those operation
+semantics in addition to removed operations, schemas/fields,
+optional-to-required changes, type/reference changes, and enum narrowing. A
+breaking diff requires an explicit `breaking` declaration, `supersedes` link,
+and major version bump. Manual contracts and legacy or fallback imports without
+complete semantic coverage return an explicit **inconclusive** result rather
+than a false compatibility verdict; use a configured external verifier for
+those formats.
+
+`contract impact` emits the same canonical graph projected into
+`.ai-work/artifacts/project/contracts.json`. It expands a contract version into
+stable operation, event/message, schema, field, generated-output, task, and
+domain nodes. Edges retain request-body, response/error status, event-payload,
+schema-reference, generation, ownership-boundary, and task-relation semantics;
+the Visualizer consumes this graph instead of rebuilding impact from source.
 
 For a new project, start with an opt-in scaffold instead of copying a sample
 domain into every installation:
@@ -142,7 +155,12 @@ dimensions (`domain`, `organization`, `dependency`, `deployment`) and may be
 assigned to a system, container, or bounded context instead of forcing one
 project-wide style. `context resolve` turns these authorities, task scope,
 upstream contexts, contracts, tests, policies, and decisions into an explained
-L0-L3 minimum-sufficient reference package with byte/token estimates.
+L0-L3 minimum-sufficient reference package with byte/token estimates. Context
+package v3 includes a bounded contract impact slice and generated SDK/mock
+references, so task handoffs carry the relevant operation/schema/field branch
+without loading the entire contract graph or reading derived artifacts.
+At L1+ it also includes symbol ranges and provenance from the deterministic
+Python/TypeScript Semantic Index; it is context metadata, never gate authority.
 When no context exists yet, the Bootstrap Exception returns only configured or
 existing conventional source roots at L1, never a repository-wide source dump;
 register the first contexts before implementation continues.

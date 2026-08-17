@@ -142,6 +142,18 @@ The `routing` object in a handoff additionally carries `operation` and
 the selected policy/core and technology skill details. This is an additive
 schema-v2 field; older handoff readers can ignore it safely.
 
+`routing.context_package` uses context-package schema version 3. In addition to
+L0-L3 references it may contain a bounded `contract_impact` graph slice with
+stable operation, event/message, schema, field, generated-output, domain, and
+task references. The resolver builds that slice from the contract registry and
+normalized source, not from `.ai-work/artifacts`; it remains handoff context and
+has no lifecycle, QA, review, or delivery authority.
+
+At L1+ its `symbol_context` adds bounded source-definition metadata: stable
+symbol IDs, source ranges, content hashes, AST/Compiler provenance,
+deterministic selection reasons, and exact import-boundary edges. It never
+contains source bodies or claims a semantic call graph.
+
 Every task also carries `contract_revision` and `contract_hash` on its
 `workflow.json` entry -- the revision and SHA-256 content hash of the
 contract file as of the last write that produced it. Both are `null` for a
@@ -386,17 +398,41 @@ Task refs use `defines|implements|consumes|verifies` and are emitted in
 `.ai-work/artifacts/project/contracts.json` alongside `represents` edges.
 
 `contract import` accepts OpenAPI, AsyncAPI, Protobuf, and Prisma sources and
-writes a normalized schema-version-1 draft under
-`.ai-contracts/imported/<id>/<version>.json`. The registry records import
-format/source hash. Built-in `contract codegen` writes TypeScript or Python
+writes a normalized schema-version-2 draft under
+`.ai-contracts/imported/<id>/<version>.json`. Each normalized payload declares
+`semantic_coverage`. OpenAPI operations bind request body/content schemas,
+responses and status categories, auth requirements/security schemes, and error
+responses. AsyncAPI 2.x/3.x events bind channel direction to message content
+type and payload schema. The registry records import format/source hash.
+Schema-version-1 normalized payloads remain readable, but compatibility is
+inconclusive until re-imported because they do not prove the new semantic
+coverage. Dependency-free YAML fallback similarly declares only the bounded
+facts it parsed. Built-in `contract codegen` writes TypeScript or Python
 DTOs/interfaces and optional mocks, then records every output hash in the
 existing `generated_output_hashes` convergence contract.
 
-Project-owned `architecture-fitness.json` is schema version 1 with `rules`
-(`forbid-dependency` source/target glob arrays) and optional executable
+The canonical derived `contracts.json` artifact projects this normalized
+semantic model on each contract version with explicit `available`, `complete`,
+`coverage`, and `missing_coverage` fields. It does not copy source paths or
+become contract authority; Visualizer and other consumers read the projection
+instead of reparsing OpenAPI or AsyncAPI independently.
+
+The same artifact contains `impact_graph` and each contract item lists its
+`impact_refs`. Entity IDs extend the stable contract ID with URL-encoded
+fragments: `#operation:`, `#event:`, `#message:`, `#schema:`, `#field:`, and
+`#generated-output:`. Graph relations are `contains`, `references`,
+`request-body`, `response`, `error-response`, `event-payload`, `generates`,
+`represents`, or a task contract relation. `contract impact` schema version 2
+uses this shared builder, so CLI and artifact consumers cannot produce two
+different impact truths.
+
+Project-owned `architecture-fitness.json` accepts schema version 1 for
+compatibility and schema version 2 with `analysis.require_ast`. It contains
+`rules` (`forbid-dependency` source/target glob arrays) and optional executable
 `commands`. `architecture fitness` is read-only; `verify` embeds its checks,
 so failures flow into QA evidence without giving the validator lifecycle
-authority. Project-owned `architecture.json` declares C4 systems, external
+authority. An unavailable AST/Compiler adapter yields `inconclusive`, not a
+false pass or a rejection. Project-owned `architecture.json` declares C4 systems, external
 systems, containers, context mappings, and relationships. The resulting C4
 L1-L3 graph is a field of the existing architecture artifact, not a thirteenth
 payload or a new source of truth.
@@ -412,12 +448,12 @@ system/container/context reference. A profile combines any of the independent
 and profile values without producing gate evidence. `verify` repeats the
 architecture-model portion and records it in deterministic QA evidence.
 
-`context resolve` returns context-package schema version 1. Its L0-L3
+`context resolve` returns context-package schema version 3. Its L0-L3
 references carry path, source kind, reason, existence/pattern state, byte size,
 and estimated tokens. The package also records direct/dependency/excluded
-contexts, contract refs, selection metrics, and optional explanation trace.
-It is a read-only execution input embedded by `route`; it is not workflow
-state, evidence, or a fourteenth project artifact.
+contexts, contract refs, selection metrics, optional explanation trace, and a
+bounded symbol-context slice at L1+. It is a read-only execution input embedded
+by `route`; it is not workflow state, evidence, or a fourteenth project artifact.
 
 Project-owned `delivery.json` defines the integration branch, optional
 pre-integration commands, and an optional non-authoritative local CI

@@ -469,7 +469,7 @@
     .obs-observed { color: var(--green); }
     .obs-inferred { color: var(--amber); }
     .obs-proposed { color: var(--purple); }
-    .contract-graph { display: grid; gap: 10px; margin: 2px 0 18px; }
+    .contract-graph { display: grid; gap: 10px; margin: 2px 0 12px; }
     .contract-graph-row {
       display: grid; grid-template-columns: minmax(150px, .8fr) minmax(210px, 1fr) minmax(220px, 1.4fr);
       align-items: stretch; gap: 10px; padding: 10px;
@@ -486,6 +486,50 @@
     .contract-relation:last-child { margin-bottom: 0; }
     .contract-relation-label { color: var(--amber); font-family: var(--mono); }
     .contract-relation-arrow { color: var(--purple); }
+    .contract-impact-toolbar {
+      display: flex; flex-wrap: wrap; gap: 10px; align-items: end;
+      margin: 4px 0 12px; padding: 10px;
+      border: 1px solid var(--border); border-radius: 9px; background: rgba(15,23,42,.4);
+    }
+    .contract-impact-toolbar label { color: var(--text-dim); font-size: 9px; text-transform: uppercase; letter-spacing: .4px; }
+    .contract-impact-toolbar select {
+      display: block; min-width: 160px; margin-top: 4px; padding: 6px 8px;
+      border: 1px solid var(--border-hi); border-radius: 6px;
+      background: var(--bg-card); color: var(--text); font: 10px var(--mono);
+    }
+    .contract-impact-stage-wrap {
+      overflow: auto; min-height: 260px; max-height: 560px;
+      border: 1px solid var(--border); border-radius: 10px;
+      background: radial-gradient(circle at 30% 20%, rgba(56,189,248,.04), transparent 45%), rgba(8,14,26,.72);
+    }
+    .contract-impact-stage { position: relative; min-width: 100%; }
+    .contract-impact-svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .contract-impact-edge { fill: none; stroke: rgba(148,163,184,.38); stroke-width: 1.25; }
+    .contract-impact-edge-label { fill: var(--text-dim); font: 8px var(--mono); paint-order: stroke; stroke: var(--bg); stroke-width: 3px; }
+    .contract-impact-node {
+      position: absolute; width: 176px; min-height: 58px; padding: 8px 9px;
+      border: 1px solid var(--border-hi); border-left: 3px solid var(--text-dim); border-radius: 8px;
+      background: rgba(19,27,46,.96); color: var(--text); text-align: left; cursor: pointer;
+      transition: opacity .15s, border-color .15s, box-shadow .15s;
+    }
+    .contract-impact-node:hover, .contract-impact-node.selected { border-color: var(--cyan); box-shadow: 0 0 0 1px rgba(56,189,248,.18); }
+    .contract-impact-node.dimmed, .contract-impact-node.search-dimmed { opacity: .23; }
+    .contract-impact-node[data-type="contract"] { border-left-color: var(--purple); }
+    .contract-impact-node[data-type="operation"], .contract-impact-node[data-type="event"] { border-left-color: var(--cyan); }
+    .contract-impact-node[data-type="schema"], .contract-impact-node[data-type="message"] { border-left-color: var(--teal); }
+    .contract-impact-node[data-type="field"] { border-left-color: var(--amber); }
+    .contract-impact-node[data-type="generated-output"] { border-left-color: var(--green); }
+    .contract-impact-node[data-type="task"], .contract-impact-node[data-type="domain"] { border-left-color: var(--purple); }
+    .contract-impact-node-type { color: var(--text-dim); font: 8px var(--mono); text-transform: uppercase; letter-spacing: .5px; }
+    .contract-impact-node-label { margin-top: 4px; color: var(--text); font: 10px var(--mono); overflow-wrap: anywhere; }
+    .contract-impact-node-meta { margin-top: 4px; color: var(--text-dim); font-size: 8px; overflow-wrap: anywhere; }
+    .contract-impact-inspector {
+      margin: 0 0 18px; padding: 12px; border: 1px solid var(--border); border-radius: 9px;
+      background: rgba(15,23,42,.42);
+    }
+    .contract-impact-inspector-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(170px,1fr)); gap: 7px; }
+    .contract-impact-inspector-rel { margin-top: 10px; font: 9px var(--mono); color: var(--text-sub); }
+    .contract-impact-inspector-rel div { margin-top: 4px; overflow-wrap: anywhere; }
     @media (max-width: 900px) { .contract-graph-row { grid-template-columns: 1fr; } }
 
     /* ── Graph Canvas ── */

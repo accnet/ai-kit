@@ -128,15 +128,26 @@ both commands are read-only and only `artifact generate` publishes it.
 `verify` includes the same model checks before architecture fitness, so an
 invalid profile or graph reference cannot receive authoritative QA pass.
 
-`context resolve <request>` (or `--task T<n>`) returns a schema-version-1
+`context resolve <request>` (or `--task T<n>`) returns a schema-version-3
 minimum-sufficient context package without reading source bodies. L0 identifies
 authorities and task metadata, L1 direct scope, L2 upstream contexts/contracts/
-related tests, and L3 architecture decisions and governance. `--level` caps
+related tests, and L3 architecture decisions and governance. At L2 the package
+also embeds a bounded `contract_impact` slice selected from the same canonical
+contract graph used by `contract impact`, and adds selected generated outputs
+as references. Entity matching and branch traversal are deterministic; the
+resolver never reads artifacts or turns this projection into gate authority. `--level` caps
 the package and `--explain` (also `context explain`) includes deterministic
 token matches and selection reasons. Metrics are reference/file byte estimates,
 not claims about hallucination reduction. `route` embeds this same package in
 runner handoffs, so procedures consume one resolver rather than independently
 scanning the repository.
+
+At L1+ the package also carries a bounded `symbol_context`: deterministic
+Python/TypeScript definition metadata with stable IDs, source ranges, content
+hashes, adapter provenance, and selection reasons. It never copies source
+bodies or claims a call graph. CamelCase, snake_case, and kebab-case query
+forms normalize to the same tokens; L2 follows only exact internal import
+boundaries. Routes use the assigned worktree when present.
 
 When the context registry is empty, a bounded Bootstrap Exception may return
 only configured source roots (or existing conventional roots such as `src`,
@@ -145,12 +156,21 @@ never returns `.` or recursively enumerates the repository; bootstrap discovery
 does not become architecture authority. Register contexts before normal work.
 
 `contract diff <id> <from> <to>` compares normalized versions produced by
-`contract import`; `contract check` turns supported breaking findings into a
-major-version, `supersedes`, and compatibility-declaration gate. Arbitrary
-manually registered sources are reported as inconclusive instead of being
+`contract import`. Schema v2 retains OpenAPI request bodies, response status
+codes/content, auth and error outcomes per operation, plus AsyncAPI 2.x/3.x
+message payloads per event. `contract check` turns conclusive breaking findings
+into a major-version, `supersedes`, and compatibility-declaration gate. Legacy
+v1, bounded YAML fallback, and arbitrary manually registered sources are
+reported as inconclusive when semantic coverage is incomplete instead of being
 misclassified as compatible. `scaffold minimal` creates human architecture
 companions, while `scaffold store-pilot` also seeds a Create Store contract and
 frontend/backend/worker reference boundary; both leave lifecycle state alone.
+
+`contract impact <id> <version>` returns schema version 2 with a stable graph
+down to operation, event/message, schema, field, and generated-output nodes,
+plus linked domain and workflow tasks. The identical graph is projected into
+the canonical contracts artifact; clients must consume it rather than infer
+operation-to-schema relationships independently.
 
 `artifact generate` is the only publisher of project observation data. It
 normalizes workflow, project configuration, contract registry, evidence, Git,
@@ -173,8 +193,11 @@ delegates to `artifact generate`.
 finds feature-level modules the declared `.ai-config/contexts.yaml` bounded
 contexts don't name individually (NestJS `*.module.ts` folders, React
 `src/{pages,components,features,services,contexts}`, Python packages with
-`__init__.py`, and a generic first/second-level fallback), and attempts to
-detect internal dependency edges from same-language relative imports. It
+`__init__.py`, and a generic first/second-level fallback), and aggregates
+dependency edges from one shared Semantic Index. Python uses the standard
+library AST; TypeScript uses the project's locked Compiler API when available.
+The compatibility lexical TypeScript fallback is explicitly inferred and is
+never authoritative for schema-v2 AST-required fitness. It
 never edits `contexts.yaml` or any source file. Declared contexts stay
 authoritative: a discovered module whose path falls inside a declared
 context's glob is linked to it as a child (`parent`) rather than treated as

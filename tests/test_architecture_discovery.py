@@ -187,6 +187,16 @@ class DependencyDetectionTests(ArchitectureDiscoveryTestCase):
         edge = next((e for e in artifact["edges"] if e["from"] == "auth" and e["to"] == "storage"), None)
         self.assertIsNotNone(edge, f"expected auth -> storage edge, got {artifact['edges']}")
 
+    def test_python_import_in_comment_or_string_does_not_create_dependency(self) -> None:
+        self.write_kit_yaml(["src"], stack=["python"])
+        self.write_contexts_yaml("  core:\n    path: src/*\n    owner: backend\n")
+        self.write_file("src/__init__.py", "")
+        self.write_file("src/api/__init__.py", "")
+        self.write_file("src/storage/__init__.py", "")
+        self.write_file("src/api/service.py", '# from ..storage import client\nexample = "from ..storage import client"\n')
+        artifact = self.discover()
+        self.assertFalse(any(edge["from"] == "api" and edge["to"] == "storage" for edge in artifact["edges"]))
+
 
 class WarningTests(ArchitectureDiscoveryTestCase):
     def test_duplicate_module_path_is_warned(self) -> None:
