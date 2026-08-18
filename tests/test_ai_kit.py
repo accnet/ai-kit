@@ -167,6 +167,21 @@ class EngineTestCase(unittest.TestCase):
             setattr(args, key, value)
         return ai_kit.cmd_add_task(args)
 
+    def update_task(self, task_id: str, **extra) -> dict:
+        """Mirrors the real update-task parser's defaults (argparse leaves
+        every --add-*/--set-*/--clear-* flag at None/False when omitted)."""
+        args = ns(
+            state=str(self.state_file), id=task_id, actor="planner",
+            add_acceptance=None, add_files=None, add_tags=None,
+            add_forbidden_file=None, add_constraint=None, add_required_check=None,
+            add_qa_command=None, set_qa_commands=None, clear_qa_commands=False,
+            add_output_export=None, add_output_evidence_kind=None,
+            allow_relative_runtime_path=False,
+        )
+        for key, value in extra.items():
+            setattr(args, key, value)
+        return ai_kit.cmd_update_task(args)
+
     def transition(self, task_id: str, action: str, actor: str, **extra) -> dict:
         args = ns(state=str(self.state_file), id=task_id, action=action, actor=actor)
         for key, value in extra.items():
@@ -2512,6 +2527,86 @@ class CentralRuntimeConfigTests(EngineTestCase):
         self.assertIn("limit reached", third["reason"])
         self.assertNotIn("T1-fix-3", ai_kit.task_map(ai_kit.load(self.state_file)))
 
+    def test_remediation_task_inherits_the_original_worktrees_uncommitted_work(self) -> None:
+        """A remediation task used to start from a brand-new worktree at the
+        current HEAD, discarding whatever the failed attempt had already
+        written -- correct code sitting in the superseded task's worktree
+        had to be copied over by hand. It must be captured and re-applied
+        automatically instead."""
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "t@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Test"], check=True)
+        (self.root / "app.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "app.py"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "base"], check=True)
+        base = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        # Simulate a prior dispatch attempt: a real linked worktree with
+        # uncommitted work -- one tracked-file edit and one new untracked file.
+        original_worktree = self.root / "T1-worktree"
+        subprocess.run(
+            ["git", "-C", str(self.root), "worktree", "add", "-qb", "agent/wf/T1", str(original_worktree)],
+            check=True,
+        )
+        (original_worktree / "app.py").write_text("value = 2  # fixed\n", encoding="utf-8")
+        (original_worktree / "new_file.py").write_text("NEW = True\n", encoding="utf-8")
+
+        self.write_runtime_config(qa_strategy="remediation-task", max_attempts=2, automation_enabled=True)
+        self.init_workflow()
+        self.add_task("T1", files=["app.py", "new_file.py"])
+        self.transition("T1", "start", actor="backend")
+        state = ai_kit.load(self.state_file)
+        ai_kit.task_map(state)["T1"]["assignment"] = {
+            "runner": "worker", "model": "model-a", "agent_id": "agent-1",
+            "branch": "agent/wf/T1", "worktree": str(original_worktree),
+            "isolation": "linked-worktree", "base_commit": base,
+            "assigned_at": ai_kit.now(), "state_path": str(self.state_file.resolve()),
+        }
+        ai_kit.save(state, self.state_file, state["revision"])
+        self.transition("T1", "complete", actor="backend")
+        evidence = self.qa_evidence("T1", status="fail")
+        self.transition("T1", "reject", actor="qa-control-plane", detail="tests failed",
+                         evidence=[evidence], _control_plane=True)
+
+        result = ai_kit._create_remediation_task(self.state_file, "T1", "qa", evidence, ["functional:test_command"])
+        self.assertTrue(result["created"])
+
+        patch_path = ai_kit._remediation_patch_path(self.state_file, "T1-fix-1")
+        self.assertTrue(patch_path.exists(), "expected a captured patch for the remediation task")
+        patch_text = patch_path.read_text(encoding="utf-8")
+        self.assertIn("app.py", patch_text)
+        self.assertIn("new_file.py", patch_text)
+
+        # Now actually create the remediation task's fresh worktree, exactly
+        # as `dispatch` would, and confirm the captured patch was applied.
+        state = ai_kit.load(self.state_file)
+        remediation_task = ai_kit.task_map(state)["T1-fix-1"]
+        assignment = ai_kit._ensure_task_worktree(state, remediation_task, "worker", "model-a", "agent-2", self.state_file)
+        new_worktree = Path(assignment["worktree"])
+        self.assertEqual(assignment["isolation"], "linked-worktree")
+        self.assertEqual((new_worktree / "app.py").read_text(encoding="utf-8"), "value = 2  # fixed\n")
+        self.assertEqual((new_worktree / "new_file.py").read_text(encoding="utf-8"), "NEW = True\n")
+
+    def test_ensure_task_worktree_tolerates_a_missing_patch_file(self) -> None:
+        """No captured patch (the common case) must be a silent no-op, not
+        an error -- most tasks are never remediated."""
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "t@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Test"], check=True)
+        (self.root / "app.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "app.py"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "base"], check=True)
+
+        self.init_workflow()
+        self.add_task("T1")
+        state = ai_kit.load(self.state_file)
+        task = ai_kit.task_map(state)["T1"]
+        assignment = ai_kit._ensure_task_worktree(state, task, "worker", "model-a", "agent-1", self.state_file)
+        self.assertEqual(assignment["isolation"], "linked-worktree")
+        self.assertTrue(Path(assignment["worktree"]).exists())
+
 
 class PostCompletionConfigTests(EngineTestCase):
     """_load_post_completion_config / _post_completion_enabled: opt-in switch
@@ -2944,6 +3039,225 @@ class TransitionCompletePostCompletionIntegrationTests(EngineTestCase):
         state = ai_kit.load(self.state_file)
         actions = [item["action"] for item in state["events"]]
         self.assertIn("post-completion-failed", actions)
+
+
+class DesignAssessAutoTests(EngineTestCase):
+    """--auto trades writing 10-12 near-identical per-rule JSON entries by
+    hand for one human-typed reason applied uniformly as 'pass' -- the same
+    honesty guarantee as the manual path (a human asserts it, the engine
+    doesn't infer it), just without the ceremony for a task small enough
+    that individual per-rule reasoning would add no real signal."""
+
+    def test_auto_marks_every_applicable_rule_pass_with_shared_reason(self) -> None:
+        self.init_workflow()
+        self.add_task("T1", task_kind="implementation")
+        task = ai_kit.task_map(ai_kit.load(self.state_file))["T1"]
+        applicable = ai_kit._applicable_design_rules(task)
+        self.assertTrue(applicable, "fixture must exercise at least one real design rule")
+
+        result = ai_kit.cmd_design_assess(ns(
+            state=str(self.state_file), id="T1", actor="backend",
+            auto="one-line config flag, no architectural surface",
+        ))
+        self.assertEqual(result["results"], len(applicable))
+
+        assessment_path = ai_kit._design_assessment_path(self.state_file, "T1")
+        assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(assessment["rules"]), len(applicable))
+        for rule in assessment["rules"]:
+            self.assertEqual(rule["result"], "pass")
+            self.assertTrue(rule["rationale"].startswith("[auto] "))
+            self.assertIn("one-line config flag", rule["rationale"])
+
+    def test_auto_assessment_satisfies_the_design_gate(self) -> None:
+        self.init_workflow()
+        self.add_task("T1", task_kind="implementation")
+        self.transition("T1", "start", actor="backend")
+        ai_kit.cmd_design_assess(ns(
+            state=str(self.state_file), id="T1", actor="backend", auto="trivial cleanup",
+        ))
+        state = ai_kit.load(self.state_file)
+        task = ai_kit.task_map(state)["T1"]
+        design = ai_kit._design_validation(self.state_file, task)
+        self.assertTrue(design["passed"], design)
+
+    def test_auto_and_input_are_mutually_exclusive(self) -> None:
+        self.init_workflow()
+        self.add_task("T1", task_kind="implementation")
+        with self.assertRaises(ai_kit.EngineError) as ctx:
+            ai_kit.cmd_design_assess(ns(
+                state=str(self.state_file), id="T1", actor="backend",
+                auto="reason", input="/tmp/whatever.json",
+            ))
+        self.assertIn("mutually exclusive", str(ctx.exception))
+
+    def test_requires_either_input_or_auto(self) -> None:
+        self.init_workflow()
+        self.add_task("T1", task_kind="implementation")
+        with self.assertRaises(ai_kit.EngineError):
+            ai_kit.cmd_design_assess(ns(state=str(self.state_file), id="T1", actor="backend"))
+
+    def test_auto_rejects_an_empty_reason(self) -> None:
+        self.init_workflow()
+        self.add_task("T1", task_kind="implementation")
+        with self.assertRaises(ai_kit.EngineError):
+            ai_kit.cmd_design_assess(ns(state=str(self.state_file), id="T1", actor="backend", auto="   "))
+
+    def test_manual_input_path_still_works_unchanged(self) -> None:
+        self.init_workflow()
+        self.add_task("T1", task_kind="implementation")
+        task = ai_kit.task_map(ai_kit.load(self.state_file))["T1"]
+        applicable = ai_kit._applicable_design_rules(task)
+        input_file = self.root / "assessment-input.json"
+        input_file.write_text(json.dumps({
+            "rules": [{"rule_id": rule["id"], "result": "pass", "rationale": "manual", "evidence": []}
+                      for rule in applicable]
+        }), encoding="utf-8")
+        result = ai_kit.cmd_design_assess(ns(
+            state=str(self.state_file), id="T1", actor="backend", input=str(input_file),
+        ))
+        self.assertEqual(result["results"], len(applicable))
+
+
+class PendingDispatchGuardTests(EngineTestCase):
+    """A task claimed by dispatch-ready's pool scheduler gets an
+    `isolation: pending-dispatch` placeholder assignment before its
+    background `dispatch` subprocess creates the real worktree. Reading that
+    placeholder's (nonexistent) worktree used to silently fall back to
+    ROOT -- diffing the whole host checkout against this task's file scope.
+    It must fail loudly and specifically instead."""
+
+    def _give_pending_dispatch_assignment(self, task_id: str) -> None:
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        for task in state["tasks"]:
+            if task["id"] == task_id:
+                task["assignment"] = {
+                    "runner": "codex-cli", "model": "x", "agent_id": "abc123",
+                    "isolation": "pending-dispatch", "assigned_at": ai_kit.now(),
+                    "state_path": str(self.state_file.resolve()),
+                }
+        self.state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    def test_cmd_verify_raises_instead_of_falling_back_to_root(self) -> None:
+        self.init_workflow()
+        self.add_task("T1")
+        self.transition("T1", "start", actor="backend")
+        self._give_pending_dispatch_assignment("T1")
+        self.transition("T1", "complete", actor="backend")
+        with self.assertRaises(ai_kit.EngineError) as ctx:
+            ai_kit.cmd_verify(ns(state=str(self.state_file), id="T1"))
+        self.assertIn("pending-dispatch", str(ctx.exception))
+
+    def test_explicit_workdir_override_bypasses_the_guard(self) -> None:
+        self.init_workflow()
+        self.add_task("T1")
+        self.transition("T1", "start", actor="backend")
+        self._give_pending_dispatch_assignment("T1")
+        self.transition("T1", "complete", actor="backend")
+        report = ai_kit.cmd_verify(ns(state=str(self.state_file), id="T1", workdir=str(self.root)))
+        self.assertIn("passed", report)
+
+    def test_execution_root_for_assignment_returns_root_when_no_assignment(self) -> None:
+        self.assertEqual(ai_kit._execution_root_for_assignment(None), ai_kit.ROOT)
+        self.assertEqual(ai_kit._execution_root_for_assignment({}), ai_kit.ROOT)
+
+    def test_execution_root_for_assignment_returns_worktree_when_present(self) -> None:
+        result = ai_kit._execution_root_for_assignment(
+            {"worktree": str(self.root / "some-worktree"), "isolation": "linked-worktree"}
+        )
+        self.assertEqual(result, self.root / "some-worktree")
+
+
+class QACommandRelativeRuntimePathTests(EngineTestCase):
+    """A relative .venv/node_modules reference in a qa-command only works
+    from the host checkout -- dispatch worktrees never have either
+    directory (both are gitignored). This must be caught at task-creation
+    time, not discovered after a full dispatch round-trip."""
+
+    def test_add_task_rejects_relative_venv_path(self) -> None:
+        self.init_workflow()
+        with self.assertRaises(ai_kit.EngineError) as ctx:
+            self.add_task("T1", qa_command=[".venv/bin/python -m pytest -q"])
+        self.assertIn(".venv/bin/python", str(ctx.exception))
+
+    def test_add_task_rejects_relative_venv_path_inside_quotes(self) -> None:
+        self.init_workflow()
+        with self.assertRaises(ai_kit.EngineError):
+            self.add_task("T1", qa_command=['bash -c ".venv/bin/python -m pytest"'])
+
+    def test_add_task_rejects_relative_node_modules_path(self) -> None:
+        self.init_workflow()
+        with self.assertRaises(ai_kit.EngineError) as ctx:
+            self.add_task("T1", qa_command=["node_modules/.bin/tsc --noEmit"])
+        self.assertIn("node_modules/.bin/tsc", str(ctx.exception))
+
+    def test_add_task_accepts_absolute_venv_path(self) -> None:
+        self.init_workflow()
+        task = self.add_task("T1", qa_command=["/repo/.venv/bin/python -m pytest -q"])
+        self.assertEqual(task["qa_contract"]["commands"], ["/repo/.venv/bin/python -m pytest -q"])
+
+    def test_add_task_allow_flag_bypasses_the_check(self) -> None:
+        self.init_workflow()
+        task = self.add_task(
+            "T1", qa_command=[".venv/bin/python -m pytest -q"],
+            allow_relative_runtime_path=True,
+        )
+        self.assertEqual(task["qa_contract"]["commands"], [".venv/bin/python -m pytest -q"])
+
+    def test_update_task_add_qa_command_rejects_relative_path(self) -> None:
+        self.init_workflow()
+        self.add_task("T1")
+        with self.assertRaises(ai_kit.EngineError):
+            self.update_task("T1", add_qa_command=[".venv/bin/python -m pytest -q"])
+
+    def test_update_task_set_qa_commands_rejects_relative_path(self) -> None:
+        self.init_workflow()
+        self.add_task("T1")
+        with self.assertRaises(ai_kit.EngineError):
+            self.update_task("T1", set_qa_commands=[".venv/bin/python -m pytest -q"])
+
+
+class UpdateTaskQACommandReplacementTests(EngineTestCase):
+    """update-task's --add-qa-command is additive-only; --set-qa-commands and
+    --clear-qa-commands are the only way to correct a wrong command without
+    cancelling and recreating the task (which loses its id/history)."""
+
+    def test_set_qa_commands_replaces_the_list(self) -> None:
+        self.init_workflow()
+        self.add_task("T1", qa_command=["old-command"])
+        task = self.update_task("T1", set_qa_commands=["/repo/.venv/bin/python -m pytest -q"])
+        self.assertEqual(task["qa_contract"]["commands"], ["/repo/.venv/bin/python -m pytest -q"])
+
+    def test_set_qa_commands_with_no_values_clears_the_list(self) -> None:
+        self.init_workflow()
+        self.add_task("T1", qa_command=["old-command"])
+        task = self.update_task("T1", set_qa_commands=[])
+        self.assertEqual(task["qa_contract"]["commands"], [])
+
+    def test_clear_qa_commands_empties_the_list(self) -> None:
+        self.init_workflow()
+        self.add_task("T1", qa_command=["old-command"])
+        task = self.update_task("T1", clear_qa_commands=True)
+        self.assertEqual(task["qa_contract"]["commands"], [])
+
+    def test_set_qa_commands_bumps_contract_hash(self) -> None:
+        self.init_workflow()
+        original = self.add_task("T1", qa_command=["old-command"])
+        updated = self.update_task("T1", set_qa_commands=["new-command"])
+        self.assertNotEqual(updated["contract_hash"], original["contract_hash"])
+        self.assertEqual(updated["contract_revision"], (original["contract_revision"] or 0) + 1)
+
+    def test_omitting_set_qa_commands_leaves_existing_commands_untouched(self) -> None:
+        self.init_workflow()
+        self.add_task("T1", qa_command=["keep-me"])
+        task = self.update_task("T1", add_tags=["some-tag"])
+        self.assertEqual(task["qa_contract"]["commands"], ["keep-me"])
+
+    def test_unrelated_update_task_call_is_unaffected_by_the_new_flags(self) -> None:
+        self.init_workflow()
+        self.add_task("T1")
+        task = self.update_task("T1", add_acceptance=[["extra criterion"]])
+        self.assertIn("extra criterion", task["acceptance"])
 
 
 if __name__ == "__main__":

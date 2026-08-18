@@ -1386,6 +1386,20 @@ def _ensure_task_worktree(
             if result.returncode != 0:
                 raise EngineError(f"failed to create task worktree {worktree}: {(result.stderr or result.stdout).strip()}")
             isolation = "linked-worktree"
+            patch_path = _remediation_patch_path(state_file, task["id"])
+            if patch_path.exists():
+                apply_error = _apply_inherited_diff_patch(worktree, patch_path)
+                if apply_error:
+                    print(
+                        f"WARNING: could not apply {task['id']}'s inherited diff from its prior "
+                        f"attempt (starting from a clean tree instead): {apply_error}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"Applied {task['id']}'s inherited diff from its prior attempt's worktree.",
+                        file=sys.stderr,
+                    )
     assignment = {
         "runner": runner_name,
         "model": model,
@@ -1401,6 +1415,110 @@ def _ensure_task_worktree(
         "lease_expires_at": task.get("claim_expires_at"),
     }
     return assignment
+
+
+def _remediation_patch_path(state_file: Path, task_id: str) -> Path:
+    return workspace(state_file) / "remediation-patches" / f"{task_id}.patch"
+
+
+def _capture_worktree_diff_patch(worktree: Path, base_commit: str) -> bytes | None:
+    """Snapshot a worktree's uncommitted work (tracked changes plus untracked
+    new files) as a single git-apply-able patch.
+
+    A remediation task (`<id>-fix-N`) used to start from a brand-new worktree
+    checked out at the current HEAD, discarding whatever the failed attempt
+    had already written -- correct code sitting in the superseded task's
+    worktree had to be copied over by hand every time. Capturing it here
+    lets `_ensure_task_worktree` re-apply it automatically into the
+    remediation task's fresh worktree instead.
+    """
+    import subprocess as _sp
+    if not worktree.exists():
+        return None
+    tracked = _sp.run(
+        ["git", "-C", str(worktree), "diff", "--binary", base_commit, "--"],
+        capture_output=True,
+    )
+    if tracked.returncode != 0:
+        return None
+    untracked_names = _sp.run(
+        ["git", "-C", str(worktree), "ls-files", "--others", "--exclude-standard"],
+        capture_output=True, text=True,
+    )
+    parts = [tracked.stdout or b""]
+    for relative in (untracked_names.stdout or "").splitlines():
+        relative = relative.strip()
+        if not relative:
+            continue
+        # `--no-index` diffs an untracked file against /dev/null and exits 1
+        # to report "a difference was found" (expected here) -- only treat a
+        # higher exit code as a real failure.
+        result = _sp.run(
+            ["git", "-C", str(worktree), "diff", "--binary", "--no-index", "--", "/dev/null", relative],
+            capture_output=True,
+        )
+        if result.returncode in (0, 1) and result.stdout:
+            parts.append(result.stdout)
+    combined = b"".join(parts)
+    return combined or None
+
+
+def _apply_inherited_diff_patch(worktree: Path, patch_path: Path) -> str | None:
+    """Best-effort re-apply of a captured diff into a freshly created
+    worktree. Returns None on success, or a short failure reason.
+
+    A conflicting or unappliable patch must never block dispatch -- the
+    worker just redoes the work from a clean tree, exactly as it did before
+    this feature existed. This is a head start, not a guarantee.
+    """
+    import subprocess as _sp
+    if not patch_path.exists() or patch_path.stat().st_size == 0:
+        return None
+    result = _sp.run(
+        ["git", "-C", str(worktree), "apply", "--binary", str(patch_path)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return (result.stderr or result.stdout or "unknown error").strip()[:500]
+    return None
+
+
+def _execution_root_for_assignment(assignment: dict | None) -> Path:
+    """Resolve the directory a task's functional/scope/output checks should
+    read from.
+
+    `dispatch-ready`'s pool scheduler claims a task and immediately persists
+    an `isolation: pending-dispatch` placeholder assignment (no worktree
+    yet), then spawns a background `dispatch` subprocess that creates the
+    real linked worktree a few seconds later. Every prior call site here
+    fell back to `ROOT` whenever no worktree was recorded, which silently
+    treated "not dispatched yet" the same as "intentionally running against
+    the host checkout" (`--no-worktree`, or a non-git fixture). During that
+    pending window, QA then diffed the *entire* host working tree --
+    including every other in-flight task's uncommitted changes -- against
+    this task's declared file scope, failing `declared-file-scope` for
+    reasons that have nothing to do with this task. Fail loudly and
+    specifically instead of guessing.
+    """
+    if not assignment:
+        return ROOT
+    if assignment.get("isolation") == "pending-dispatch":
+        raise EngineError(
+            "task dispatch is still pending (assignment.isolation == "
+            "'pending-dispatch'): the pool scheduler claimed it but its "
+            "background `dispatch` subprocess has not created a worktree yet. "
+            "Wait for that subprocess to finish (check "
+            ".ai-work/logs/) and retry, or re-run `ai-kit dispatch <id> "
+            "--agent-id <agent-id>` directly to resume it. Running QA against "
+            "the host repo root instead would silently diff every other "
+            "in-flight task's uncommitted changes against this task's file "
+            "scope."
+        )
+    return Path(assignment.get("worktree") or ROOT)
+
+
+def _task_execution_root(task: dict) -> Path:
+    return _execution_root_for_assignment(task.get("assignment"))
 
 
 def _persist_assignment(state_file: Path, task_id: str, assignment: dict) -> dict:
@@ -1839,6 +1957,46 @@ def _task_contract_v3_fields(args: argparse.Namespace) -> dict:
             "evidence_kinds": getattr(args, "output_evidence_kind", None) or [],
         },
     })
+
+
+# A relative .venv/ or node_modules/ path only resolves from the *host*
+# checkout. `dispatch` runs qa-commands from an isolated linked git worktree
+# (.ai-work/worktrees/<id>/<task>/) that is a separate checkout sharing no
+# gitignored directory with the host -- .venv/ and node_modules/ are never
+# present there. A relative reference to either fails with a bare "not
+# found" only after a full dispatch round-trip (worktree creation, a runner
+# invocation, and a QA run), and the failure message doesn't point back to
+# the qa-command that caused it. Catch it at task-creation time instead.
+# Matched only when the reference is NOT already prefixed by a path
+# separator/word character, so an absolute path (".../repo/.venv/bin/...")
+# is left alone -- only a bare relative reference is flagged.
+_QA_COMMAND_RELATIVE_RUNTIME_RE = re.compile(r"(?<![\w./])(\.?venv/bin/\S+|node_modules/\S+)")
+
+
+def _qa_command_relative_runtime_risks(commands: list[str]) -> list[str]:
+    """Return one description per relative .venv/node_modules reference found."""
+    risks: list[str] = []
+    for command in commands:
+        for match in _QA_COMMAND_RELATIVE_RUNTIME_RE.finditer(command):
+            risks.append(f"{match.group(1)!r} in qa-command {command!r}")
+    return risks
+
+
+def _check_qa_command_relative_runtime_paths(commands: list[str], *, allow: bool) -> None:
+    if allow or not commands:
+        return
+    risks = _qa_command_relative_runtime_risks(commands)
+    if not risks:
+        return
+    raise EngineError(
+        "qa-command references a relative runtime path that will not exist in an "
+        "isolated dispatch worktree (.venv/ and node_modules/ are gitignored and "
+        "never present outside the host checkout): " + "; ".join(risks) + ". "
+        "Use an absolute path into the host repo instead (e.g. "
+        "\"$(git rev-parse --show-toplevel)/.venv/bin/python\" or a literal absolute "
+        "path), or pass --allow-relative-runtime-path if this command is known to "
+        "run only with --no-worktree / against the host checkout directly."
+    )
 
 
 def _new_task_governance_fields(args: argparse.Namespace) -> dict:
@@ -4791,6 +4949,10 @@ def cmd_add_task(args: argparse.Namespace) -> dict:
     acceptance = _flatten_repeated(args.acceptance)
     if not acceptance:
         raise EngineError("add-task requires at least one --acceptance criterion")
+    _check_qa_command_relative_runtime_paths(
+        getattr(args, "qa_command", None) or [],
+        allow=bool(getattr(args, "allow_relative_runtime_path", False)),
+    )
     context = getattr(args, "context", None)
     context_revision = _context_revision(context)
     epic = getattr(args, "epic", None)
@@ -4817,10 +4979,12 @@ def cmd_update_task(args: argparse.Namespace) -> dict:
     if not task:
         raise EngineError(f"unknown task: {args.id}")
     add_acceptance = _flatten_repeated(args.add_acceptance)
+    set_qa_commands = getattr(args, "set_qa_commands", None)
+    clear_qa_commands = bool(getattr(args, "clear_qa_commands", False))
     v3_changes = any(getattr(args, name, None) for name in (
         "add_forbidden_file", "add_constraint", "add_required_check", "add_qa_command",
         "add_output_export", "add_output_evidence_kind",
-    ))
+    )) or set_qa_commands is not None or clear_qa_commands
     if not add_acceptance and not args.add_files and not args.add_tags and not v3_changes:
         raise EngineError("update-task requires at least one additive task-contract field")
     detail_parts = []
@@ -4846,6 +5010,17 @@ def cmd_update_task(args: argparse.Namespace) -> dict:
         if values:
             target[key].extend(value for value in values if value not in target[key])
             detail_parts.append(f"{label}: " + ", ".join(values))
+    if clear_qa_commands:
+        task["qa_contract"]["commands"] = []
+        detail_parts.append("QA commands: cleared")
+    if set_qa_commands is not None:
+        task["qa_contract"]["commands"] = list(set_qa_commands)
+        detail_parts.append("QA commands: replaced with " + (", ".join(set_qa_commands) or "(none)"))
+    if clear_qa_commands or set_qa_commands is not None or getattr(args, "add_qa_command", None):
+        _check_qa_command_relative_runtime_paths(
+            task["qa_contract"]["commands"],
+            allow=bool(getattr(args, "allow_relative_runtime_path", False)),
+        )
     if args.add_files:
         task["scope"]["allowed_files"] = list(task["files"])
     # Contract fields (acceptance/files/tags) just changed, so the contract
@@ -5719,7 +5894,7 @@ def cmd_route(args: argparse.Namespace) -> dict:
         str(task.get("title") or task["id"]),
         task=task,
         state_file=state_file,
-        analysis_root=Path((task.get("assignment") or {}).get("worktree") or ROOT),
+        analysis_root=_task_execution_root(task),
         explain=getattr(args, "explain", False),
     )
     context_paths = [
@@ -7098,15 +7273,45 @@ def cmd_design_assess(args: argparse.Namespace) -> dict:
     task = task_map(state).get(args.id)
     if not task:
         raise EngineError(f"unknown task: {args.id}")
-    input_path = Path(args.input).resolve()
-    try:
-        payload = json.loads(input_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise EngineError(f"invalid design assessment input: {exc}") from exc
     policy = _merged_design_policy(); policy_hash = _design_policy_hash(policy)
-    results = payload.get("rules")
-    if not isinstance(results, list):
-        raise EngineError("design assessment requires a rules array")
+    auto_reason = getattr(args, "auto", None)
+    input_value = getattr(args, "input", None)
+    if auto_reason is not None and input_value:
+        raise EngineError("design assess: --auto and --input are mutually exclusive")
+    if auto_reason is not None:
+        # --auto trades individual per-rule reasoning for one human-typed
+        # justification applied uniformly to every applicable rule, as
+        # "pass" (not "not-applicable" -- the rule's topic still applies,
+        # it is just judged trivially satisfied). It exists because writing
+        # 10-12 near-identical JSON entries by hand for a one-line config
+        # flag or a dead-code deletion was pure ceremony with no signal:
+        # the honesty guarantee here is exactly the same as the manual
+        # path (a human is asserting this, not the engine inferring it) --
+        # this only removes the boilerplate, not the accountability. The
+        # "[auto]" prefix keeps auto-approved rules visibly distinct from
+        # individually-reasoned ones in the assessment file for later audit.
+        if not str(auto_reason).strip():
+            raise EngineError("design assess --auto requires a non-empty reason")
+        results = [
+            {
+                "rule_id": rule["id"],
+                "result": "pass",
+                "rationale": f"[auto] {auto_reason.strip()}",
+                "evidence": [],
+            }
+            for rule in _applicable_design_rules(task, policy)
+        ]
+    else:
+        if not input_value:
+            raise EngineError('design assess requires --input <file> or --auto "<reason>"')
+        input_path = Path(input_value).resolve()
+        try:
+            payload = json.loads(input_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise EngineError(f"invalid design assessment input: {exc}") from exc
+        results = payload.get("rules")
+        if not isinstance(results, list):
+            raise EngineError("design assessment requires a rules array")
     known = {rule["id"]: rule for rule in _applicable_design_rules(task, policy)}
     seen = set()
     for result in results:
@@ -9775,7 +9980,7 @@ def _dispatch_approval(task_id: str, role: str, state_arg: str | None, agent_id:
     # shell=True: same G4 threat model as cmd_dispatch above (template comes
     # from .ai-config/runners.yaml). stdin is closed for the same
     # non-interactive-only reason documented in runners.yaml.
-    review_root = Path(assignment.get("worktree") or ROOT)
+    review_root = _execution_root_for_assignment(assignment)
     result = _sp.run(cmd, shell=True, cwd=str(review_root), stdin=_sp.DEVNULL)
     audit = {
         "ts": now(), "task": task_id, "role": role, "runner": runner_name, "model": model,
@@ -10299,7 +10504,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict:
     # .ai-config/runners.yaml, not an argv list, so it can't be handed to
     # subprocess without a shell (see G4 in AGENTS.md: write access to
     # runners.yaml is equivalent to arbitrary shell execution here).
-    execution_root = Path((task.get("assignment") or {}).get("worktree") or ROOT)
+    execution_root = _task_execution_root(task)
     result = _sp.run(cmd, shell=True, cwd=str(execution_root), stdin=_sp.DEVNULL)
     # Audit log
     audit = {
@@ -10508,7 +10713,7 @@ def _task_result_references(state_file: Path, task: dict) -> list[dict]:
 
 
 def _write_task_result(state_file: Path, state: dict, task: dict) -> Path:
-    cwd = Path((task.get("assignment") or {}).get("worktree") or ROOT).resolve()
+    cwd = _task_execution_root(task).resolve()
     try:
         changed_files = _task_changed_paths(task, cwd) if task.get("assignment") else []
         generation_error = None
@@ -10700,6 +10905,20 @@ def _create_remediation_task(
     remediation_id = f"{remediation_root}-fix-{attempt}"
     if remediation_id in tasks:
         return {"created": False, "strategy": "remediation-task", "task": remediation_id, "reason": "already exists"}
+
+    # Capture whatever the failed attempt already wrote, if it ran in a real
+    # linked worktree, so the remediation task can inherit it instead of
+    # starting over from a clean base_commit -- see _apply_inherited_diff_patch.
+    original_assignment = original.get("assignment") or {}
+    if original_assignment.get("isolation") == "linked-worktree" and original_assignment.get("worktree"):
+        patch_bytes = _capture_worktree_diff_patch(
+            Path(original_assignment["worktree"]),
+            original_assignment.get("base_commit") or original.get("base_commit") or "HEAD",
+        )
+        if patch_bytes:
+            patch_path = _remediation_patch_path(state_file, remediation_id)
+            patch_path.parent.mkdir(parents=True, exist_ok=True)
+            patch_path.write_bytes(patch_bytes)
 
     copied = json.loads(json.dumps(original))
     copied.update({
@@ -10899,7 +11118,7 @@ def _cmd_qa_run_authoritative(args: argparse.Namespace) -> dict:
         raise EngineError(f"unknown task: {args.id}")
     if task["status"] not in {"implementation-complete", "qa-passed"}:
         raise EngineError(f"qa run requires implementation-complete (or qa-passed recovery), found {task['status']}")
-    cwd = Path((task.get("assignment") or {}).get("worktree") or ROOT).resolve()
+    cwd = _task_execution_root(task).resolve()
     functional = cmd_verify(argparse.Namespace(state=args.state, id=task["id"], workdir=str(cwd)))
     design = _design_validation(state_file, task) if _load_rules().get("design_policy_required", True) else {"passed": True, "checks": [], "disabled": True}
     contract = _contract_convergence(task, cwd) if _load_rules().get("contract_convergence_required", True) else {"passed": True, "checks": [], "disabled": True}
@@ -11040,7 +11259,7 @@ def cmd_review_submit(args: argparse.Namespace) -> dict:
     for key in ("runner", "model", "agent_id"):
         if not str(payload.get(key) or "").strip():
             raise EngineError(f"recommendation requires reviewer {key}")
-    cwd = Path((task.get("assignment") or {}).get("worktree") or ROOT)
+    cwd = _task_execution_root(task)
     for item in payload.get("evidence", []):
         evidence_path = Path(str(item))
         candidates = [evidence_path] if evidence_path.is_absolute() else [cwd / evidence_path, ROOT / evidence_path]
@@ -11100,7 +11319,7 @@ def _qa_evidence_is_current(state_file: Path, task: dict) -> tuple[bool, str]:
         return False, "QA evidence is invalid JSON"
     if payload.get("status") != "pass":
         return False, f"QA status is {payload.get('status')}"
-    cwd = Path((task.get("assignment") or {}).get("worktree") or ROOT)
+    cwd = _task_execution_root(task)
     current = _evidence_fingerprint(task, cwd)
     if payload.get("fingerprint") != current:
         return False, "QA evidence fingerprint is stale"
@@ -11204,7 +11423,7 @@ def cmd_review_apply(args: argparse.Namespace) -> dict:
     design = _design_validation(state_file, task)
     if not design.get("passed"):
         raise EngineError("design evidence is stale or failing")
-    cwd = Path(assignment.get("worktree") or ROOT)
+    cwd = _execution_root_for_assignment(assignment)
     contract = _contract_convergence(task, cwd)
     if not contract.get("passed"):
         raise EngineError("contract evidence is stale or failing")
@@ -11251,7 +11470,7 @@ def _delivery_not_applicable(task: dict) -> tuple[bool, str | None]:
     if declared and all(path.startswith(".ai-work/") for path in declared):
         return True, "task scope contains only AI-Kit control-plane artifacts"
     assignment = task.get("assignment") or {}
-    cwd = Path(assignment.get("worktree") or ROOT)
+    cwd = _execution_root_for_assignment(assignment)
     if assignment:
         changed = _task_changed_paths(task, cwd)
         if not changed:
@@ -11271,7 +11490,7 @@ def _delivery_check(state_file: Path, task: dict, commit: str) -> dict:
     checks.append({"name": "reachable-from-integration-branch", "status": "pass" if reachable.returncode == 0 else "fail", "detail": branch})
     assignment = task.get("assignment") or {}
     base = assignment.get("base_commit") or task.get("base_commit")
-    worktree = Path(assignment.get("worktree") or ROOT)
+    worktree = _execution_root_for_assignment(assignment)
     if assignment and worktree.exists():
         changed_paths = _task_changed_paths(task, worktree)
         mismatches = []
@@ -11310,7 +11529,7 @@ def _delivery_check(state_file: Path, task: dict, commit: str) -> dict:
     checks.append({"name": "review-current", "status": "pass" if review_current and review_referenced else "fail", "detail": review_detail if review_referenced else "review recommendation is not attached to task lifecycle evidence"})
     design = _design_validation(state_file, task)
     checks.append({"name": "design-current", "status": "pass" if design.get("passed") else "fail"})
-    contract = _contract_convergence(task, Path((task.get("assignment") or {}).get("worktree") or ROOT))
+    contract = _contract_convergence(task, _task_execution_root(task))
     # Contract tasks become approved at review apply; a defines ref is current
     # at delivery when it is approved, even though pre-review QA expected proposed.
     if task.get("task_kind") == "contract":
@@ -11485,7 +11704,8 @@ def cmd_verify(args: argparse.Namespace) -> dict:
     task = task_map(state).get(args.id)
     if not task:
         raise EngineError(f"unknown task: {args.id}")
-    run_root = Path(getattr(args, "workdir", None) or (task.get("assignment") or {}).get("worktree") or ROOT).resolve()
+    workdir_override = getattr(args, "workdir", None)
+    run_root = Path(workdir_override).resolve() if workdir_override else _task_execution_root(task).resolve()
     report = {"task": task["id"], "checks": [], "passed": True}
     print(f"Verifying task {task['id']}...", file=sys.stderr)
     manifest = _config_path("kit.yaml")
@@ -11636,8 +11856,8 @@ def parser() -> argparse.ArgumentParser:
     config_show = config_sub.add_parser("show"); config_show.add_argument("--effective", action="store_true", default=True); config_show.set_defaults(fn=cmd_config_show)
     config_validate = config_sub.add_parser("validate"); config_validate.set_defaults(fn=cmd_config_validate)
     config_migrate = config_sub.add_parser("migrate"); config_migrate.add_argument("--force", action="store_true"); config_migrate.set_defaults(fn=cmd_config_migrate)
-    add = sub.add_parser("add-task"); add.add_argument("id"); add.add_argument("--title", required=True); add.add_argument("--owner", required=True); add.add_argument("--phase", required=True); add.add_argument("--needs", nargs="*"); add.add_argument("--depends-on", action="append", default=[], metavar="PATH"); add.add_argument("--acceptance", nargs="+", action="append", required=True); add.add_argument("--files", nargs="*"); add.add_argument("--forbidden-file", action="append", default=[]); add.add_argument("--constraint", action="append", default=[]); add.add_argument("--required-check", action="append", default=[]); add.add_argument("--qa-command", action="append", default=[]); add.add_argument("--output-export", action="append", default=[]); add.add_argument("--output-evidence-kind", action="append", default=[]); add.add_argument("--no-changed-files", action="store_true"); add.add_argument("--tags", nargs="*"); add.add_argument("--context"); add.add_argument("--epic"); add.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); add.add_argument("--required-capability", action="append", default=[]); add.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); add.add_argument("--actor", default="planner"); add.set_defaults(fn=cmd_add_task)
-    update = sub.add_parser("update-task"); update.add_argument("id"); update.add_argument("--add-acceptance", nargs="+", action="append"); update.add_argument("--add-files", nargs="*"); update.add_argument("--add-tags", nargs="*"); update.add_argument("--add-forbidden-file", action="append"); update.add_argument("--add-constraint", action="append"); update.add_argument("--add-required-check", action="append"); update.add_argument("--add-qa-command", action="append"); update.add_argument("--add-output-export", action="append"); update.add_argument("--add-output-evidence-kind", action="append"); update.add_argument("--actor", default="planner"); update.set_defaults(fn=cmd_update_task)
+    add = sub.add_parser("add-task"); add.add_argument("id"); add.add_argument("--title", required=True); add.add_argument("--owner", required=True); add.add_argument("--phase", required=True); add.add_argument("--needs", nargs="*"); add.add_argument("--depends-on", action="append", default=[], metavar="PATH"); add.add_argument("--acceptance", nargs="+", action="append", required=True); add.add_argument("--files", nargs="*"); add.add_argument("--forbidden-file", action="append", default=[]); add.add_argument("--constraint", action="append", default=[]); add.add_argument("--required-check", action="append", default=[]); add.add_argument("--qa-command", action="append", default=[]); add.add_argument("--output-export", action="append", default=[]); add.add_argument("--output-evidence-kind", action="append", default=[]); add.add_argument("--no-changed-files", action="store_true"); add.add_argument("--tags", nargs="*"); add.add_argument("--context"); add.add_argument("--epic"); add.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); add.add_argument("--required-capability", action="append", default=[]); add.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); add.add_argument("--allow-relative-runtime-path", action="store_true", help="skip the .venv/node_modules relative-path check on --qa-command"); add.add_argument("--actor", default="planner"); add.set_defaults(fn=cmd_add_task)
+    update = sub.add_parser("update-task"); update.add_argument("id"); update.add_argument("--add-acceptance", nargs="+", action="append"); update.add_argument("--add-files", nargs="*"); update.add_argument("--add-tags", nargs="*"); update.add_argument("--add-forbidden-file", action="append"); update.add_argument("--add-constraint", action="append"); update.add_argument("--add-required-check", action="append"); update.add_argument("--add-qa-command", action="append"); update.add_argument("--set-qa-commands", nargs="*", default=None, help="replace qa_contract.commands entirely (pass no values to keep it empty)"); update.add_argument("--clear-qa-commands", action="store_true", help="empty qa_contract.commands"); update.add_argument("--add-output-export", action="append"); update.add_argument("--add-output-evidence-kind", action="append"); update.add_argument("--allow-relative-runtime-path", action="store_true", help="skip the .venv/node_modules relative-path check on new/replaced QA commands"); update.add_argument("--actor", default="planner"); update.set_defaults(fn=cmd_update_task)
     ready = sub.add_parser("ready"); ready.add_argument("--context"); ready.add_argument("--epic"); ready.set_defaults(fn=cmd_ready)
     plan = sub.add_parser("plan"); plan.add_argument("--idea", required=True); plan.add_argument("--workflow", default="feature"); plan.add_argument("--owner", required=True); plan.add_argument("--acceptance", nargs="+", action="append", required=True); plan.add_argument("--files", nargs="*"); plan.add_argument("--forbidden-file", action="append", default=[]); plan.add_argument("--constraint", action="append", default=[]); plan.add_argument("--required-check", action="append", default=[]); plan.add_argument("--qa-command", action="append", default=[]); plan.add_argument("--output-export", action="append", default=[]); plan.add_argument("--output-evidence-kind", action="append", default=[]); plan.add_argument("--no-changed-files", action="store_true"); plan.add_argument("--tags", nargs="*"); plan.add_argument("--phase", default="build"); plan.add_argument("--context"); plan.add_argument("--epic"); plan.add_argument("--depends-on", action="append", default=[], metavar="PATH"); plan.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); plan.add_argument("--required-capability", action="append", default=[]); plan.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); plan.add_argument("--scope"); plan.add_argument("--out-of-scope"); plan.add_argument("--risks", nargs="*"); plan.add_argument("--assumptions"); plan.add_argument("--actor", default="planner"); plan.add_argument("--force", action="store_true"); plan.set_defaults(fn=cmd_plan)
     plan_draft = sub.add_parser("plan-draft", help="create, revise, finalize, and materialize a collaborative plan draft")
@@ -11667,7 +11887,7 @@ def parser() -> argparse.ArgumentParser:
     review_apply = review_sub.add_parser("apply"); review_apply.add_argument("id"); review_apply.add_argument("--evidence"); review_apply.set_defaults(fn=cmd_review_apply)
     design = sub.add_parser("design", help="executable design governance"); design_sub = design.add_subparsers(dest="design_command", required=True)
     design_rules = design_sub.add_parser("rules"); design_rules.add_argument("--task"); design_rules.set_defaults(fn=cmd_design_rules)
-    design_assess = design_sub.add_parser("assess"); design_assess.add_argument("id"); design_assess.add_argument("--input", required=True); design_assess.add_argument("--actor", required=True); design_assess.add_argument("--agent-id"); design_assess.set_defaults(fn=cmd_design_assess)
+    design_assess = design_sub.add_parser("assess"); design_assess.add_argument("id"); design_assess.add_argument("--input", help="assessment JSON file; mutually exclusive with --auto"); design_assess.add_argument("--auto", metavar="REASON", help="mark every applicable rule 'pass' with this one shared, human-provided reason instead of writing per-rule JSON by hand"); design_assess.add_argument("--actor", required=True); design_assess.add_argument("--agent-id"); design_assess.set_defaults(fn=cmd_design_assess)
     design_validate = design_sub.add_parser("validate"); design_validate.add_argument("id"); design_validate.add_argument("--evidence"); design_validate.set_defaults(fn=cmd_design_validate)
     design_exception = design_sub.add_parser("exception"); design_exception.add_argument("id"); design_exception.add_argument("rule"); design_exception.add_argument("--reason", required=True); design_exception.add_argument("--actor", required=True); design_exception.add_argument("--decision"); design_exception.add_argument("--confirmed-by-user", action="store_true"); design_exception.set_defaults(fn=cmd_design_exception)
     contract = sub.add_parser("contract", help="contract registry and lifecycle"); contract_sub = contract.add_subparsers(dest="contract_command", required=True)
