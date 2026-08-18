@@ -43,6 +43,19 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   [[ "$hooks" == ".githooks" ]] && ok "Git hooks configured" || note "Git hooks not configured; run bootstrap.sh"
 fi
 
+# .ai-config/config.yaml (the "modern" runtime schema) and
+# .ai-config/automation.yaml (the "legacy" one) can both exist at once --
+# install.sh seeds config.yaml into every project by default. When both are
+# present, _load_post_completion_config() reads config.yaml EXCLUSIVELY and
+# silently ignores automation.yaml in its entirety, with no warning anywhere.
+# Editing automation.yaml (e.g. to turn off dispatch_ready_on_close) then has
+# *zero effect* and looks like the setting didn't take -- costly to
+# rediscover, since nothing else here even hints that a second, higher-
+# priority config file exists.
+if [[ -f .ai-config/config.yaml && -f .ai-config/automation.yaml ]]; then
+  note "both .ai-config/config.yaml and .ai-config/automation.yaml exist — config.yaml wins entirely and automation.yaml is silently ignored (not merged). Edit config.yaml's automation.* section, or delete config.yaml if automation.yaml is the one you intend to use."
+fi
+
 configured_checks=0
 for key in test_command typecheck_command build_command lint_command; do
   # Scoped to the `verification:` block, exactly like ai_kit.py's
