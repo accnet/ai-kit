@@ -118,6 +118,45 @@ class EngineTestCase(unittest.TestCase):
             setattr(ai_kit, name, value)
         self._tmp.cleanup()
 
+    def write_central_runtime_config(
+        self,
+        profiles: dict[str, dict],
+        *,
+        default_name: str,
+        default_model: str | None = None,
+        automation_enabled: bool = False,
+        qa_mode: str = "disabled",
+        qa_runner: str | None = None,
+        qa_model: str | None = None,
+        review_mode: str = "not-required",
+        review_runner: str | None = None,
+        review_model: str | None = None,
+    ) -> None:
+        """Write the minimal centralized runtime fixture used by engine tests."""
+        review = {"mode": review_mode}
+        if review_runner:
+            review["runner"] = review_runner
+        if review_model:
+            review["model"] = review_model
+        config = {
+            "version": 1,
+            "runners": {
+                "default": {"name": default_name, "model": default_model},
+                "profiles": profiles,
+                "aliases": {},
+            },
+            "automation": {
+                "enabled": automation_enabled,
+                "quality": {
+                    "qa": {"mode": qa_mode, "runner": qa_runner, "model": qa_model},
+                    "review": review,
+                },
+            },
+        }
+        (self.root / ".ai-config" / "config.yaml").write_text(
+            ai_kit._dump_runtime_yaml(config), encoding="utf-8"
+        )
+
     def _use_canonical_kit_root(self) -> None:
         """Copy installed routing inputs into this test's Git-free root."""
         if EngineTestCase._canonical_root is None:
@@ -449,11 +488,12 @@ class GovernedControlPlaneTests(EngineTestCase):
             ))
 
     def test_runner_selection_is_capability_priority_and_capacity_aware(self) -> None:
-        (self.root / ".ai-config" / "runners.yaml").write_text(
-            "runners:\n"
-            "  low:\n    command: \"true {prompt}\"\n    capabilities: [implementation]\n    roles: [backend]\n    task_kinds: [implementation]\n    priority: 10\n    max_parallel: 1\n"
-            "  high:\n    command: \"true {prompt}\"\n    capabilities: [implementation, testing]\n    roles: [backend]\n    task_kinds: [implementation]\n    priority: 100\n    max_parallel: 1\n",
-            encoding="utf-8",
+        self.write_central_runtime_config(
+            {
+                "low": {"command": "true {prompt}", "capabilities": ["implementation"], "roles": ["backend"], "task_kinds": ["implementation"], "priority": 10, "max_parallel": 1},
+                "high": {"command": "true {prompt}", "capabilities": ["implementation", "testing"], "roles": ["backend"], "task_kinds": ["implementation"], "priority": 100, "max_parallel": 1},
+            },
+            default_name="high",
         )
         self.init_workflow(); self.add_task("T1", task_kind="implementation", required_capability=["testing"])
         state = ai_kit.load(self.state_file); task = ai_kit.task_map(state)["T1"]
@@ -636,11 +676,13 @@ class GovernedControlPlaneTests(EngineTestCase):
         self.assertEqual(refs[0]["sha256"], result["sha256"])
 
     def test_pool_scheduler_assigns_all_eligible_runners_deterministically(self) -> None:
-        (self.root / ".ai-config" / "runners.yaml").write_text(
-            "runners:\n"
-            "  high:\n    command: \"runner --model {model} {prompt}\"\n    models: [fast, thorough]\n    pool_model: thorough\n    capabilities: [implementation, testing]\n    roles: [backend]\n    task_kinds: [implementation]\n    priority: 100\n    max_parallel: 1\n"
-            "  low:\n    command: \"true {prompt}\"\n    capabilities: [implementation]\n    roles: [backend]\n    task_kinds: [implementation]\n    priority: 10\n    max_parallel: 1\n",
-            encoding="utf-8",
+        self.write_central_runtime_config(
+            {
+                "high": {"command": "runner --model {model} {prompt}", "models": ["fast", "thorough"], "pool_model": "thorough", "capabilities": ["implementation", "testing"], "roles": ["backend"], "task_kinds": ["implementation"], "priority": 100, "max_parallel": 1},
+                "low": {"command": "true {prompt}", "capabilities": ["implementation"], "roles": ["backend"], "task_kinds": ["implementation"], "priority": 10, "max_parallel": 1},
+            },
+            default_name="high",
+            default_model="thorough",
         )
         self.init_workflow()
         self.add_task("A", task_kind="implementation", required_capability=["testing"])
@@ -2422,9 +2464,6 @@ class CentralRuntimeConfigTests(EngineTestCase):
 
     def test_central_config_is_authoritative_and_strictly_validated(self) -> None:
         self.write_runtime_config()
-        (self.root / ".ai-config" / "runners.yaml").write_text(
-            "runners:\n  ignored:\n    command: 'false {prompt}'\n", encoding="utf-8"
-        )
         config = ai_kit._load_runtime_config()
         self.assertEqual(config["runners"]["default"]["name"], "worker")
         self.assertEqual(set(ai_kit._load_runners()), {"worker"})
@@ -2441,24 +2480,6 @@ class CentralRuntimeConfigTests(EngineTestCase):
         check = next(item for item in result["checks"] if item["name"] == "review-policy-consistency")
         self.assertFalse(check["passed"])
 
-    def test_legacy_disabled_reviewer_defaults_to_not_required(self) -> None:
-        (self.root / ".ai-config" / "runners.yaml").write_text(
-            "default_executor: worker\ndefault_model: model-a\nrunners:\n"
-            "  worker:\n    command: 'runner -m {model} {prompt}'\n    models: [model-a]\n",
-            encoding="utf-8",
-        )
-        (self.root / ".ai-config" / "automation.yaml").write_text(
-            "roles:\n  qa:\n    enabled: false\n  reviewer:\n    enabled: false\n"
-            "post_completion:\n  enabled: false\n",
-            encoding="utf-8",
-        )
-        config = ai_kit._legacy_effective_runtime_config()
-        self.assertEqual(config["automation"]["quality"]["review"]["mode"], "not-required")
-        self.assertTrue(config["automation"]["quality"]["completion"]["auto_resolve_review_when_not_required"])
-        roles = ai_kit._load_automation_roles()
-        self.assertEqual(roles["reviewer"]["mode"], "not-required")
-        self.assertEqual(roles["qa"]["mode"], "disabled")
-
     def test_plan_authorization_is_bound_to_the_exact_digest(self) -> None:
         draft = {
             "schema_version": 3, "id": "P1", "revision": 3, "title": "Plan", "workflow": "feature",
@@ -2473,27 +2494,6 @@ class CentralRuntimeConfigTests(EngineTestCase):
         current, detail = ai_kit._current_plan_execution_authorization(draft)
         self.assertFalse(current)
         self.assertIn("stale", detail)
-
-    def test_config_migrate_promotes_legacy_files_without_merging(self) -> None:
-        (self.root / ".ai-config" / "rules.yaml").write_text("review_required: false\n", encoding="utf-8")
-        (self.root / ".ai-config" / "runners.yaml").write_text(
-            "default_executor: worker\ndefault_model: model-a\nrunners:\n"
-            "  worker:\n    command: 'runner -m {model} {prompt}'\n    models: [model-a]\n"
-            "    capabilities: [implementation]\n    roles: [backend]\n    task_kinds: [general]\n"
-            "    priority: 10\n    max_parallel: 1\n",
-            encoding="utf-8",
-        )
-        (self.root / ".ai-config" / "automation.yaml").write_text(
-            "roles:\n  qa:\n    enabled: false\n  reviewer:\n    enabled: false\n"
-            "post_completion:\n  enabled: false\n",
-            encoding="utf-8",
-        )
-        result = ai_kit.cmd_config_migrate(ns(force=False))
-        self.assertTrue((self.root / ".ai-config" / "config.yaml").is_file())
-        self.assertTrue(result["valid"])
-        self.assertEqual(ai_kit._load_runtime_config()["runners"]["default"]["name"], "worker")
-        (self.root / ".ai-config" / "runners.yaml").write_text("runners: {}\n", encoding="utf-8")
-        self.assertEqual(set(ai_kit._load_runners()), {"worker"})
 
     def test_review_not_required_creates_auditable_policy_evidence(self) -> None:
         self.write_runtime_config(review_mode="not-required")
@@ -2606,38 +2606,24 @@ class CentralRuntimeConfigTests(EngineTestCase):
 
 
 class PostCompletionConfigTests(EngineTestCase):
-    """_load_post_completion_config / _post_completion_enabled: opt-in switch
-    read from .ai-config/automation.yaml, defaulting to disabled."""
+    """Automation settings are read from the central runtime config."""
 
-    def _write_automation(self, body: str) -> None:
-        (self.root / ".ai-config" / "automation.yaml").write_text(body, encoding="utf-8")
-
-    def test_missing_automation_yaml_defaults_disabled(self) -> None:
-        self.assertFalse(ai_kit._post_completion_enabled())
-
-    def test_missing_post_completion_section_defaults_disabled(self) -> None:
-        self._write_automation("roles:\n  qa:\n    runner: x\n  reviewer:\n    runner: y\n")
-        self.assertFalse(ai_kit._post_completion_enabled())
-
-    def test_enabled_true_is_parsed(self) -> None:
-        self._write_automation(
-            "roles:\n  qa:\n    runner: x\n  reviewer:\n    runner: y\n"
-            "post_completion:\n  enabled: true\n"
+    def _write_automation(self, enabled: bool) -> None:
+        self.write_central_runtime_config(
+            {"worker": {"command": "true {prompt}", "capabilities": ["implementation"]}},
+            default_name="worker",
+            automation_enabled=enabled,
         )
+
+    def test_missing_runtime_config_defaults_disabled(self) -> None:
+        self.assertFalse(ai_kit._post_completion_enabled())
+
+    def test_enabled_true_is_read_from_config(self) -> None:
+        self._write_automation(True)
         self.assertTrue(ai_kit._post_completion_enabled())
 
-    def test_enabled_false_is_parsed(self) -> None:
-        self._write_automation(
-            "roles:\n  qa:\n    runner: x\n  reviewer:\n    runner: y\n"
-            "post_completion:\n  enabled: false\n"
-        )
-        self.assertFalse(ai_kit._post_completion_enabled())
-
-    def test_malformed_enabled_value_defaults_disabled(self) -> None:
-        self._write_automation(
-            "roles:\n  qa:\n    runner: x\n  reviewer:\n    runner: y\n"
-            "post_completion:\n  enabled: maybe\n"
-        )
+    def test_enabled_false_is_read_from_config(self) -> None:
+        self._write_automation(False)
         self.assertFalse(ai_kit._post_completion_enabled())
 
 
@@ -2659,30 +2645,28 @@ class TaskLockTests(EngineTestCase):
 
 class AutomationRunnersTestCase(EngineTestCase):
     """Base fixture: a distinct executor/qa/reviewer runner identity in
-    .ai-config/runners.yaml + automation.yaml, and a task started through to
+    config.yaml, and a task started through to
     'implementation-complete' so _dispatch_approval/_run_post_completion/
     cmd_pipeline tests can begin from a realistic starting point."""
 
     def setUp(self) -> None:
         super().setUp()
-        (self.root / ".ai-config" / "runners.yaml").write_text(
-            "default_executor: \"executor-runner\"\n"
-            "default_model: \"exec-model\"\n"
-            "\n"
-            "runners:\n"
-            "  executor-runner:\n"
-            "    command: \"true {prompt} {model}\"\n"
-            "    models: [\"exec-model\"]\n"
-            "  qa-runner:\n"
-            "    command: \"true {prompt} {model}\"\n"
-            "    models: [\"qa-model\"]\n"
-            "  reviewer-runner:\n"
-            "    command: \"true {prompt} {model}\"\n"
-            "    models: [\"reviewer-model\"]\n",
-            encoding="utf-8",
+        self.write_central_runtime_config(
+            {
+                "executor-runner": {"command": "true {prompt} {model}", "models": ["exec-model"]},
+                "qa-runner": {"command": "true {prompt} {model}", "models": ["qa-model"]},
+                "reviewer-runner": {"command": "true {prompt} {model}", "models": ["reviewer-model"]},
+            },
+            default_name="executor-runner",
+            default_model="exec-model",
+            automation_enabled=False,
+            qa_mode="local",
+            qa_runner="qa-runner",
+            qa_model="qa-model",
+            review_mode="independent",
+            review_runner="reviewer-runner",
+            review_model="reviewer-model",
         )
-        self._write_automation_roles(qa="qa-runner", qa_model="qa-model",
-                                      reviewer="reviewer-runner", reviewer_model="reviewer-model")
         self.init_workflow()
         self.add_task("T1", owner="backend")
         # These classes exercise the retained v4 compatibility pipeline.
@@ -2696,11 +2680,16 @@ class AutomationRunnersTestCase(EngineTestCase):
         contract_path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
 
     def _write_automation_roles(self, qa: str, qa_model: str, reviewer: str, reviewer_model: str) -> None:
-        (self.root / ".ai-config" / "automation.yaml").write_text(
-            "roles:\n"
-            f"  qa:\n    runner: {qa}\n    model: {qa_model}\n"
-            f"  reviewer:\n    runner: {reviewer}\n    model: {reviewer_model}\n",
-            encoding="utf-8",
+        config = ai_kit._load_runtime_config()
+        assert config is not None
+        config["automation"]["quality"]["qa"].update(
+            {"mode": "local", "runner": qa, "model": qa_model}
+        )
+        config["automation"]["quality"]["review"].update(
+            {"mode": "independent", "runner": reviewer, "model": reviewer_model}
+        )
+        (self.root / ".ai-config" / "config.yaml").write_text(
+            ai_kit._dump_runtime_yaml(config), encoding="utf-8"
         )
 
     def bring_to_implementation_complete(self, task_id: str = "T1") -> None:
@@ -3001,7 +2990,7 @@ class PipelineOrchestrationTests(AutomationRunnersTestCase):
 
 class TransitionCompletePostCompletionIntegrationTests(EngineTestCase):
     """cmd_transition('complete') only chains into _run_post_completion when
-    .ai-config/automation.yaml opts in via post_completion.enabled: true."""
+    automation.enabled in .ai-config/config.yaml is true."""
 
     def test_complete_does_not_trigger_post_completion_by_default(self) -> None:
         self.init_workflow()
@@ -3013,8 +3002,10 @@ class TransitionCompletePostCompletionIntegrationTests(EngineTestCase):
         self.assertEqual(task["status"], "implementation-complete")
 
     def test_complete_triggers_post_completion_when_enabled(self) -> None:
-        (self.root / ".ai-config" / "automation.yaml").write_text(
-            "post_completion:\n  enabled: true\n", encoding="utf-8")
+        self.write_central_runtime_config(
+            {"worker": {"command": "true {prompt}", "capabilities": ["implementation"]}},
+            default_name="worker", automation_enabled=True,
+        )
         self.init_workflow()
         self.add_task("T1", owner="backend")
         self.transition("T1", "start", actor="backend")
@@ -3025,8 +3016,10 @@ class TransitionCompletePostCompletionIntegrationTests(EngineTestCase):
         self.assertEqual(post_mock.call_args.args[0], "T1")
 
     def test_complete_records_event_when_post_completion_raises(self) -> None:
-        (self.root / ".ai-config" / "automation.yaml").write_text(
-            "post_completion:\n  enabled: true\n", encoding="utf-8")
+        self.write_central_runtime_config(
+            {"worker": {"command": "true {prompt}", "capabilities": ["implementation"]}},
+            default_name="worker", automation_enabled=True,
+        )
         self.init_workflow()
         self.add_task("T1", owner="backend")
         self.transition("T1", "start", actor="backend")

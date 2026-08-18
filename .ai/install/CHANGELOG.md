@@ -16,7 +16,7 @@
 - `.ai-config/config.yaml` version 1 is the sole runtime authority for runners,
   digest-bound plan auto-execution, global scheduler/isolation limits, local
   QA, review policy, completion, and bounded failure handling. The split
-  `runners.yaml` and `automation.yaml` templates are removed.
+  Split runner/automation templates and fallback paths are removed.
 - Review `not-required` now produces explicit policy-waiver evidence. The
   `remediation-task` failure strategy creates a versioned fix task and rewires
   downstream DAG/task contracts instead of looping the rejected task forever.

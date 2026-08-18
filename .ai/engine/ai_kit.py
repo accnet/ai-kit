@@ -156,8 +156,6 @@ WORKFLOW_STATE_SCHEMA_VERSION = 5
 TASK_LEASE_SECONDS = 30 * 60
 CONFIG_FILES = {
     "config.yaml",
-    "runners.yaml",
-    "automation.yaml",
     "registry.yaml",
     "contexts.yaml",
     "epics.yaml",
@@ -274,9 +272,8 @@ def _runtime_config_path() -> Path | None:
     project = _project_runtime_config_path()
     if project.is_file():
         return project
-    # The bundled seed is authoritative even when an older project still has
-    # split files. Legacy files are imported only by the explicit
-    # `config migrate` command; they never silently override config.yaml.
+    # The bundled seed is the only fallback when a project-owned config has
+    # not been materialized yet.
     template = ROOT / ".ai" / "install" / "config" / "config.yaml"
     return template if template.is_file() else None
 
@@ -646,204 +643,65 @@ def _load_epics() -> dict:
 
 
 def _load_runners() -> dict:
-    """Load runner profiles from the structured YAML registry."""
+    """Load runner profiles from the centralized runtime config."""
     runtime = _load_runtime_config()
-    if runtime:
-        return runtime["runners"]["profiles"]
-    return _load_yaml_registry(".ai-config/runners.yaml", "runners")
-
-
-def _parse_role_enabled(value) -> bool:
-    """Interpret an automation.yaml 'enabled' scalar. Absent means True."""
-    if value is None:
-        return True
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().strip("\"'").lower()
-    if text in {"true", "yes", "1", "on"}:
-        return True
-    if text in {"false", "no", "0", "off"}:
-        return False
-    raise EngineError(f".ai-config/automation.yaml: invalid 'enabled' value {value!r}; use true/false")
+    return runtime["runners"]["profiles"] if runtime else {}
 
 
 def _load_automation_roles() -> dict:
-    """Load and validate the qa/reviewer role -> runner:model mapping.
-
-    Format (.ai-config/automation.yaml):
-      roles:
-        qa:
-          enabled: true
-          runner: opencode-cli
-          model: deepseek-v4-flash
-        reviewer:
-          enabled: false
-          runner: opencode-cli
-          model: deepseek-v4-pro
-    'enabled' (optional, default true) toggles whether post-completion
-    automation (`ai-kit pipeline` / the opt-in post_completion trigger)
-    auto-dispatches that role to its configured runner at all. Set it to
-    'false' to leave a task parked at the status just before that role's
-    verdict -- `implementation-complete` for qa, `qa-passed` for review --
-    instead of spawning a CLI subprocess for it. That parked state is the
-    handoff point for a human or an interactive session (not a dispatched
-    subprocess) to verify by hand via `ai-kit approve`/`transition`; see
-    `_run_post_completion`'s manual-wait branches. 'runner' is required only
-    when the role is enabled -- a disabled role may omit it, since there is
-    nothing to dispatch to.
-    Deliberately does NOT define 'executor' here: runners.yaml's
-    default_executor/default_model already is the single source of truth for
-    "which runner/model executes a task" (used by plain `dispatch` and
-    `dispatch-ready`). Redefining it a second time in automation.yaml would
-    let the two drift out of sync with no error; `ai-kit pipeline` instead
-    resolves executor via `_resolve_runner(None, None)`, the same fallback
-    plain `dispatch` uses. automation.yaml only needs to add the two roles
-    (qa, reviewer) that have no equivalent anywhere else in the registry.
-    """
+    """Project QA/review role projection from ``config.yaml``."""
     runtime = _load_runtime_config()
-    if runtime:
-        quality = runtime["automation"].get("quality", {})
-        qa = quality.get("qa", {})
-        review = quality.get("review", {})
-        roles = {
-            "qa": {"enabled": qa.get("mode", "local") == "local", "mode": qa.get("mode", "local")},
-            "reviewer": {
-                "enabled": review.get("mode", "manual") == "independent",
-                "mode": review.get("mode", "manual"),
-                "runner": review.get("runner"),
-                "model": review.get("model"),
-                "backup_runner": review.get("backup_runner"),
-                "backup_model": review.get("backup_model"),
-            },
+    if not runtime:
+        return {
+            "qa": {"enabled": False, "mode": "disabled"},
+            "reviewer": {"enabled": False, "mode": "not-required"},
         }
-        return roles
-    roles = _load_yaml_registry(".ai-config/automation.yaml", "roles")
-    for name in ("qa", "reviewer"):
-        if name not in roles:
-            raise EngineError(
-                f".ai-config/automation.yaml is missing role '{name}'; add a 'roles.{name}.runner' "
-                f"(and optional 'model') entry naming a runner registered in .ai-config/runners.yaml, "
-                f"or 'roles.{name}.enabled: false' to verify it manually instead"
-            )
-        roles[name]["enabled"] = _parse_role_enabled(roles[name].get("enabled"))
-        # Legacy automation.yaml only had an enabled flag.  Normalize it to
-        # the central runtime vocabulary so a disabled reviewer is an explicit
-        # policy waiver instead of silently parking tasks for manual review.
-        if name == "qa":
-            roles[name].setdefault("mode", "local" if roles[name]["enabled"] else "disabled")
-        else:
-            roles[name].setdefault("mode", "independent" if roles[name]["enabled"] else "not-required")
-        if roles[name]["enabled"] and not roles[name].get("runner"):
-            raise EngineError(
-                f".ai-config/automation.yaml role '{name}' is enabled but has no 'runner'; add one, "
-                f"or set 'roles.{name}.enabled: false' to verify it manually instead"
-            )
-        for backup_key in ("backup_runner", "backup_model"):
-            if backup_key in roles[name] and not isinstance(roles[name][backup_key], str):
-                raise EngineError(f".ai-config/automation.yaml: role '{name}' has invalid '{backup_key}'")
-    return roles
-
-
-_POST_COMPLETION_WARNED: set[str] = set()
-
-
-def _post_completion_warn(message: str) -> None:
-    """Report a post_completion config problem once per process, on stderr."""
-    if message in _POST_COMPLETION_WARNED:
-        return
-    _POST_COMPLETION_WARNED.add(message)
-    print(f"WARNING: {message}", file=sys.stderr)
+    quality = runtime["automation"].get("quality", {})
+    qa = quality.get("qa", {})
+    review = quality.get("review", {})
+    return {
+        "qa": {
+            "enabled": qa.get("mode", "local") == "local",
+            "mode": qa.get("mode", "local"),
+            "runner": qa.get("runner"),
+            "model": qa.get("model"),
+            "backup_runner": qa.get("backup_runner"),
+            "backup_model": qa.get("backup_model"),
+        },
+        "reviewer": {
+            "enabled": review.get("mode", "manual") == "independent",
+            "mode": review.get("mode", "manual"),
+            "runner": review.get("runner"),
+            "model": review.get("model"),
+            "backup_runner": review.get("backup_runner"),
+            "backup_model": review.get("backup_model"),
+        },
+    }
 
 
 def _load_post_completion_config() -> dict:
-    """Load the opt-in post-completion automation switch.
-
-    Format (.ai-config/automation.yaml):
-      post_completion:
-        enabled: true
-    A missing file, missing section, or malformed value all default to
-    'enabled: false' so dispatch/transition/pipeline behavior is unchanged
-    unless an operator explicitly opts in.
-
-    Failing closed is deliberate and must stay that way: this is read from
-    `cmd_transition` on every `complete`, so raising on a bad value would make
-    an unrelated automation typo break the transition the caller actually
-    asked for. What it does NOT do any more is stay quiet about it -- an
-    unknown key or an unparseable value now warns on stderr (once per
-    process). Previously `enabld: true`, `enabled: yes please` or a
-    mis-indented key were indistinguishable from never having configured
-    automation at all, and the only symptom was tasks silently not advancing.
-    """
+    """Load automation settings from the centralized ``config.yaml``."""
     runtime = _load_runtime_config()
-    if runtime:
-        automation = runtime["automation"]
-        execution = automation.get("execution", {})
-        failure = automation.get("failure", {}).get("qa", {})
+    if not runtime:
         return {
-            "enabled": automation.get("enabled", False),
-            "retry_on_rejection": failure.get("strategy", "manual") == "retry-current-task",
-            "max_retries": failure.get("max_attempts", 0),
-            "dispatch_ready_on_close": execution.get("auto_dispatch_ready", False),
-            "dispatch_ready_limit": execution.get("dispatch_ready_limit", 1),
+            "enabled": False,
+            "retry_on_rejection": False,
+            "max_retries": 0,
+            "dispatch_ready_on_close": False,
+            "dispatch_ready_limit": 1,
             "backup_after_retries": 1,
         }
-    BOOL_KEYS = {"enabled", "retry_on_rejection", "dispatch_ready_on_close"}
-    INT_KEYS = {"max_retries": (0, 5), "dispatch_ready_limit": (1, 50), "backup_after_retries": (1, 5)}
-    TRUE = {"true", "yes", "on", "1"}
-    FALSE = {"false", "no", "off", "0"}
-
-    values: dict[str, object] = {
-        "enabled": False, "retry_on_rejection": False, "max_retries": 0,
-        "dispatch_ready_on_close": False, "dispatch_ready_limit": 1, "backup_after_retries": 1,
+    automation = runtime["automation"]
+    execution = automation.get("execution", {})
+    failure = automation.get("failure", {}).get("qa", {})
+    return {
+        "enabled": automation.get("enabled", False),
+        "retry_on_rejection": failure.get("strategy", "manual") == "retry-current-task",
+        "max_retries": failure.get("max_attempts", 0),
+        "dispatch_ready_on_close": execution.get("auto_dispatch_ready", False),
+        "dispatch_ready_limit": execution.get("dispatch_ready_limit", 1),
+        "backup_after_retries": 1,
     }
-    path = _config_path("automation.yaml")
-    if not path.exists():
-        return values
-
-    in_section = False
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        stripped = line.strip()
-        if not line.startswith((" ", "\t")):
-            # Tolerate trailing whitespace after the header, which the previous
-            # exact `line == "post_completion:"` comparison silently rejected.
-            in_section = stripped == "post_completion:"
-            continue
-        if not in_section or not stripped or stripped.startswith("#"):
-            continue
-        match = re.match(r"^\s+([A-Za-z0-9_]+):\s*(.*)$", line)
-        if not match:
-            _post_completion_warn(f"{display_path(path)}:{number}: ignoring unparseable post_completion entry {stripped!r}")
-            continue
-        key, raw = match.group(1), match.group(2).strip().strip('"' + chr(39))
-        raw = raw.split(" #", 1)[0].strip()
-        if key in BOOL_KEYS:
-            if raw.lower() in TRUE:
-                values[key] = True
-            elif raw.lower() in FALSE:
-                values[key] = False
-            else:
-                _post_completion_warn(
-                    f"{display_path(path)}:{number}: post_completion.{key} must be true or false, got {raw!r}; "
-                    f"treating it as false"
-                )
-        elif key in INT_KEYS:
-            low, high = INT_KEYS[key]
-            if re.fullmatch(r"\d+", raw):
-                values[key] = min(high, max(low, int(raw)))
-            else:
-                _post_completion_warn(
-                    f"{display_path(path)}:{number}: post_completion.{key} must be a whole number, got {raw!r}; "
-                    f"keeping the default {values[key]}"
-                )
-        else:
-            known = ", ".join(sorted(BOOL_KEYS | set(INT_KEYS)))
-            _post_completion_warn(
-                f"{display_path(path)}:{number}: ignoring unknown post_completion key {key!r}; expected one of: {known}"
-            )
-
-    if not values["retry_on_rejection"]:
-        values["max_retries"] = 0
-    return values
 
 
 def _post_completion_enabled() -> bool:
@@ -851,82 +709,24 @@ def _post_completion_enabled() -> bool:
 
 
 def _load_runner_aliases() -> dict[str, str]:
-    """Load legacy runner-name aliases from a flat YAML section."""
+    """Load runner aliases from the centralized runtime config."""
     runtime = _load_runtime_config()
-    if runtime:
-        return {str(key): str(value) for key, value in runtime["runners"].get("aliases", {}).items()}
-    path = _config_path("runners.yaml")
-    if not path.exists():
-        return {}
-    aliases: dict[str, str] = {}
-    in_section = False
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if not line.startswith((" ", "\t")):
-            in_section = stripped == "runner_aliases:"  # tolerate trailing whitespace
-            continue
-        if not in_section:
-            continue
-        match = re.match(r"^  (\S+):\s*(.+)$", line)
-        if not match:
-            continue
-        value = match.group(2).strip()
-        if value.startswith('"'):
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError:
-                pass
-        aliases[match.group(1)] = str(value)
-    return aliases
-
-
-def _runner_scalar(value: str) -> str:
-    """Serialize a runner field without losing spaces, quotes, or ``#``."""
-    return json.dumps(value, ensure_ascii=False)
+    return {
+        str(key): str(value)
+        for key, value in (runtime or {}).get("runners", {}).get("aliases", {}).items()
+    }
 
 
 def _default_executor() -> str | None:
-    """Read the top-level `default_executor: <name>` scalar from .ai-config/runners.yaml, or None if unset."""
+    """Read the default runner name from ``config.yaml``."""
     runtime = _load_runtime_config()
-    if runtime:
-        return runtime["runners"]["default"].get("name")
-    path = _config_path("runners.yaml")
-    if not path.exists():
-        return None
-    prefix = "default_executor:"
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.startswith(prefix):
-            value = line[len(prefix):].strip()
-            if value.startswith('"'):
-                try:
-                    value = json.loads(value)
-                except json.JSONDecodeError:
-                    pass
-            return value or None
-    return None
+    return runtime["runners"]["default"].get("name") if runtime else None
 
 
 def _default_model() -> str | None:
-    """Read the top-level default model paired with default_executor."""
+    """Read the default runner model from ``config.yaml``."""
     runtime = _load_runtime_config()
-    if runtime:
-        return runtime["runners"]["default"].get("model")
-    path = _config_path("runners.yaml")
-    if not path.exists():
-        return None
-    prefix = "default_model:"
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.startswith(prefix):
-            value = line[len(prefix):].strip()
-            if value.startswith('"'):
-                try:
-                    value = json.loads(value)
-                except json.JSONDecodeError:
-                    pass
-            return value or None
-    return None
+    return runtime["runners"]["default"].get("model") if runtime else None
 
 
 _entry_models = entry_models
@@ -1004,42 +804,14 @@ def _write_runners(
     aliases: dict[str, str],
 ) -> None:
     runtime = _load_runtime_config()
-    if runtime:
-        runtime["runners"] = {
-            "default": {"name": default_executor, "model": default_model},
-            "profiles": runners,
-            "aliases": aliases,
-        }
-        _write_runtime_config(runtime)
-        return
-    path = _writable_config_path("runners.yaml")
-    lines = []
-    if default_executor:
-        lines.append(f"default_executor: {_runner_scalar(default_executor)}")
-        if default_model:
-            lines.append(f"default_model: {_runner_scalar(default_model)}")
-        lines.append("")
-    lines.append("runners:")
-    for name, fields in sorted(runners.items()):
-        lines.append(f"  {name}:")
-        lines.append(f"    command: {_runner_scalar(fields['command'])}")
-        if fields.get("models"):
-            models = _entry_models(fields)
-            lines.append(f"    models: {json.dumps(models, ensure_ascii=False)}")
-        for key in ("model", "pool_model", "provider", "description", "input"):
-            if fields.get(key) is not None and fields.get(key) != "":
-                lines.append(f"    {key}: {_runner_scalar(str(fields[key]))}")
-        for key in ("capabilities", "roles", "task_kinds"):
-            if fields.get(key):
-                lines.append(f"    {key}: {json.dumps(_entry_list(fields, key), ensure_ascii=False)}")
-        for key in ("priority", "max_parallel"):
-            if fields.get(key) is not None and fields.get(key) != "":
-                lines.append(f"    {key}: {int(fields[key])}")
-    if aliases:
-        lines.extend(["", "runner_aliases:"])
-        for name, target in sorted(aliases.items()):
-            lines.append(f"  {name}: {_runner_scalar(target)}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if not runtime:
+        raise EngineError(".ai-config/config.yaml is required for runner changes")
+    runtime["runners"] = {
+        "default": {"name": default_executor, "model": default_model},
+        "profiles": runners,
+        "aliases": aliases,
+    }
+    _write_runtime_config(runtime)
 
 
 def _render_runner_command(template: str, prompt: str, model: str | None) -> str:
@@ -4632,7 +4404,7 @@ def cmd_transition(args: argparse.Namespace) -> dict:
     sync_tasks_md(state, path)
     _auto_generate_visualizer_data(path)
     if args.action == "complete" and _post_completion_enabled():
-        # Opt-in only (.ai-config/automation.yaml: post_completion.enabled):
+        # Opt-in only (automation.enabled in .ai-config/config.yaml):
         # chain verify -> independent QA -> independent review -> close so a
         # caller never has to remember to run `ai-kit pipeline` by hand. Best
         # effort: failures are recorded as events, not raised, because the
@@ -6081,78 +5853,12 @@ def cmd_runner_list(args: argparse.Namespace) -> dict:
     }
 
 
-def _legacy_effective_runtime_config() -> dict:
-    profiles = _load_yaml_registry(".ai-config/runners.yaml", "runners")
-    for profile in profiles.values():
-        if profile.get("model") and not profile.get("models"):
-            profile["models"] = [profile.pop("model")]
-        for numeric, fallback in (("priority", 0), ("max_parallel", 1)):
-            try:
-                profile[numeric] = int(profile.get(numeric, fallback))
-            except (TypeError, ValueError) as exc:
-                raise EngineError(f"legacy runner {numeric} must be an integer") from exc
-    roles = _load_yaml_registry(".ai-config/automation.yaml", "roles")
-    post = _load_post_completion_config()
-    qa_enabled = _parse_role_enabled((roles.get("qa") or {}).get("enabled")) if roles.get("qa") else False
-    reviewer = roles.get("reviewer") or {}
-    reviewer_enabled = _parse_role_enabled(reviewer.get("enabled")) if reviewer else False
-    review_config = {
-        # A disabled legacy reviewer maps to the explicit policy-waiver mode;
-        # it must not silently park every task waiting for a reviewer that the
-        # operator deliberately disabled.
-        "mode": "independent" if reviewer_enabled else "not-required",
-    }
-    for key in ("runner", "model", "backup_runner", "backup_model"):
-        if reviewer.get(key):
-            review_config[key] = reviewer[key]
-    return _validate_runtime_config({
-        "version": 1,
-        "runners": {
-            "default": {"name": _default_executor(), "model": _default_model()},
-            "profiles": profiles,
-            "aliases": _load_runner_aliases(),
-        },
-        "automation": {
-            "enabled": bool(post.get("enabled")),
-            "planning": {
-                "auto_execute": {
-                    "enabled": False,
-                    "trigger": "plan-materialized",
-                    "require": ["valid_dag", "complete_acceptance_criteria", "current_execution_authorization"],
-                },
-            },
-            "execution": {
-                "mode": "parallel",
-                "max_parallel_tasks": max(1, sum(max(0, int(item.get("max_parallel", 1))) for item in profiles.values())),
-                "auto_dispatch_ready": bool(post.get("dispatch_ready_on_close")),
-                "dispatch_ready_limit": int(post.get("dispatch_ready_limit", 1)),
-                "isolation": {"worktree_per_task": True, "require_disjoint_paths": True},
-            },
-            "quality": {
-                "qa": {"mode": "local" if qa_enabled else "disabled", "max_parallel": 1},
-                "review": review_config,
-                "completion": {
-                    "auto_resolve_review_when_not_required": True,
-                    "auto_close_delivery_not_applicable": True,
-                },
-            },
-            "failure": {
-                "qa": {
-                    "strategy": "retry-current-task" if post.get("retry_on_rejection") else "manual",
-                    "max_attempts": int(post.get("max_retries", 0)),
-                },
-                "review": {"strategy": "manual", "max_attempts": int(post.get("max_retries", 0))},
-            },
-        },
-    })
-
-
 def _effective_runtime_config() -> tuple[dict, str]:
     runtime = _load_runtime_config()
-    if runtime:
-        path = _runtime_config_path()
-        return runtime, display_path(path) if path else "config.yaml"
-    return _legacy_effective_runtime_config(), "legacy:runners.yaml+automation.yaml"
+    if not runtime:
+        raise EngineError(".ai-config/config.yaml is missing")
+    path = _runtime_config_path()
+    return runtime, display_path(path) if path else "config.yaml"
 
 
 def _runtime_config_cross_checks(config: dict) -> list[dict]:
@@ -6206,36 +5912,13 @@ def _runtime_config_cross_checks(config: dict) -> list[dict]:
 
 def cmd_config_show(args: argparse.Namespace) -> dict:
     config, source = _effective_runtime_config()
-    return {"source": source, "authority": source != "legacy:runners.yaml+automation.yaml", "config": config}
+    return {"source": source, "authority": True, "config": config}
 
 
 def cmd_config_validate(args: argparse.Namespace) -> dict:
     config, source = _effective_runtime_config()
     checks = _runtime_config_cross_checks(config)
     return {"source": source, "valid": all(item["passed"] for item in checks), "passed": all(item["passed"] for item in checks), "checks": checks}
-
-
-def cmd_config_migrate(args: argparse.Namespace) -> dict:
-    path = _project_runtime_config_path()
-    if path.exists() and not args.force:
-        raise EngineError(f"runtime config already exists: {display_path(path)}; use --force to normalize it")
-    if path.exists():
-        config = _validate_runtime_config(_load_strict_runtime_yaml(path))
-        source = display_path(path)
-    else:
-        legacy_paths = (ROOT / ".ai-config" / "runners.yaml", ROOT / ".ai-config" / "automation.yaml")
-        if any(item.exists() for item in legacy_paths):
-            config = _legacy_effective_runtime_config()
-            source = "legacy:runners.yaml+automation.yaml"
-        else:
-            template = ROOT / ".ai" / "install" / "config" / "config.yaml"
-            if not template.is_file():
-                raise EngineError("config.yaml is missing and no legacy configuration is available to migrate")
-            config = _validate_runtime_config(_load_strict_runtime_yaml(template))
-            source = display_path(template)
-    written = _write_runtime_config(config)
-    checks = _runtime_config_cross_checks(config)
-    return {"migrated_from": source, "config": display_path(written), "valid": all(item["passed"] for item in checks), "checks": checks}
 
 
 def cmd_epic_add(args: argparse.Namespace) -> dict:
@@ -9319,7 +9002,7 @@ def _dispatch_approval_legacy(task_id: str, role: str, state_arg: str | None, ag
         raise EngineError(f"cannot dispatch {role} approval for {task_id} from {task['status'] if task else 'unknown'} (expected {expected})")
     roles = _load_automation_roles(); profile = roles[role_key]
     if not profile["enabled"]:
-        raise EngineError(f"role '{role_key}' is disabled in .ai-config/automation.yaml")
+        raise EngineError(f"role '{role_key}' is disabled by .ai-config/config.yaml")
     runner_name, runner, model = _resolve_runner(profile["runner"], profile.get("model"))
     exec_runner, _exec_entry, exec_model = _resolve_runner(None, None)
     if (runner_name, model) == (exec_runner, exec_model):
@@ -9342,7 +9025,7 @@ def _dispatch_approval_legacy(task_id: str, role: str, state_arg: str | None, ag
 
 def _dispatch_approval(task_id: str, role: str, state_arg: str | None, agent_id: str | None = None) -> dict:
     """Dispatch an independent QA or review pass to the runner configured
-    for `role` in .ai-config/automation.yaml -- mirrors cmd_dispatch's
+    for `role` in .ai-config/config.yaml -- mirrors cmd_dispatch's
     executor flow instead of fabricating a verdict in-process. The engine
     never calls cmd_approve() on the runner's behalf: the dispatched runner
     is required to render its own verdict and call
@@ -9379,7 +9062,7 @@ def _dispatch_approval(task_id: str, role: str, state_arg: str | None, agent_id:
     roles = _load_automation_roles()
     if not roles[role_key]["enabled"]:
         raise EngineError(
-            f"role '{role_key}' is disabled in .ai-config/automation.yaml (roles.{role_key}.enabled: false); "
+            f"role '{role_key}' is disabled by .ai-config/config.yaml; "
             f"it must be verified manually via 'ai-kit approve {task_id} --role {role} ...', not dispatched"
         )
     assignment = task.get("assignment") or {}
@@ -9392,7 +9075,7 @@ def _dispatch_approval(task_id: str, role: str, state_arg: str | None, agent_id:
     runner_name, runner, model = _select_runner_for_task(task, state, roles[role_key][runner_key], roles[role_key].get(model_key), reviewer=True)
     if (runner_name, model) == (exec_runner, exec_model):
         raise EngineError(
-            f".ai-config/automation.yaml: role '{role_key}' resolves to the same identity as 'executor' "
+            f".ai-config/config.yaml: role '{role_key}' resolves to the same identity as 'executor' "
             f"({runner_name}/{model}); {role} must run under a different runner or model"
         )
     agent_id = agent_id or uuid.uuid4().hex[:8]
@@ -9429,8 +9112,8 @@ def _dispatch_approval(task_id: str, role: str, state_arg: str | None, agent_id:
     cmd = _render_runner_command(runner["command"], prompt, model)
     print(f"Dispatching {role} approval for {task_id} to runner '{runner_name}/{model}'...", file=sys.stderr)
     # shell=True: same G4 threat model as cmd_dispatch above (template comes
-    # from .ai-config/runners.yaml). stdin is closed for the same
-    # non-interactive-only reason documented in runners.yaml.
+    # from the centralized .ai-config/config.yaml). stdin is closed for the
+    # non-interactive-only reason documented in config.yaml.
     review_root = Path(assignment.get("worktree") or ROOT)
     result = _sp.run(cmd, shell=True, cwd=str(review_root), stdin=_sp.DEVNULL)
     audit = {
@@ -9963,9 +9646,9 @@ def cmd_dispatch(args: argparse.Namespace) -> dict:
     cmd = _render_runner_command(template, prompt, selected_model)
     print(f"Dispatching task {task['id']} to runner '{runner_label}'...", file=sys.stderr)
     # shell=True is required: `template` is a shell command string from
-    # .ai-config/runners.yaml, not an argv list, so it can't be handed to
+    # .ai-config/config.yaml, not an argv list, so it can't be handed to
     # subprocess without a shell (see G4 in AGENTS.md: write access to
-    # runners.yaml is equivalent to arbitrary shell execution here).
+    # config.yaml is equivalent to arbitrary shell execution here).
     execution_root = Path((task.get("assignment") or {}).get("worktree") or ROOT)
     result = _sp.run(cmd, shell=True, cwd=str(execution_root), stdin=_sp.DEVNULL)
     # Audit log
@@ -11298,10 +10981,9 @@ def parser() -> argparse.ArgumentParser:
     sub = root.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init"); init.add_argument("--title", required=True); init.add_argument("--workflow", required=True); init.add_argument("--actor", default="planner"); init.add_argument("--force", action="store_true"); init.set_defaults(fn=cmd_init)
     scaffold = sub.add_parser("scaffold", help="install an opt-in architecture/project starter"); scaffold.add_argument("profile", choices=SCAFFOLD_PROFILES); scaffold.add_argument("--force", action="store_true", help="replace scaffold-owned files and store-pilot configuration"); scaffold.set_defaults(fn=cmd_scaffold)
-    config = sub.add_parser("config", help="validate, inspect, or migrate centralized runtime configuration"); config_sub = config.add_subparsers(dest="config_command", required=True)
+    config = sub.add_parser("config", help="validate or inspect centralized runtime configuration"); config_sub = config.add_subparsers(dest="config_command", required=True)
     config_show = config_sub.add_parser("show"); config_show.add_argument("--effective", action="store_true", default=True); config_show.set_defaults(fn=cmd_config_show)
     config_validate = config_sub.add_parser("validate"); config_validate.set_defaults(fn=cmd_config_validate)
-    config_migrate = config_sub.add_parser("migrate"); config_migrate.add_argument("--force", action="store_true"); config_migrate.set_defaults(fn=cmd_config_migrate)
     add = sub.add_parser("add-task"); add.add_argument("id"); add.add_argument("--title", required=True); add.add_argument("--owner", required=True); add.add_argument("--phase", required=True); add.add_argument("--needs", nargs="*"); add.add_argument("--depends-on", action="append", default=[], metavar="PATH"); add.add_argument("--acceptance", nargs="+", action="append", required=True); add.add_argument("--files", nargs="*"); add.add_argument("--forbidden-file", action="append", default=[]); add.add_argument("--constraint", action="append", default=[]); add.add_argument("--required-check", action="append", default=[]); add.add_argument("--qa-command", action="append", default=[]); add.add_argument("--output-export", action="append", default=[]); add.add_argument("--output-evidence-kind", action="append", default=[]); add.add_argument("--no-changed-files", action="store_true"); add.add_argument("--tags", nargs="*"); add.add_argument("--context"); add.add_argument("--epic"); add.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); add.add_argument("--required-capability", action="append", default=[]); add.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); add.add_argument("--actor", default="planner"); add.set_defaults(fn=cmd_add_task)
     update = sub.add_parser("update-task"); update.add_argument("id"); update.add_argument("--add-acceptance", nargs="+", action="append"); update.add_argument("--add-files", nargs="*"); update.add_argument("--add-tags", nargs="*"); update.add_argument("--add-forbidden-file", action="append"); update.add_argument("--add-constraint", action="append"); update.add_argument("--add-required-check", action="append"); update.add_argument("--add-qa-command", action="append"); update.add_argument("--set-qa-command", action="append", help="replace all QA contract commands"); update.add_argument("--remove-qa-command", action="append", help="remove an exact QA contract command"); update.add_argument("--clear-qa-commands", action="store_true", help="remove all QA contract commands"); update.add_argument("--add-output-export", action="append"); update.add_argument("--add-output-evidence-kind", action="append"); update.add_argument("--actor", default="planner"); update.set_defaults(fn=cmd_update_task)
     ready = sub.add_parser("ready"); ready.add_argument("--context"); ready.add_argument("--epic"); ready.set_defaults(fn=cmd_ready)

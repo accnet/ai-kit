@@ -25,7 +25,7 @@ def resolve_runner(
 ) -> tuple[str, dict, str | None]:
     name = explicit or default_executor
     if not name:
-        raise ValueError("no --runner given and no default runner configured in .ai-config/config.yaml (or legacy runners.yaml); pass --runner explicitly or set one via 'ai-kit runner add <name> --default'")
+        raise ValueError("no --runner given and no default runner configured in .ai-config/config.yaml; pass --runner explicitly or set one via 'ai-kit runner add <name> --default'")
     alias_target = aliases.get(name)
     if alias_target:
         name, alias_model = split_runner_reference(alias_target)

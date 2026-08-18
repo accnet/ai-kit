@@ -288,10 +288,9 @@ commands. Use `onboard --apply` only after reviewing the output; it backs up
 
 Runtime configuration lives in `.ai-config/config.yaml`. It owns runner
 profiles/defaults/aliases plus planning, execution, quality, completion, and
-failure policy. The split `runners.yaml` and `automation.yaml` files are not
-installed or used at runtime; existing legacy files are read only by an
-explicit `config migrate`. Use `ai-kit config validate` and `config show` to
-validate or inspect the active configuration.
+failure policy. Split runner and automation config files are not installed,
+read, or written. Use `ai-kit config validate` and `config show` to validate or
+inspect the active configuration.
 
 ```yaml
 version: 1

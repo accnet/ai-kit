@@ -216,8 +216,7 @@ misreading a renamed or retyped field:
 - `.ai-config/config.yaml` version 1 is the sole project runtime authority for
   runner profiles, plan authorization/auto-execution, scheduler isolation and
   concurrency, quality/completion policy, and bounded failure strategy. Do not
-  create or consume split `runners.yaml` or `automation.yaml` files; existing
-  legacy files are read only by an explicit `config migrate`.
+  create or consume split runner and automation config files.
 - `.ai-work/artifacts/project/manifest.json` is the atomic commit marker for
   one 12-payload project projection. Every payload has a schema-version-1
   envelope and the same `generation_id`; the manifest records its SHA-256,

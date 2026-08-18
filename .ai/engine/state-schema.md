@@ -384,9 +384,8 @@ it is never an independent source of lifecycle truth.
 
 `.ai-config/config.yaml` version 1 is the sole runtime authority for runner
 profiles, aliases/defaults, plan auto-execution, scheduler/isolation, quality,
-completion, and failure policy. The split `runners.yaml` and `automation.yaml`
-files are not installed or used at runtime; existing legacy files are read only
-by an explicit `config migrate`. Use `config validate` and `config show` to
+completion, and failure policy. Split runner and automation config files are
+not installed, read, or written. Use `config validate` and `config show` to
 inspect the active configuration.
 A canonical CLI/provider entry has a `command` template containing `{prompt}` and `{model}`, a
 `models` allowlist, and optional `provider`/`description`. Version-5 profiles
