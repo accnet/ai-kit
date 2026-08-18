@@ -41,11 +41,12 @@ IDs must be unique and the dependency graph must be a DAG. Events are
 append-only and include timestamp, actor, action, task, old status, new
 status, and detail.
 
-`update-task` amends an existing task's `acceptance`, `files`, or `tags`
-lists after creation (at least one of `--add-acceptance`, `--add-files`,
-`--add-tags` is required) — use it when QA/review rejects work and the
-acceptance criteria need to be tightened before redispatch, rather than
-editing `workflow.json` by hand.
+`update-task` amends an existing task's contract after creation. In addition
+to additive fields, QA commands can be replaced, removed, or cleared with
+`--set-qa-command`, `--remove-qa-command`, and `--clear-qa-commands`; every
+contract edit bumps `contract_revision`/`contract_hash` and invalidates old
+QA/review evidence. Use this when QA/review rejects work rather than editing
+`workflow.json` by hand.
 
 `--acceptance` (on `add-task`/`plan`) and `--add-acceptance` (on
 `update-task`) both accept multiple values in one flag (`--acceptance "a"
@@ -204,8 +205,8 @@ error. `dispatch` re-resolves after claiming a task (`todo` -> `in-progress`)
 rather than reusing the transition's return value, so the contract overlay
 survives the status change instead of being silently dropped.
 
-`update-task` rewrites the contract file whenever it changes `acceptance`,
-`files`, or `tags`: it bumps `contract_revision` by one, preserves the
+`update-task` rewrites the contract file whenever it changes any contract
+field: it bumps `contract_revision` by one, preserves the
 contract's original `created_at` (read off the existing file via
 `_existing_contract_created_at`, or stamped fresh if the task has never had
 one), stamps a new `updated_at`, and records the new hash on the
@@ -422,7 +423,11 @@ definition and a mode matching `automation.execution.mode`; editing the plan
 invalidates the authorization. Failure policy may create a bounded
 `remediation-task`: the rejected task becomes `superseded`, the replacement
 records `remediates`/`remediation_attempt`, and all downstream task contracts
-are revised to also depend on the replacement.
+are revised to also depend on the replacement. When the failed task still has
+a linked worktree, remediation reuses it so the corrective worker receives
+the existing diff instead of a fresh planning checkout. A `pending-dispatch`
+reservation is never valid worker completion or QA input; it must first be
+materialized by `dispatch`.
 
 ## Design, contract, and delivery machine contracts
 

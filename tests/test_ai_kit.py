@@ -2347,6 +2347,79 @@ class CentralRuntimeConfigTests(EngineTestCase):
             encoding="utf-8",
         )
 
+    def test_update_task_can_replace_remove_and_clear_qa_commands(self) -> None:
+        self.init_workflow()
+        self.add_task("T1", qa_command=[".venv/bin/python -m pytest"])
+        original = ai_kit.task_map(ai_kit.load(self.state_file))["T1"]["contract_hash"]
+        updated = ai_kit.cmd_update_task(ns(
+            state=str(self.state_file), id="T1", add_acceptance=None, add_files=None,
+            add_tags=None, add_forbidden_file=None, add_constraint=None,
+            add_required_check=None, add_qa_command=None, set_qa_command=["python -m pytest"],
+            remove_qa_command=None, clear_qa_commands=False, add_output_export=None,
+            add_output_evidence_kind=None, actor="planner",
+        ))
+        self.assertEqual(updated["qa_contract"]["commands"], ["python -m pytest"])
+        self.assertNotEqual(updated["contract_hash"], original)
+        removed = ai_kit.cmd_update_task(ns(
+            state=str(self.state_file), id="T1", add_acceptance=None, add_files=None,
+            add_tags=None, add_forbidden_file=None, add_constraint=None,
+            add_required_check=None, add_qa_command=None, set_qa_command=None,
+            remove_qa_command=["python -m pytest"], clear_qa_commands=False,
+            add_output_export=None, add_output_evidence_kind=None, actor="planner",
+        ))
+        self.assertEqual(removed["qa_contract"]["commands"], [])
+        self.add_task("T2", qa_command=["python -m unittest"])
+        cleared = ai_kit.cmd_update_task(ns(
+            state=str(self.state_file), id="T2", add_acceptance=None, add_files=None,
+            add_tags=None, add_forbidden_file=None, add_constraint=None,
+            add_required_check=None, add_qa_command=None, set_qa_command=None,
+            remove_qa_command=None, clear_qa_commands=True, add_output_export=None,
+            add_output_evidence_kind=None, actor="planner",
+        ))
+        self.assertEqual(cleared["qa_contract"]["commands"], [])
+
+    def test_pending_dispatch_cannot_complete_or_qa(self) -> None:
+        self.init_workflow(); self.add_task("T1")
+        self.transition("T1", "start", actor="backend")
+        state = ai_kit.load(self.state_file)
+        task = ai_kit.task_map(state)["T1"]
+        task["assignment"] = {"isolation": "pending-dispatch", "worktree": str(self.root)}
+        ai_kit.save(state, self.state_file, state["revision"])
+        with self.assertRaisesRegex(ai_kit.EngineError, "pending-dispatch"):
+            self.transition("T1", "complete", actor="backend")
+        state = ai_kit.load(self.state_file)
+        ai_kit.task_map(state)["T1"]["status"] = "implementation-complete"
+        ai_kit.save(state, self.state_file, state["revision"])
+        with self.assertRaisesRegex(ai_kit.EngineError, "pending-dispatch"):
+            ai_kit.cmd_qa_run(ns(state=str(self.state_file), id="T1"))
+
+    def test_remediation_reuses_existing_linked_worktree(self) -> None:
+        self.write_runtime_config(qa_strategy="remediation-task", max_attempts=1, automation_enabled=True)
+        self.init_workflow(); self.add_task("T1")
+        state = ai_kit.load(self.state_file); task = ai_kit.task_map(state)["T1"]
+        task["status"] = "todo"
+        task["assignment"] = {"worktree": str(self.root), "isolation": "linked-worktree", "branch": "agent/test/T1", "base_commit": "base"}
+        ai_kit.save(state, self.state_file, state["revision"])
+        result = ai_kit._create_remediation_task(self.state_file, "T1", "qa", "failure.json", ["test failed"])
+        self.assertTrue(result["created"])
+        self.assertTrue(result["inherited_worktree"])
+        remediation = ai_kit.task_map(ai_kit.load(self.state_file))["T1-fix-1"]
+        self.assertEqual(remediation["assignment"]["worktree"], str(self.root))
+
+    def test_qa_command_portability_check_flags_missing_worktree_runtime(self) -> None:
+        task = {"qa_contract": {"commands": [".venv/bin/python -m pytest", "python -m pytest"]}}
+        issues = ai_kit._qa_command_path_issues(task, self.root)
+        self.assertEqual(len(issues), 1)
+        self.assertIn(".venv/bin/python", issues[0])
+
+    def test_cleanup_task_uses_lightweight_design_governance(self) -> None:
+        self.init_workflow()
+        task = self.add_task("T1", task_kind="cleanup")
+        result = ai_kit._design_validation(self.state_file, task)
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["not_applicable"])
+        self.assertIn("task_kind=cleanup", result["checks"][0]["detail"])
+
     def test_central_config_is_authoritative_and_strictly_validated(self) -> None:
         self.write_runtime_config()
         (self.root / ".ai-config" / "runners.yaml").write_text(

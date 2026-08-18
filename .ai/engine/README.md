@@ -4,6 +4,34 @@ The control plane is a dependency-free Python CLI for multi-agent workflow
 coordination. It is intentionally deterministic: Markdown describes work for
 humans, while `.ai-work/state/workflow.json` is the canonical runtime state.
 
+## Incremental engine modularization
+
+`ai_kit.py` remains the stable executable and compatibility facade. New bounded
+logic is extracted under `.ai/engine/kit_engine/` instead of adding more
+cross-cutting code to the entrypoint:
+
+```text
+kit_engine/
+├── foundation/   Runtime boundary and stable EngineError
+├── artifact/     Builder, envelope, validator, and manifest-last publisher
+├── quality/      Evidence, review independence, and delivery applicability
+├── config/       Runtime config schema and YAML-subset validation
+├── storage/      Atomic JSON persistence
+├── domain/       Task graph/readiness primitives
+├── planning/     Deterministic DAG projection
+├── qa/           QA command portability and file-scope rules
+├── contracts/    Contract refs, semantic compatibility, and graph builder
+├── execution/    Runner resolution, profile normalization, and command rendering
+├── architecture/ Architecture observation, discovery, and provenance rules
+├── context/      Query normalization, level selection, and reference metadata
+└── cli/          Result rendering and gate exit policy
+```
+
+Extracted modules are dependency-light and receive policy callbacks or an
+explicit `Runtime`; they do not import CLI globals. This preserves the public
+CLI and custom `--state` behavior while keeping context, QA, and execution
+changes safe to evolve incrementally.
+
 ## Commands
 
 ```bash
@@ -245,7 +273,8 @@ to `.ai-work/logs/events.jsonl`.
 `reject` sends an `implementation-complete` or `qa-passed` task back to
 `todo` when QA/review finds work that must be redone (distinct from `block`,
 which is for external impediments, not rejected work). Pair it with
-`update-task` to tighten acceptance criteria before redispatching. `verify`
+`update-task` to tighten acceptance criteria or replace a broken
+`qa_contract.commands` list before redispatching. `verify`
 runs the `test_command`/`lint_command`/`typecheck_command`/`build_command`
 configured in `.ai-config/kit.yaml` plus the security gate; if all four commands
 are still the placeholder `true` (nothing configured), it prints a stderr

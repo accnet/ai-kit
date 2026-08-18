@@ -20,6 +20,59 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from kit_engine.foundation import EngineError, Runtime
+from kit_engine.storage import atomic_write_json
+from kit_engine.domain.tasks import runnable as _domain_runnable, task_map, transitive_needs as _transitive_needs
+from kit_engine.planning import generate_dag_payload
+from kit_engine.contracts import (
+    ContractGraphBuilder,
+    contract_field_breaks as semantic_contract_field_breaks,
+    enum_narrowed as semantic_enum_narrowed,
+    event_semantic_breaks as semantic_event_breaks,
+    indexed_contract_items as semantic_indexed_contract_items,
+    normalize_contract_refs,
+    operation_semantic_breaks as semantic_operation_breaks,
+    schema_shape_breaks as semantic_schema_shape_breaks,
+    security_scheme_breaks as semantic_security_scheme_breaks,
+)
+from kit_engine.architecture import (
+    build_observation,
+    extract_python_imports as discovery_extract_python_imports,
+    extract_ts_relative_imports as discovery_extract_ts_imports,
+    map_task_to_module as discovery_map_task_to_module,
+    owning_module as discovery_owning_module,
+    resolve_python_dependency as discovery_resolve_python_dependency,
+    resolve_ts_dependency as discovery_resolve_ts_dependency,
+    validate_observation,
+)
+from kit_engine.config import load_yaml_subset, validate_runtime_config
+from kit_engine.artifact import artifact_envelope, envelope_payload_data, json_bytes as artifact_json_bytes, publish as publish_artifacts, sha256_bytes as artifact_sha256_bytes, validate_bundle_envelopes
+from kit_engine.quality import (
+    classify_qa_failure as quality_classify_qa_failure,
+    evidence_fingerprint as quality_evidence_fingerprint,
+    not_applicable_reason,
+    reviewer_identity_error,
+)
+from kit_engine.context import reference_stats, requested_level, task_text, tokenize_query, tokenize_task
+from kit_engine.cli import exit_code_for_result, render_result
+from kit_engine.qa import (
+    is_runtime_transient_path as _is_runtime_transient_path,
+    path_in_declared_scope as _path_in_declared_scope,
+    qa_command_path_issues as _qa_command_path_issues,
+)
+from kit_engine.execution import (
+    active_count,
+    entry_list,
+    entry_models,
+    parse_inline_list,
+    ready_tasks,
+    render_runner_command,
+    resolve_runner as resolve_runner_profile,
+    safe_git_component,
+    split_runner_reference,
+    supports as runner_supports,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = Path(__file__).resolve()
 WORK = ROOT / ".ai-work"
@@ -117,7 +170,7 @@ CONFIG_FILES = {
     "architecture-fitness.json",
     "truth.yaml",
 }
-TASK_KINDS = {"general", "contract", "implementation", "integration"}
+TASK_KINDS = {"general", "contract", "implementation", "integration", "cleanup", "trivial"}
 CONTRACT_RELATIONS = {"defines", "implements", "consumes", "verifies"}
 CONTRACT_KINDS = {"domain", "api", "event", "schema", "interface"}
 CONTRACT_STATUSES = {"draft", "proposed", "approved", "active", "deprecated", "removed"}
@@ -196,121 +249,21 @@ def _load_json_config(name: str, default: dict) -> dict:
 
 def _write_json_config(name: str, value: dict) -> Path:
     path = _writable_config_path(name)
-    _atomic_write_json(path, value)
+    atomic_write_json(path, value)
     return path
 
 
 def _atomic_write_json(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
-
-
-def _strip_runtime_yaml_comment(line: str) -> str:
-    quote = None
-    escaped = False
-    for index, char in enumerate(line):
-        if escaped:
-            escaped = False
-            continue
-        if char == "\\" and quote == '"':
-            escaped = True
-            continue
-        if char in {'"', "'"}:
-            quote = None if quote == char else char if quote is None else quote
-            continue
-        if char == "#" and quote is None and (index == 0 or line[index - 1].isspace()):
-            return line[:index].rstrip()
-    return line.rstrip()
-
-
-def _runtime_yaml_scalar(raw: str, path: Path, line_number: int) -> object:
-    value = raw.strip()
-    if not value:
-        return {}
-    if value.startswith("["):
-        if not value.endswith("]"):
-            raise EngineError(f"{display_path(path)}:{line_number}: inline list must close on the same line")
-        inner = value[1:-1].strip()
-        if not inner:
-            return []
-        items, token, quote = [], "", None
-        for char in inner + ",":
-            if char in {'"', "'"}:
-                quote = None if quote == char else char if quote is None else quote
-                token += char
-            elif char == "," and quote is None:
-                items.append(_runtime_yaml_scalar(token.strip(), path, line_number)); token = ""
-            else:
-                token += char
-        return items
-    if value == "{}":
-        return {}
-    if value.startswith("{"):
-        raise EngineError(
-            f"{display_path(path)}:{line_number}: inline mappings are not supported; use an indented mapping"
-        )
-    if value.startswith('"'):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise EngineError(f"{display_path(path)}:{line_number}: invalid quoted scalar: {exc}") from exc
-    if value.startswith("'") and value.endswith("'"):
-        return value[1:-1].replace("''", "'")
-    lowered = value.lower()
-    if lowered in {"true", "false"}:
-        return lowered == "true"
-    if lowered in {"null", "~"}:
-        return None
-    if re.fullmatch(r"-?\d+", value):
-        return int(value)
-    return value
+    """Compatibility alias retained for existing callers and tests."""
+    atomic_write_json(path, value)
 
 
 def _load_strict_runtime_yaml(path: Path) -> dict:
-    """Parse the bounded config.yaml schema without an environment dependency."""
-    if not path.is_file():
-        raise EngineError(f"runtime config not found: {display_path(path)}")
-    logical = []
-    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        line = _strip_runtime_yaml_comment(raw)
-        if not line.strip():
-            continue
-        if "\t" in line[:len(line) - len(line.lstrip())]:
-            raise EngineError(f"{display_path(path)}:{number}: tabs are not allowed for indentation")
-        indent = len(line) - len(line.lstrip(" "))
-        if indent % 2:
-            raise EngineError(f"{display_path(path)}:{number}: indentation must use multiples of two spaces")
-        logical.append((number, indent, line.strip()))
-    root: dict = {}
-    stack: list[tuple[int, object]] = [(-2, root)]
-    for index, (number, indent, text_value) in enumerate(logical):
-        while stack and indent <= stack[-1][0]:
-            stack.pop()
-        if not stack:
-            raise EngineError(f"{display_path(path)}:{number}: invalid indentation")
-        parent = stack[-1][1]
-        if text_value.startswith("- "):
-            if not isinstance(parent, list):
-                raise EngineError(f"{display_path(path)}:{number}: sequence item has no list parent")
-            parent.append(_runtime_yaml_scalar(text_value[2:], path, number))
-            continue
-        if ":" not in text_value or not isinstance(parent, dict):
-            raise EngineError(f"{display_path(path)}:{number}: expected mapping key")
-        key, raw_value = text_value.split(":", 1)
-        key = key.strip()
-        if not key or key in parent:
-            raise EngineError(f"{display_path(path)}:{number}: empty or duplicate key {key!r}")
-        raw_value = raw_value.strip()
-        if raw_value:
-            parent[key] = _runtime_yaml_scalar(raw_value, path, number)
-            continue
-        next_is_list = index + 1 < len(logical) and logical[index + 1][1] > indent and logical[index + 1][2].startswith("- ")
-        child: object = [] if next_is_list else {}
-        parent[key] = child
-        stack.append((indent, child))
-    return root
+    """Parse bounded config.yaml while preserving facade error semantics."""
+    try:
+        return load_yaml_subset(path, display_path)
+    except ValueError as exc:
+        raise EngineError(str(exc)) from exc
 
 
 def _project_runtime_config_path() -> Path:
@@ -329,113 +282,12 @@ def _runtime_config_path() -> Path | None:
     return template if template.is_file() else None
 
 
-def _require_mapping(value: object, label: str) -> dict:
-    if not isinstance(value, dict):
-        raise EngineError(f"config.yaml: {label} must be a mapping")
-    return value
-
-
-def _require_list(value: object, label: str) -> list:
-    if not isinstance(value, list):
-        raise EngineError(f"config.yaml: {label} must be a list")
-    return value
-
-
 def _validate_runtime_config(config: dict) -> dict:
-    if config.get("version") != 1:
-        raise EngineError("config.yaml must use version: 1")
-    unknown = set(config) - {"version", "runners", "automation"}
-    if unknown:
-        raise EngineError(f"config.yaml has unknown top-level keys: {', '.join(sorted(unknown))}")
-    runners = _require_mapping(config.get("runners"), "runners")
-    profiles = _require_mapping(runners.get("profiles"), "runners.profiles")
-    default = _require_mapping(runners.get("default"), "runners.default")
-    aliases = _require_mapping(runners.get("aliases", {}), "runners.aliases")
-    if default.get("name") not in profiles:
-        raise EngineError("config.yaml: runners.default.name must name a runner profile")
-    for name, raw_profile in profiles.items():
-        profile = _require_mapping(raw_profile, f"runners.profiles.{name}")
-        if profile.get("model") is not None:
-            if profile.get("models") is not None:
-                raise EngineError(f"config.yaml: runner {name} cannot declare both model and models")
-            profile["models"] = [profile.pop("model")]
-        if not isinstance(profile.get("command"), str) or not profile["command"].strip():
-            raise EngineError(f"config.yaml: runner {name} requires command")
-        for key in ("models", "capabilities", "roles", "task_kinds"):
-            if key in profile:
-                _require_list(profile[key], f"runners.profiles.{name}.{key}")
-        models = profile.get("models", [])
-        for key in ("pool_model",):
-            if profile.get(key) is not None and profile[key] not in models:
-                raise EngineError(f"config.yaml: runner {name}.{key} must be present in models")
-        maximum = profile.get("max_parallel", 1)
-        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
-            raise EngineError(f"config.yaml: runner {name}.max_parallel must be a non-negative integer")
-        if models and "{model}" not in profile["command"]:
-            raise EngineError(f"config.yaml: runner {name} declares models but command has no {{model}} placeholder")
-    default_model = default.get("model")
-    if default_model is not None and default_model not in profiles[default["name"]].get("models", []):
-        raise EngineError("config.yaml: runners.default.model is not allowed by its profile")
-    for alias, target in aliases.items():
-        if not isinstance(target, str) or not alias:
-            raise EngineError("config.yaml: runner aliases must map names to runner references")
-
-    automation = _require_mapping(config.get("automation"), "automation")
-    if not isinstance(automation.get("enabled"), bool):
-        raise EngineError("config.yaml: automation.enabled must be boolean")
-    planning = _require_mapping(automation.get("planning", {}), "automation.planning")
-    auto_execute = _require_mapping(planning.get("auto_execute", {}), "automation.planning.auto_execute")
-    if "enabled" in auto_execute and not isinstance(auto_execute["enabled"], bool):
-        raise EngineError("config.yaml: automation.planning.auto_execute.enabled must be boolean")
-    if "require" in auto_execute:
-        requirements = _require_list(auto_execute["require"], "automation.planning.auto_execute.require")
-        required_gates = {"valid_dag", "complete_acceptance_criteria", "current_execution_authorization"}
-        unknown_requirements = set(requirements) - required_gates
-        if unknown_requirements:
-            raise EngineError(f"config.yaml: unknown auto-execution requirements: {', '.join(sorted(unknown_requirements))}")
-        if auto_execute.get("enabled") and not required_gates.issubset(set(requirements)):
-            raise EngineError("config.yaml: auto-execution requires valid_dag, complete_acceptance_criteria, and current_execution_authorization")
-    if auto_execute and auto_execute.get("trigger", "plan-materialized") != "plan-materialized":
-        raise EngineError("config.yaml: only plan-materialized auto-execution is supported")
-    execution = _require_mapping(automation.get("execution", {}), "automation.execution")
-    mode = execution.get("mode", "parallel")
-    if mode not in {"sequential", "parallel"}:
-        raise EngineError("config.yaml: automation.execution.mode must be sequential or parallel")
-    for key, default_value in (("max_parallel_tasks", 1), ("dispatch_ready_limit", 1)):
-        value = execution.get(key, default_value)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise EngineError(f"config.yaml: automation.execution.{key} must be a positive integer")
-    if "auto_dispatch_ready" in execution and not isinstance(execution["auto_dispatch_ready"], bool):
-        raise EngineError("config.yaml: automation.execution.auto_dispatch_ready must be boolean")
-    isolation = _require_mapping(execution.get("isolation", {}), "automation.execution.isolation")
-    for key in ("worktree_per_task", "require_disjoint_paths"):
-        if key in isolation and not isinstance(isolation[key], bool):
-            raise EngineError(f"config.yaml: automation.execution.isolation.{key} must be boolean")
-    quality = _require_mapping(automation.get("quality", {}), "automation.quality")
-    qa = _require_mapping(quality.get("qa", {}), "automation.quality.qa")
-    if qa.get("mode", "local") not in {"local", "disabled"}:
-        raise EngineError("config.yaml: QA authority supports mode local or disabled")
-    qa_parallel = qa.get("max_parallel", 1)
-    if not isinstance(qa_parallel, int) or isinstance(qa_parallel, bool) or qa_parallel < 1:
-        raise EngineError("config.yaml: automation.quality.qa.max_parallel must be positive")
-    review = _require_mapping(quality.get("review", {}), "automation.quality.review")
-    if review.get("mode", "manual") not in {"independent", "manual", "not-required"}:
-        raise EngineError("config.yaml: review.mode must be independent, manual, or not-required")
-    if review.get("mode") == "independent" and not review.get("runner"):
-        raise EngineError("config.yaml: independent review requires a runner")
-    completion = _require_mapping(quality.get("completion", {}), "automation.quality.completion")
-    for key in ("auto_resolve_review_when_not_required", "auto_close_delivery_not_applicable"):
-        if key in completion and not isinstance(completion[key], bool):
-            raise EngineError(f"config.yaml: automation.quality.completion.{key} must be boolean")
-    failure = _require_mapping(automation.get("failure", {}), "automation.failure")
-    for gate in ("qa", "review"):
-        policy = _require_mapping(failure.get(gate, {}), f"automation.failure.{gate}")
-        if policy.get("strategy", "manual") not in {"retry-current-task", "remediation-task", "manual"}:
-            raise EngineError(f"config.yaml: failure.{gate}.strategy is invalid")
-        attempts = policy.get("max_attempts", 0)
-        if not isinstance(attempts, int) or isinstance(attempts, bool) or not 0 <= attempts <= 10:
-            raise EngineError(f"config.yaml: failure.{gate}.max_attempts must be between 0 and 10")
-    return config
+    """Compatibility adapter for the extracted runtime schema validator."""
+    try:
+        return validate_runtime_config(config)
+    except ValueError as exc:
+        raise EngineError(str(exc)) from exc
 
 
 def _load_runtime_config() -> dict | None:
@@ -1071,61 +923,18 @@ def _default_model() -> str | None:
     return None
 
 
-def _entry_models(entry: dict) -> list[str]:
-    """Return the normalized allowlist for grouped or legacy runner entries."""
-    models = entry.get("models")
-    if isinstance(models, list):
-        values = [str(item).strip() for item in models if str(item).strip()]
-    elif isinstance(models, str) and models.strip():
-        values = [item.strip() for item in models.split(",") if item.strip()]
-    elif entry.get("model"):
-        values = [item.strip() for item in str(entry["model"]).split(",") if item.strip()]
-    else:
-        values = []
-    return list(dict.fromkeys(values))
+_entry_models = entry_models
+_entry_list = entry_list
 
 
-def _entry_list(entry: dict, key: str) -> list[str]:
-    return list(dict.fromkeys(_parse_inline_list(entry.get(key))))
-
-
-def _runner_active_count(name: str, state: dict) -> int:
-    return sum(
-        1 for task in state.get("tasks", [])
-        if task.get("status") == "in-progress"
-        and (task.get("assignment") or {}).get("runner") == name
-    )
+_runner_active_count = active_count
 
 
 def _runner_supports(name: str, entry: dict, task: dict, state: dict, reviewer: bool = False) -> tuple[bool, str | None]:
-    roles = _entry_list(entry, "roles")
-    kinds = _entry_list(entry, "task_kinds")
-    capabilities = set(_entry_list(entry, "capabilities"))
-    if roles and "*" not in roles and task.get("owner") not in roles:
-        return False, f"runner {name} does not support role {task.get('owner')}"
-    if kinds and "*" not in kinds and task.get("task_kind", "general") not in kinds:
-        return False, f"runner {name} does not support task kind {task.get('task_kind')}"
-    missing = set(task.get("required_capabilities") or []) - capabilities
-    if missing:
-        return False, f"runner {name} lacks capabilities: {', '.join(sorted(missing))}"
     try:
-        # Profiles created before schema v5 had no capacity field; preserve
-        # their legacy unbounded behavior. New seed profiles declare the safe
-        # default `max_parallel: 1` explicitly.
-        maximum = int(entry.get("max_parallel", 1_000_000))
-    except (TypeError, ValueError):
-        raise EngineError(f"runner {name} max_parallel must be an integer")
-    if maximum <= 0:
-        # An explicit 0 is how an operator drains a runner. `max(1, maximum)`
-        # below used to floor it at one, so a drained runner still accepted a
-        # task -- the one outcome setting it to 0 is meant to prevent.
-        return False, f"runner {name} is disabled (max_parallel: {maximum})"
-    active_count = _runner_active_count(name, state)
-    if task.get("status") == "in-progress" and (task.get("assignment") or {}).get("runner") == name:
-        active_count = max(0, active_count - 1)
-    if active_count >= maximum:
-        return False, f"runner {name} is at capacity ({maximum})"
-    return True, None
+        return runner_supports(name, entry, task, state, _entry_list)
+    except ValueError as exc:
+        raise EngineError(str(exc)) from exc
 
 
 def _select_runner_for_task(task: dict, state: dict, explicit: str | None, model: str | None, reviewer: bool = False, pool: bool = False) -> tuple[str, dict, str | None]:
@@ -1162,13 +971,7 @@ def _select_runner_for_task(task: dict, state: dict, explicit: str | None, model
     raise EngineError("eligible runners require an explicit --model")
 
 
-def _split_runner_reference(reference: str) -> tuple[str, str | None]:
-    if ":" not in reference:
-        return reference, None
-    runner, model = reference.split(":", 1)
-    if not runner or not model:
-        raise EngineError(f"invalid runner reference '{reference}'; expected <runner>:<model>")
-    return runner, model
+_split_runner_reference = split_runner_reference
 
 
 def _resolve_runner(explicit: str | None, requested_model: str | None = None) -> tuple[str, dict, str | None]:
@@ -1179,47 +982,13 @@ def _resolve_runner(explicit: str | None, requested_model: str | None = None) ->
     default_executor doesn't name a registered runner (misconfiguration), or
     if the resolved name isn't registered.
     """
-    runners = _load_runners()
-    aliases = _load_runner_aliases()
-    default_executor = _default_executor()
-    name = explicit or default_executor
-    if not name:
-        raise EngineError(
-            "no --runner given and no default runner configured in .ai-config/config.yaml (or legacy runners.yaml); "
-            "pass --runner explicitly or set one via 'ai-kit runner add <name> --default'"
+    try:
+        return resolve_runner_profile(
+            explicit, requested_model, _default_executor(), _default_model(),
+            _load_runner_aliases(), _load_runners(), _entry_models,
         )
-    alias_target = aliases.get(name)
-    if alias_target:
-        name, alias_model = _split_runner_reference(alias_target)
-        if requested_model and alias_model and requested_model != alias_model:
-            raise EngineError(f"runner alias '{explicit}' fixes model '{alias_model}', not '{requested_model}'")
-        requested_model = requested_model or alias_model
-    else:
-        name, reference_model = _split_runner_reference(name)
-        if requested_model and reference_model and requested_model != reference_model:
-            raise EngineError(f"runner reference '{explicit}' fixes model '{reference_model}', not '{requested_model}'")
-        requested_model = requested_model or reference_model
-    if name not in runners:
-        available = ", ".join([*runners.keys(), *aliases.keys()])
-        raise EngineError(f"unknown runner profile or alias: {explicit or default_executor}. Available: {available}")
-    entry = runners[name]
-    models = _entry_models(entry)
-    selected_model = requested_model
-    if selected_model is None and name == default_executor:
-        selected_model = _default_model()
-    if selected_model is None and len(models) == 1:
-        selected_model = models[0]
-    if selected_model is None and len(models) > 1:
-        raise EngineError(f"runner '{name}' supports multiple models; pass --model explicitly")
-    if selected_model is not None and not models:
-        raise EngineError(f"runner '{name}' does not declare selectable models")
-    if selected_model is not None and selected_model not in models:
-        raise EngineError(f"model '{selected_model}' is not configured for runner '{name}'. Available: {', '.join(models)}")
-    if selected_model is None and "{model}" in entry.get("command", ""):
-        raise EngineError(f"runner '{name}' command requires a model but no model was selected")
-    if models and "{model}" not in entry.get("command", ""):
-        raise EngineError(f"runner '{name}' declares models but its command is missing the {{model}} placeholder")
-    return name, entry, selected_model
+    except ValueError as exc:
+        raise EngineError(str(exc)) from exc
 
 
 def _write_runners(
@@ -1268,19 +1037,11 @@ def _write_runners(
 
 
 def _render_runner_command(template: str, prompt: str, model: str | None) -> str:
-    """Render prompt/model placeholders with shell-safe quoting.
-
-    {model} is resolved against the TEMPLATE, before the prompt goes in. The
-    prompt carries task titles, acceptance criteria and file paths, so it can
-    legitimately contain the literal text "{model}" -- substituting afterwards
-    rewrote the user's own words inside the quoted prompt, or (with no model
-    selected) made an unrelated task title trip the "select a model" guard.
-    """
-    if "{model}" in template:
-        if model is None:
-            raise EngineError("runner command still contains {model}; select a model before dispatch")
-        template = template.replace("{model}", shlex.quote(model))
-    return template.replace("{prompt}", shlex.quote(prompt))
+    """Compatibility adapter preserving the facade's EngineError contract."""
+    try:
+        return render_runner_command(template, prompt, model)
+    except ValueError as exc:
+        raise EngineError(str(exc)) from exc
 
 
 def _git_head(refresh: bool = False) -> str | None:
@@ -1317,8 +1078,7 @@ def _git_head(refresh: bool = False) -> str | None:
         return None
 
 
-def _safe_git_component(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-") or "task"
+_safe_git_component = safe_git_component
 
 
 def _ensure_task_worktree(
@@ -1578,11 +1338,6 @@ TRANSITIONS = {
     "cancel": ({"todo", "in-progress", "blocked"}, "cancelled"),
 }
 
-
-class EngineError(Exception):
-    pass
-
-
 def now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -1602,6 +1357,12 @@ def _lease_is_expired(value: str | None) -> bool:
 
 def state_path(value: str | None) -> Path:
     return Path(value).resolve() if value else STATE
+
+
+def runtime_context(value: str | Path | None = None) -> Runtime:
+    """Build the explicit runtime boundary used by extracted modules."""
+    path = state_path(str(value) if value is not None else None)
+    return Runtime.from_state(ROOT, path)
 
 
 def workspace(path: Path) -> Path:
@@ -1723,23 +1484,11 @@ def new_state(title: str, workflow: str) -> dict:
 
 
 def _normalize_contract_refs(value: object) -> list[dict]:
-    refs: list[dict] = []
-    for item in value or []:
-        if isinstance(item, str):
-            match = re.fullmatch(r"(defines|implements|consumes|verifies):([^@\s]+)@([^\s]+)", item)
-            if not match:
-                raise EngineError(
-                    f"invalid contract ref {item!r}; expected RELATION:CONTRACT_ID@SEMVER"
-                )
-            relation, contract_id, version = match.groups()
-            item = {"id": contract_id, "version": version, "relation": relation}
-        if not isinstance(item, dict):
-            raise EngineError("contract_refs entries must be objects or RELATION:ID@VERSION strings")
-        ref = {"id": str(item.get("id") or "").strip(), "version": str(item.get("version") or "").strip(), "relation": str(item.get("relation") or "").strip()}
-        if not ref["id"] or not ref["version"] or ref["relation"] not in CONTRACT_RELATIONS:
-            raise EngineError(f"invalid contract ref: {item!r}")
-        refs.append(ref)
-    return refs
+    """Compatibility adapter preserving the facade's EngineError contract."""
+    try:
+        return normalize_contract_refs(value, CONTRACT_RELATIONS)
+    except ValueError as exc:
+        raise EngineError(str(exc)) from exc
 
 
 def _contract_snapshot(ref: dict) -> dict | None:
@@ -1872,21 +1621,7 @@ def configured_source_dirs() -> list[str]:
     return [item.strip() for item in match.group(1).split(",") if item.strip()] if match else []
 
 
-def _parse_inline_list(value: object) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if value is None:
-        return []
-    text = str(value).strip()
-    if text.startswith("[") and text.endswith("]"):
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, list):
-                return [str(item).strip() for item in parsed if str(item).strip()]
-        except json.JSONDecodeError:
-            inner = text[1:-1]
-            return [item.strip().strip("\"'") for item in inner.split(",") if item.strip()]
-    return [text] if text else []
+_parse_inline_list = parse_inline_list
 
 
 def _load_skill_metadata(skill_dir: Path) -> dict:
@@ -2081,20 +1816,11 @@ def _select_procedure(task: dict, requested_operation: str | None = None) -> dic
     }
 
 
-def _task_text(task: dict) -> str:
-    parts = [task.get("title") or ""]
-    parts.extend(task.get("tags") or [])
-    parts.extend(task.get("acceptance") or [])
-    return " ".join(str(part) for part in parts).lower()
+_task_text = task_text
 
 
 def _tokenize_task(task: dict) -> set[str]:
-    tokens: set[str] = set(configured_stack())
-    tokens.update(str(tag).lower() for tag in (task.get("tags") or []))
-    for value in [task.get("title") or "", " ".join(task.get("acceptance") or [])]:
-        for token in re.findall(r"[a-z0-9][a-z0-9_-]{1,}", value.lower()):
-            tokens.add(token)
-    return tokens
+    return tokenize_task(task, configured_stack)
 
 
 def _resolve_technology_skill(root: Path, ref: str) -> Path | None:
@@ -2317,10 +2043,6 @@ def save(state: dict, path: Path, expected_revision: int | None = None) -> None:
             _atomic_write_json(CURRENT, summary)
     finally:
         lock.unlink(missing_ok=True)
-
-
-def task_map(state: dict) -> dict:
-    return {task["id"]: task for task in state["tasks"]}
 
 
 def validate(state: dict) -> None:
@@ -2586,25 +2308,12 @@ def sync_tasks_md(state: dict, state_path: Path) -> None:
 
 
 def runnable(task: dict, tasks: dict) -> bool:
-    refs_ready, _reason = _contract_refs_ready(task)
-    return (
-        task["status"] == "todo"
-        and all(tasks[dep]["status"] in DEPENDENCY_SATISFYING_STATUSES for dep in task["needs"])
-        and refs_ready
+    return _domain_runnable(
+        task,
+        tasks,
+        dependency_satisfying_statuses=DEPENDENCY_SATISFYING_STATUSES,
+        contract_refs_ready=_contract_refs_ready,
     )
-
-
-def _transitive_needs(task_id: str, tasks: dict) -> set[str]:
-    """All task ids `task_id` (transitively) needs -- its full upstream dependency set."""
-    seen: set[str] = set()
-    stack = list(tasks.get(task_id, {}).get("needs", []))
-    while stack:
-        dep = stack.pop()
-        if dep in seen or dep not in tasks:
-            continue
-        seen.add(dep)
-        stack.extend(tasks[dep].get("needs", []))
-    return seen
 
 
 def _file_conflicts(task: dict, state: dict) -> list[dict]:
@@ -2823,26 +2532,21 @@ def _generate_contract_graph(state: dict) -> dict:
 
 
 def _artifact_root(state_file: Path) -> Path:
-    return workspace(state_file) / "artifacts" / "project"
+    return Runtime.from_state(ROOT, state_file).artifact_root
 
 
-def _artifact_json_bytes(value: object) -> bytes:
-    return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+_artifact_json_bytes = artifact_json_bytes
 
 
-def _artifact_sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
+_artifact_sha256_bytes = artifact_sha256_bytes
 
 
 def _artifact_envelope(name: str, generation_id: str, generated_at: str, state: dict | None, data: object) -> dict:
-    return {
-        "schema_version": ARTIFACT_PAYLOAD_SCHEMA_VERSION,
-        "artifact": name,
-        "generation_id": generation_id,
-        "generated_at": generated_at,
-        "workflow_id": state.get("workflow_id") if state else None,
-        "data": data,
-    }
+    return artifact_envelope(
+        name, generation_id, generated_at,
+        state.get("workflow_id") if state else None,
+        data, schema_version=ARTIFACT_PAYLOAD_SCHEMA_VERSION,
+    )
 
 
 def _architecture_observation(
@@ -2854,43 +2558,21 @@ def _architecture_observation(
     rationale: str | None = None,
     proposer: str | None = None,
 ) -> dict:
-    observation = {
-        "classification": classification,
-        "source_kind": source_kind,
-        "source_refs": list(source_refs),
-        "confidence": confidence,
-        "rationale": rationale,
-    }
-    if proposer:
-        observation["proposer"] = proposer
-    _validate_architecture_observation(observation, "architecture observation")
-    return observation
+    try:
+        return build_observation(
+            classification, source_kind, source_refs,
+            confidence=confidence, classifications=OBSERVATION_CLASSIFICATIONS,
+            rationale=rationale, proposer=proposer,
+        )
+    except ValueError as exc:
+        raise EngineError(str(exc)) from exc
 
 
 def _validate_architecture_observation(observation: object, label: str) -> None:
-    if not isinstance(observation, dict):
-        raise EngineError(f"{label}: observation must be an object")
-    classification = observation.get("classification")
-    if classification not in OBSERVATION_CLASSIFICATIONS:
-        raise EngineError(f"{label}: invalid observation classification {classification!r}")
-    if observation.get("source_kind") not in {"config", "source", "import", "convention", "assessment", "decision"}:
-        raise EngineError(f"{label}: invalid observation source_kind")
-    refs = observation.get("source_refs")
-    if not isinstance(refs, list) or not refs or not all(isinstance(item, str) and item for item in refs):
-        raise EngineError(f"{label}: observation requires non-empty source_refs")
-    confidence = observation.get("confidence")
-    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
-        raise EngineError(f"{label}: confidence must be between 0 and 1")
-    if classification == "observed" and confidence != 1:
-        raise EngineError(f"{label}: observed facts require confidence 1.0")
-    if classification == "inferred" and (confidence >= 1 or not str(observation.get("rationale") or "").strip()):
-        raise EngineError(f"{label}: inferred facts require confidence < 1.0 and rationale")
-    if classification == "proposed" and (
-        not str(observation.get("rationale") or "").strip()
-        or not str(observation.get("proposer") or "").strip()
-        or observation.get("source_kind") not in {"assessment", "decision"}
-    ):
-        raise EngineError(f"{label}: proposed facts require proposer, rationale, and assessment/decision source")
+    try:
+        validate_observation(observation, label=label, classifications=OBSERVATION_CLASSIFICATIONS)
+    except ValueError as exc:
+        raise EngineError(str(exc)) from exc
 
 
 def _artifact_state(state_file: Path) -> dict | None:
@@ -3460,21 +3142,16 @@ def _contract_generated_output_records(version: dict) -> list[dict]:
 def _contract_impact_graph(contract_id: str, version_name: str, contract: dict, version: dict, tasks: list[dict]) -> dict:
     """Build one deterministic, source-backed graph for CLI and artifacts."""
     contract_ref = f"contract:{contract_id}@{version_name}"
-    nodes: dict[str, dict] = {}
-    edges: dict[str, dict] = {}
+    graph = ContractGraphBuilder()
 
     def add_node(identifier: str, node_type: str, label: str, **values: object) -> str:
-        candidate = {"id": identifier, "type": node_type, "label": label, **values}
-        existing = nodes.get(identifier)
-        if existing is not None and existing != candidate:
-            raise EngineError(f"contract impact node collision: {identifier}")
-        nodes[identifier] = candidate
-        return identifier
+        try:
+            return graph.add_node(identifier, node_type, label, **values)
+        except ValueError as exc:
+            raise EngineError(str(exc)) from exc
 
     def add_edge(source: str, target: str, relation: str, **values: object) -> None:
-        identity = json.dumps([source, target, relation, values], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        identifier = f"contract-impact-edge:{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:20]}"
-        edges[identifier] = {"id": identifier, "from": source, "to": target, "relation": relation, **values}
+        graph.add_edge(source, target, relation, **values)
 
     add_node(
         contract_ref, "contract", f"{contract_id}@{version_name}",
@@ -3624,18 +3301,14 @@ def _contract_impact_graph(contract_id: str, version_name: str, contract: dict, 
         for relation in sorted(set(task.get("relations") or [])):
             add_edge(task_ref, contract_ref, str(relation))
 
-    node_list = sorted(nodes.values(), key=lambda item: item["id"])
-    edge_list = sorted(edges.values(), key=lambda item: item["id"])
-    counts: dict[str, int] = {}
-    for node in node_list:
-        counts[node["type"]] = counts.get(node["type"], 0) + 1
+    node_list, edge_list, counts = graph.projection()
     return {
         "contract_ref": contract_ref,
         "semantic_available": semantic is not None,
         "semantic_reason": semantic_reason,
         "nodes": node_list,
         "edges": edge_list,
-        "summary": {"nodes": len(node_list), "edges": len(edge_list), "by_type": dict(sorted(counts.items()))},
+        "summary": {"nodes": len(node_list), "edges": len(edge_list), "by_type": counts},
     }
 
 
@@ -3919,55 +3592,26 @@ def _build_artifact_payloads(state_file: Path, state: dict | None, generation_id
         "evidence": evidence,
         "events": event_data,
     }
-    payloads = {
-        f"{name}.json": _artifact_envelope(name, generation_id, generated_at, state, data)
-        for name, data in payload_data.items()
-    }
+    payloads = envelope_payload_data(
+        payload_data, generation_id, generated_at, state.get("workflow_id") if state else None,
+        lambda name, generation, generated, workflow_id, data: artifact_envelope(
+            name, generation, generated, workflow_id, data,
+            schema_version=ARTIFACT_PAYLOAD_SCHEMA_VERSION,
+        ),
+    )
     return payloads, discovery
 
 
 def _validate_artifact_payloads(payloads: dict[str, dict], manifest: dict | None = None) -> dict:
-    if set(payloads) != set(ARTIFACT_PAYLOAD_FILES):
-        missing = sorted(set(ARTIFACT_PAYLOAD_FILES) - set(payloads))
-        extra = sorted(set(payloads) - set(ARTIFACT_PAYLOAD_FILES))
-        raise EngineError(f"artifact bundle payload set mismatch; missing={missing}, extra={extra}")
-    generation_ids = set()
-    workflow_ids = set()
-    generated_times = set()
-    for filename, payload in payloads.items():
-        expected = Path(filename).stem
-        if payload.get("schema_version") != ARTIFACT_PAYLOAD_SCHEMA_VERSION or payload.get("artifact") != expected:
-            raise EngineError(f"{filename}: invalid schema_version or artifact name")
-        if not isinstance(payload.get("data"), dict):
-            raise EngineError(f"{filename}: data must be an object")
-        generation_ids.add(payload.get("generation_id"))
-        workflow_ids.add(payload.get("workflow_id"))
-        generated_times.add(payload.get("generated_at"))
-    if len(generation_ids) != 1 or None in generation_ids:
-        raise EngineError("artifact payloads do not share one generation_id")
-    if len(workflow_ids) != 1:
-        raise EngineError("artifact payloads do not share one workflow_id")
-    if len(generated_times) != 1 or None in generated_times:
-        raise EngineError("artifact payloads do not share one generated_at timestamp")
-    generation_id = next(iter(generation_ids))
-    if manifest is not None:
-        if manifest.get("schema_version") != ARTIFACT_MANIFEST_SCHEMA_VERSION or manifest.get("artifact_set_version") != ARTIFACT_SET_VERSION:
-            raise EngineError("artifact manifest schema is unsupported")
-        if manifest.get("generation_id") != generation_id:
-            raise EngineError("artifact manifest generation_id does not match payloads")
-        if manifest.get("workflow_id") != next(iter(workflow_ids)):
-            raise EngineError("artifact manifest workflow_id does not match payloads")
-        if manifest.get("generated_at") != next(iter(generated_times)):
-            raise EngineError("artifact manifest generated_at does not match payloads")
-        declared = manifest.get("artifacts")
-        if not isinstance(declared, dict) or set(declared) != set(ARTIFACT_PAYLOAD_FILES):
-            raise EngineError("artifact manifest payload set is incomplete")
-        for filename, payload in payloads.items():
-            metadata = declared[filename]
-            if metadata.get("schema_version") != ARTIFACT_PAYLOAD_SCHEMA_VERSION or metadata.get("required") is not True:
-                raise EngineError(f"artifact manifest metadata is invalid for {filename}")
-            if metadata.get("sha256") != _artifact_sha256_bytes(_artifact_json_bytes(payload)):
-                raise EngineError(f"artifact hash mismatch: {filename}")
+    try:
+        generation_id = validate_bundle_envelopes(
+            payloads, manifest, ARTIFACT_PAYLOAD_FILES,
+            ARTIFACT_PAYLOAD_SCHEMA_VERSION, ARTIFACT_MANIFEST_SCHEMA_VERSION,
+            ARTIFACT_SET_VERSION,
+            lambda payload: _artifact_sha256_bytes(_artifact_json_bytes(payload)),
+        )
+    except ValueError as exc:
+        raise EngineError(str(exc)) from exc
 
     def unique_ids(items: list[dict], label: str) -> set[str]:
         identifiers = [item.get("id") for item in items]
@@ -4378,45 +4022,11 @@ def _write_legacy_visualizer_projection(payloads: dict[str, dict], discovery: di
 
 
 def _publish_artifacts(state_file: Path, payloads: dict[str, dict], manifest: dict) -> None:
-    import shutil
     root = _artifact_root(state_file)
-    staging = root.parent / f".staging-{manifest['generation_id']}"
-    lock = root.parent / ".project.generate.lock"
-    root.parent.mkdir(parents=True, exist_ok=True)
-    acquired = False
-    for _attempt in range(100):
-        # Liveness of the recorded owner decides staleness. The previous
-        # 30-second age fallback ran on every Windows host (its pid probe
-        # raised an OSError that fell straight through to it), so a generation
-        # taking longer than that had its lock stolen -- and the thief then
-        # deleted the original's .staging-* directory out from under it.
-        if _acquire_lock_file(lock, {"generation_id": manifest["generation_id"]}, max_age_seconds=600.0):
-            acquired = True
-            break
-        time.sleep(0.05)
-    if not acquired:
-        raise EngineError(f"artifact generation lock is busy: {display_path(lock)}")
     try:
-        for abandoned in root.parent.glob(".staging-*"):
-            if abandoned != staging and abandoned.is_dir():
-                shutil.rmtree(abandoned)
-        staging.mkdir(parents=True, exist_ok=False)
-        for filename, payload in payloads.items():
-            (staging / filename).write_bytes(_artifact_json_bytes(payload))
-        (staging / "manifest.json").write_bytes(_artifact_json_bytes(manifest))
-        root.mkdir(parents=True, exist_ok=True)
-        for filename in ARTIFACT_PAYLOAD_FILES:
-            os.replace(staging / filename, root / filename)
-        # Atomic commit marker: consumers accept a generation only after this
-        # final replace and after every payload reports the same generation id.
-        os.replace(staging / "manifest.json", root / "manifest.json")
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging)
-        try:
-            lock.unlink()
-        except FileNotFoundError:
-            pass
+        publish_artifacts(root, payloads, manifest, ARTIFACT_PAYLOAD_FILES, _acquire_lock_file)
+    except RuntimeError as exc:
+        raise EngineError(str(exc).replace(str(root.parent), display_path(root.parent), 1)) from exc
 
 
 def _generate_project_artifacts_unlocked(state_arg: str | Path | None = None, *, refresh: bool = False) -> dict:
@@ -4800,6 +4410,9 @@ def cmd_add_task(args: argparse.Namespace) -> dict:
     contract_payload, contract_hash = _build_task_contract(task, 1, timestamp)
     task["contract_revision"] = 1
     task["contract_hash"] = contract_hash
+    qa_issues = _qa_command_path_issues(task, ROOT)
+    if qa_issues:
+        print("WARNING: QA command may not be portable: " + "; ".join(qa_issues), file=sys.stderr)
     state["tasks"].append(task)
     validate(state)
     sync_phases(state)
@@ -4817,10 +4430,15 @@ def cmd_update_task(args: argparse.Namespace) -> dict:
     if not task:
         raise EngineError(f"unknown task: {args.id}")
     add_acceptance = _flatten_repeated(args.add_acceptance)
+    qa_set = getattr(args, "set_qa_command", None)
+    qa_remove = getattr(args, "remove_qa_command", None)
+    qa_clear = bool(getattr(args, "clear_qa_commands", False))
+    if qa_clear and (qa_set or qa_remove):
+        raise EngineError("--clear-qa-commands cannot be combined with --set-qa-command or --remove-qa-command")
     v3_changes = any(getattr(args, name, None) for name in (
         "add_forbidden_file", "add_constraint", "add_required_check", "add_qa_command",
         "add_output_export", "add_output_evidence_kind",
-    ))
+    )) or qa_set or qa_remove or qa_clear
     if not add_acceptance and not args.add_files and not args.add_tags and not v3_changes:
         raise EngineError("update-task requires at least one additive task-contract field")
     detail_parts = []
@@ -4846,6 +4464,20 @@ def cmd_update_task(args: argparse.Namespace) -> dict:
         if values:
             target[key].extend(value for value in values if value not in target[key])
             detail_parts.append(f"{label}: " + ", ".join(values))
+    if qa_clear:
+        task["qa_contract"]["commands"] = []
+        detail_parts.append("QA commands: cleared")
+    elif qa_set is not None:
+        commands = [str(value).strip() for value in qa_set if str(value).strip()]
+        if not commands:
+            raise EngineError("--set-qa-command requires at least one command; use --clear-qa-commands to empty the list")
+        task["qa_contract"]["commands"] = list(dict.fromkeys(commands))
+        detail_parts.append("QA commands: set to " + "; ".join(task["qa_contract"]["commands"]))
+    if qa_remove:
+        removed = set(str(value) for value in qa_remove)
+        before = task["qa_contract"]["commands"]
+        task["qa_contract"]["commands"] = [value for value in before if value not in removed]
+        detail_parts.append("QA commands: removed " + "; ".join(sorted(removed)))
     if args.add_files:
         task["scope"]["allowed_files"] = list(task["files"])
     # Contract fields (acceptance/files/tags) just changed, so the contract
@@ -4858,6 +4490,9 @@ def cmd_update_task(args: argparse.Namespace) -> dict:
     contract_payload, contract_hash = _build_task_contract(task, next_revision, created_at, now())
     task["contract_revision"] = next_revision
     task["contract_hash"] = contract_hash
+    qa_issues = _qa_command_path_issues(task, ROOT)
+    if qa_issues:
+        print("WARNING: QA command may not be portable: " + "; ".join(qa_issues), file=sys.stderr)
     sync_phases(state)
     event(state, path, "update-task", task, args.actor, task["status"], task["status"], " | ".join(detail_parts))
     save(state, path, state["revision"])
@@ -4883,6 +4518,10 @@ def cmd_transition(args: argparse.Namespace) -> dict:
     task = task_map(state).get(args.id)
     if not task:
         raise EngineError(f"unknown task: {args.id}")
+    if args.action == "complete" and (task.get("assignment") or {}).get("isolation") == "pending-dispatch":
+        raise EngineError(
+            f"task {args.id} has pending-dispatch isolation and no worktree; dispatch it before complete"
+        )
     if args.action == "review-waive":
         if not getattr(args, "_control_plane", False):
             raise EngineError("review-waive is control-plane-only; configure review.mode=not-required and use the post-completion pipeline")
@@ -5849,18 +5488,10 @@ CONTEXT_IMPACT_MAX_NODES = 240
 CONTEXT_IMPACT_MAX_EDGES = 480
 CONTEXT_SYMBOL_MAX_SYMBOLS = 160
 CONTEXT_SYMBOL_MAX_EDGES = 320
-CONTEXT_QUERY_STOP_WORDS = {
-    "add", "and", "change", "create", "fix", "for", "from", "implement", "into",
-    "the", "this", "update", "with", "without",
-}
 
 
 def _context_query_tokens(query: str) -> set[str]:
-    tokens: set[str] = set()
-    for raw in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{1,}", query):
-        expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw).replace("_", " ").replace("-", " ").lower()
-        tokens.update(token for token in re.findall(r"[a-z0-9]{2,}", expanded) if token not in CONTEXT_QUERY_STOP_WORDS)
-    return tokens
+    return tokenize_query(query)
 
 
 def _semantic_symbol_tokens(symbol: dict) -> set[str]:
@@ -6106,46 +5737,14 @@ def _context_contract_impact_slice(tokens: set[str], task: dict | None, state_fi
 
 
 def _context_requested_level(query: str, task: dict | None, requested: int | None) -> int:
-    if requested is not None:
-        if requested not in {0, 1, 2, 3}:
-            raise EngineError("context level must be 0, 1, 2, or 3")
-        return requested
-    tokens = _context_query_tokens(query)
-    architectural = {
-        "architecture", "boundary", "container", "contract", "dependency", "deploy",
-        "deployment", "event", "integration", "migration", "module", "schema", "service",
-    }
-    if task and (
-        task.get("owner") == "architect"
-        or task.get("task_kind") in {"contract", "integration"}
-        or task.get("contract_refs")
-        or architectural & {str(tag).lower() for tag in task.get("tags") or []}
-    ):
-        return 3
-    return 3 if tokens & architectural else 2
+    try:
+        return requested_level(query, task, requested, _context_query_tokens)
+    except ValueError as exc:
+        raise EngineError(str(exc)) from exc
 
 
 def _context_reference_stats(reference: str) -> dict:
-    path = Path(reference)
-    path = path if path.is_absolute() else ROOT / path
-    pattern = any(character in reference for character in "*?[")
-    if pattern and not Path(reference).is_absolute():
-        matches = 0
-        for candidate in ROOT.glob(reference):
-            if candidate.is_file() or candidate.is_dir():
-                matches += 1
-            if matches >= 100:
-                break
-        return {"exists": matches > 0, "pattern": True, "match_count": matches, "size_bytes": None, "estimated_tokens": None}
-    exists = path.exists()
-    size = path.stat().st_size if exists and path.is_file() else None
-    return {
-        "exists": exists,
-        "pattern": False,
-        "match_count": 1 if exists else 0,
-        "size_bytes": size,
-        "estimated_tokens": (size + 3) // 4 if size is not None else None,
-    }
+    return reference_stats(reference, ROOT)
 
 
 def _resolve_context_package(
@@ -6699,7 +6298,7 @@ def _task_history(state: dict) -> dict[str, dict[str, str]]:
     return history
 
 
-def _generate_dag_payload(state: dict) -> dict:
+def _generate_dag_payload_legacy(state: dict) -> dict:
     """Task-dependency DAG for the visualizer: edges, longest-path layering
     (`layer`, i.e. wave number), lifecycle `stage`, per-task first-reached
     timestamps, and the precomputed ready set / critical path so the UI
@@ -6780,6 +6379,19 @@ def _generate_dag_payload(state: dict) -> dict:
         "ready": ready_ids,
         "critical_path": critical_path,
     }
+
+
+def _generate_dag_payload(state: dict) -> dict:
+    """Facade adapter to the extracted deterministic planning subsystem."""
+    return generate_dag_payload(
+        state,
+        task_map=task_map,
+        runnable=runnable,
+        dependency_satisfying_statuses=DEPENDENCY_SATISFYING_STATUSES,
+        remaining_stages=_remaining_stages,
+        task_stage=_task_stage,
+        task_history=_task_history,
+    )
 
 
 def _task_contract_drift(task: dict, state_file: Path) -> str | None:
@@ -7145,6 +6757,12 @@ def _load_design_exceptions(state_file: Path, task_id: str) -> list[dict]:
 
 def _design_validation(state_file: Path, task: dict, evidence_path: str | None = None) -> dict:
     policy = _merged_design_policy(); current_hash = _design_policy_hash(policy)
+    if task.get("task_kind") in {"cleanup", "trivial"} and not task.get("contract_refs"):
+        return {
+            "task": task["id"], "passed": True, "not_applicable": True,
+            "policy_hash": current_hash,
+            "checks": [{"name": "design-policy", "status": "not-applicable", "detail": f"task_kind={task.get('task_kind')} has no contract refs"}],
+        }
     applicable = _applicable_design_rules(task, policy)
     baseline = task.get("governance_baseline")
     if baseline is None or not applicable:
@@ -8134,6 +7752,17 @@ def _semantic_coverage(payload: dict) -> tuple[set[str], set[str]]:
     actual = set(str(item) for item in (payload.get("semantic_coverage") or []))
     required = SEMANTIC_COVERAGE_REQUIRED.get(str(payload.get("source_format")), set())
     return actual, required - actual
+
+
+# Semantic compatibility predicates are implemented in ``kit_engine``; these
+# facade aliases preserve the historical private names used by graph/diff code.
+_indexed_contract_items = semantic_indexed_contract_items
+_enum_narrowed = semantic_enum_narrowed
+_contract_field_breaks = semantic_contract_field_breaks
+_schema_shape_breaks = semantic_schema_shape_breaks
+_security_scheme_breaks = semantic_security_scheme_breaks
+_operation_semantic_breaks = semantic_operation_breaks
+_event_semantic_breaks = semantic_event_breaks
 
 
 def _contract_semantic_diff(
@@ -9389,6 +9018,16 @@ def _map_task_to_module(task: dict, modules: dict[str, dict]) -> str | None:
     return best[1] if best else None
 
 
+# Source discovery primitives are implemented independently of the control
+# plane; aliases retain the names used by the legacy architecture projector.
+_extract_ts_relative_imports = discovery_extract_ts_imports
+_extract_python_imports = discovery_extract_python_imports
+_discovery_owning_module = discovery_owning_module
+_resolve_ts_dependency = lambda file_path, spec, path_to_name: discovery_resolve_ts_dependency(file_path, spec, path_to_name, ROOT)
+_resolve_python_dependency = lambda file_path, spec, level, source_roots, path_to_name: discovery_resolve_python_dependency(file_path, spec, level, source_roots, path_to_name, ROOT)
+_map_task_to_module = discovery_map_task_to_module
+
+
 def _build_discovered_architecture() -> dict:
     """Builds the discovered-architecture.json payload in memory. Declared
     contexts are read as-is (and keep full override authority over name,
@@ -10273,6 +9912,17 @@ def cmd_dispatch(args: argparse.Namespace) -> dict:
     )
     if assignment.get("isolation") == "shared-workspace":
         print(f"WARNING: task {task['id']} is running without worktree isolation", file=sys.stderr)
+    qa_issues = _qa_command_path_issues(task, Path(assignment.get("worktree") or ROOT))
+    if qa_issues:
+        # Do not leave a claimed task running when dispatch-time validation
+        # proves its QA contract cannot execute in the isolated worktree.
+        reject_args = argparse.Namespace(
+            state=args.state, id=task["id"], action="reject", actor="dispatch-control-plane",
+            detail="; ".join(qa_issues), evidence=None, expected_revision=None,
+            agent_id=None, claim_id=None, by=None, _control_plane=True,
+        )
+        _retry_transition(reject_args)
+        raise EngineError("QA command is not portable in task worktree: " + "; ".join(qa_issues))
     _persist_assignment(state_file, task["id"], assignment)
     task = _resolve_task_definition(task["id"], load(state_file), state_file)
     state_flag = f" --state {shlex.quote(str(state_file.resolve()))}"
@@ -10337,12 +9987,9 @@ def cmd_dispatch_ready(args: argparse.Namespace) -> dict:
     active_global = sum(1 for item in state["tasks"] if item.get("status") == "in-progress")
     available_global = max(0, global_capacity - active_global)
     tasks = task_map(state)
-    candidates = [task for task in state["tasks"] if runnable(task, tasks)]
-    if args.context:
-        candidates = [t for t in candidates if t.get("context") == args.context]
-    if args.epic:
-        candidates = [t for t in candidates if t.get("epic") == args.epic]
-    candidates.sort(key=lambda task: task["id"])
+    candidates = ready_tasks(
+        state, tasks, runnable=runnable, context=args.context, epic=args.epic
+    )
     requested_limit = args.limit if args.limit else len(candidates)
     limit = min(requested_limit, available_global)
     claimed: list[dict] = []
@@ -10413,12 +10060,6 @@ def cmd_dispatch_ready(args: argparse.Namespace) -> dict:
     }
 
 
-def _is_runtime_transient_path(path: str) -> bool:
-    """Return true only for disposable files created by local verification."""
-    candidate = Path(path)
-    return "__pycache__" in candidate.parts or candidate.suffix in {".pyc", ".pyo"}
-
-
 def _task_changed_paths(task: dict, cwd: Path) -> list[str]:
     import subprocess as _sp
     assignment = task.get("assignment") or {}
@@ -10439,14 +10080,6 @@ def _task_changed_paths(task: dict, cwd: Path) -> list[str]:
         if not path.startswith(".ai-work/")
         and not _is_runtime_transient_path(path)
     )
-
-
-def _path_in_declared_scope(path: str, patterns: list[str]) -> bool:
-    for pattern in patterns:
-        normalized = pattern.rstrip("/")
-        if path == normalized or path.startswith(normalized + "/") or fnmatch.fnmatch(path, pattern):
-            return True
-    return False
 
 
 def _scope_validation(task: dict, cwd: Path) -> dict:
@@ -10610,6 +10243,11 @@ def _classify_qa_failure(evidence: dict) -> tuple[str, str, bool, list[str]]:
     return "implementation_failure", "retry-worker", True, reasons
 
 
+# Keep the historical facade name while the deterministic taxonomy lives in
+# the quality package.
+_classify_qa_failure = quality_classify_qa_failure
+
+
 def _write_recovery_recommendation(state_file: Path, task: dict, evidence_path: Path, evidence: dict) -> Path:
     classification, action, retryable, reasons = _classify_qa_failure(evidence)
     if classification not in FAILURE_TAXONOMY:
@@ -10702,6 +10340,23 @@ def _create_remediation_task(
         return {"created": False, "strategy": "remediation-task", "task": remediation_id, "reason": "already exists"}
 
     copied = json.loads(json.dumps(original))
+    # Preserve a completed worker's isolated worktree when it still exists.
+    # The remediation must repair the code that just failed QA/review, not
+    # silently recreate an empty tree from the planning HEAD. A shared or
+    # missing worktree is deliberately not inherited because reusing it would
+    # reintroduce cross-task dirty-state contamination.
+    inherited_assignment = None
+    parent_assignment = original.get("assignment") or {}
+    parent_worktree = Path(parent_assignment.get("worktree") or "") if parent_assignment.get("worktree") else None
+    if parent_assignment.get("isolation") == "linked-worktree" and parent_worktree and parent_worktree.exists():
+        inherited_assignment = {
+            key: parent_assignment.get(key)
+            for key in ("runner", "model", "capabilities", "branch", "worktree", "isolation", "base_commit", "state_path")
+            if parent_assignment.get(key) is not None
+        }
+        inherited_assignment["inherited_from"] = task_id
+        inherited_assignment["claim_id"] = None
+        inherited_assignment["lease_expires_at"] = None
     copied.update({
         "id": remediation_id,
         "title": f"Remediate {remediation_root}: {original['title']}",
@@ -10717,7 +10372,7 @@ def _create_remediation_task(
         "claimed_by": None,
         "claim_id": None,
         "claim_expires_at": None,
-        "assignment": None,
+        "assignment": inherited_assignment,
         "superseded_by": None,
         "remediates": remediation_root,
         "remediation_attempt": attempt,
@@ -10766,6 +10421,7 @@ def _create_remediation_task(
         "task": remediation_id,
         "attempt": attempt,
         "max_attempts": maximum,
+        "inherited_worktree": bool(inherited_assignment),
         "rewired_dependents": rewired,
     }
 
@@ -10818,6 +10474,11 @@ def _evidence_fingerprint(task: dict, cwd: Path) -> dict:
         json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return fingerprint
+
+
+def _evidence_fingerprint(task: dict, cwd: Path) -> dict:
+    changed = _task_changed_paths(task, cwd) if task.get("assignment") else []
+    return quality_evidence_fingerprint(task, cwd, changed, _design_policy_hash(_merged_design_policy()))
 
 
 def _activate_integration_contracts(task: dict, evidence: str) -> list[str]:
@@ -10899,7 +10560,12 @@ def _cmd_qa_run_authoritative(args: argparse.Namespace) -> dict:
         raise EngineError(f"unknown task: {args.id}")
     if task["status"] not in {"implementation-complete", "qa-passed"}:
         raise EngineError(f"qa run requires implementation-complete (or qa-passed recovery), found {task['status']}")
+    if (task.get("assignment") or {}).get("isolation") == "pending-dispatch":
+        raise EngineError(f"qa run requires a materialized task worktree; {task['id']} is still pending-dispatch")
     cwd = Path((task.get("assignment") or {}).get("worktree") or ROOT).resolve()
+    qa_issues = _qa_command_path_issues(task, cwd)
+    if qa_issues:
+        raise EngineError("QA command is not portable in task worktree: " + "; ".join(qa_issues))
     functional = cmd_verify(argparse.Namespace(state=args.state, id=task["id"], workdir=str(cwd)))
     design = _design_validation(state_file, task) if _load_rules().get("design_policy_required", True) else {"passed": True, "checks": [], "disabled": True}
     contract = _contract_convergence(task, cwd) if _load_rules().get("contract_convergence_required", True) else {"passed": True, "checks": [], "disabled": True}
@@ -11166,6 +10832,8 @@ def cmd_review_apply(args: argparse.Namespace) -> dict:
         raise EngineError(f"unknown task: {args.id}")
     if task["status"] != "qa-passed":
         raise EngineError(f"review apply requires qa-passed, found {task['status']}")
+    if (task.get("assignment") or {}).get("isolation") == "pending-dispatch":
+        raise EngineError(f"review apply requires a materialized task worktree; {task['id']} is still pending-dispatch")
     recommendation_path = Path(args.evidence).resolve() if getattr(args, "evidence", None) else _review_evidence_path(state_file, task["id"])
     if not recommendation_path.exists():
         raise EngineError("review recommendation is missing")
@@ -11183,21 +10851,9 @@ def cmd_review_apply(args: argparse.Namespace) -> dict:
     # simply omitted agent_id was rejected as self-review against an executor
     # that had no agent_id either. Absent identities are unknown, not equal:
     # demand that they be recorded, then compare.
-    reviewer_runner = str(recommendation.get("runner") or "").strip()
-    reviewer_model = str(recommendation.get("model") or "").strip()
-    reviewer_agent = str(recommendation.get("agent_id") or "").strip()
-    executor_agent = assignment.get("agent_id")
-    if not reviewer_agent:
-        raise EngineError("review recommendation must record the reviewer's agent_id")
-    if not reviewer_runner or not reviewer_model:
-        raise EngineError("review recommendation must record the reviewer's runner and model")
-    if executor_agent and reviewer_agent == executor_agent:
-        raise EngineError("reviewer agent_id must differ from executor")
-    if (
-        reviewer_runner == assignment.get("runner")
-        and reviewer_model == assignment.get("model")
-    ):
-        raise EngineError("reviewer runner/model identity must differ from executor")
+    identity_error = reviewer_identity_error(recommendation, assignment)
+    if identity_error:
+        raise EngineError(identity_error)
     qa_current, qa_detail = _qa_evidence_is_current(state_file, task)
     if not qa_current:
         raise EngineError(qa_detail)
@@ -11245,18 +10901,11 @@ def _delivery_evidence_path(state_file: Path, task_id: str) -> Path:
 
 
 def _delivery_not_applicable(task: dict) -> tuple[bool, str | None]:
-    declared = task.get("files") or []
-    if not declared:
-        return True, "task declares no tracked file scope"
-    if declared and all(path.startswith(".ai-work/") for path in declared):
-        return True, "task scope contains only AI-Kit control-plane artifacts"
     assignment = task.get("assignment") or {}
     cwd = Path(assignment.get("worktree") or ROOT)
-    if assignment:
-        changed = _task_changed_paths(task, cwd)
-        if not changed:
-            return True, "task has no tracked or untracked code change relative to its assigned base"
-    return False, None
+    changed = _task_changed_paths(task, cwd) if assignment else None
+    reason = not_applicable_reason(task, changed)
+    return reason is not None, reason
 
 
 def _delivery_check(state_file: Path, task: dict, commit: str) -> dict:
@@ -11637,7 +11286,7 @@ def parser() -> argparse.ArgumentParser:
     config_validate = config_sub.add_parser("validate"); config_validate.set_defaults(fn=cmd_config_validate)
     config_migrate = config_sub.add_parser("migrate"); config_migrate.add_argument("--force", action="store_true"); config_migrate.set_defaults(fn=cmd_config_migrate)
     add = sub.add_parser("add-task"); add.add_argument("id"); add.add_argument("--title", required=True); add.add_argument("--owner", required=True); add.add_argument("--phase", required=True); add.add_argument("--needs", nargs="*"); add.add_argument("--depends-on", action="append", default=[], metavar="PATH"); add.add_argument("--acceptance", nargs="+", action="append", required=True); add.add_argument("--files", nargs="*"); add.add_argument("--forbidden-file", action="append", default=[]); add.add_argument("--constraint", action="append", default=[]); add.add_argument("--required-check", action="append", default=[]); add.add_argument("--qa-command", action="append", default=[]); add.add_argument("--output-export", action="append", default=[]); add.add_argument("--output-evidence-kind", action="append", default=[]); add.add_argument("--no-changed-files", action="store_true"); add.add_argument("--tags", nargs="*"); add.add_argument("--context"); add.add_argument("--epic"); add.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); add.add_argument("--required-capability", action="append", default=[]); add.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); add.add_argument("--actor", default="planner"); add.set_defaults(fn=cmd_add_task)
-    update = sub.add_parser("update-task"); update.add_argument("id"); update.add_argument("--add-acceptance", nargs="+", action="append"); update.add_argument("--add-files", nargs="*"); update.add_argument("--add-tags", nargs="*"); update.add_argument("--add-forbidden-file", action="append"); update.add_argument("--add-constraint", action="append"); update.add_argument("--add-required-check", action="append"); update.add_argument("--add-qa-command", action="append"); update.add_argument("--add-output-export", action="append"); update.add_argument("--add-output-evidence-kind", action="append"); update.add_argument("--actor", default="planner"); update.set_defaults(fn=cmd_update_task)
+    update = sub.add_parser("update-task"); update.add_argument("id"); update.add_argument("--add-acceptance", nargs="+", action="append"); update.add_argument("--add-files", nargs="*"); update.add_argument("--add-tags", nargs="*"); update.add_argument("--add-forbidden-file", action="append"); update.add_argument("--add-constraint", action="append"); update.add_argument("--add-required-check", action="append"); update.add_argument("--add-qa-command", action="append"); update.add_argument("--set-qa-command", action="append", help="replace all QA contract commands"); update.add_argument("--remove-qa-command", action="append", help="remove an exact QA contract command"); update.add_argument("--clear-qa-commands", action="store_true", help="remove all QA contract commands"); update.add_argument("--add-output-export", action="append"); update.add_argument("--add-output-evidence-kind", action="append"); update.add_argument("--actor", default="planner"); update.set_defaults(fn=cmd_update_task)
     ready = sub.add_parser("ready"); ready.add_argument("--context"); ready.add_argument("--epic"); ready.set_defaults(fn=cmd_ready)
     plan = sub.add_parser("plan"); plan.add_argument("--idea", required=True); plan.add_argument("--workflow", default="feature"); plan.add_argument("--owner", required=True); plan.add_argument("--acceptance", nargs="+", action="append", required=True); plan.add_argument("--files", nargs="*"); plan.add_argument("--forbidden-file", action="append", default=[]); plan.add_argument("--constraint", action="append", default=[]); plan.add_argument("--required-check", action="append", default=[]); plan.add_argument("--qa-command", action="append", default=[]); plan.add_argument("--output-export", action="append", default=[]); plan.add_argument("--output-evidence-kind", action="append", default=[]); plan.add_argument("--no-changed-files", action="store_true"); plan.add_argument("--tags", nargs="*"); plan.add_argument("--phase", default="build"); plan.add_argument("--context"); plan.add_argument("--epic"); plan.add_argument("--depends-on", action="append", default=[], metavar="PATH"); plan.add_argument("--task-kind", choices=sorted(TASK_KINDS), default="general"); plan.add_argument("--required-capability", action="append", default=[]); plan.add_argument("--contract-ref", action="append", default=[], metavar="RELATION:ID@VERSION"); plan.add_argument("--scope"); plan.add_argument("--out-of-scope"); plan.add_argument("--risks", nargs="*"); plan.add_argument("--assumptions"); plan.add_argument("--actor", default="planner"); plan.add_argument("--force", action="store_true"); plan.set_defaults(fn=cmd_plan)
     plan_draft = sub.add_parser("plan-draft", help="create, revise, finalize, and materialize a collaborative plan draft")
@@ -11740,7 +11389,7 @@ def main() -> int:
     args = parser().parse_args()
     try:
         output = args.fn(args)
-        print(output if isinstance(output, str) else json.dumps(output, indent=2))
+        print(render_result(output))
         # `verify` reports a verdict rather than raising, so returning 0
         # unconditionally made it useless as a shell gate: dispatch-full.sh's
         # `if ! ai-kit verify ...` never fired, and a task whose checks FAILED
@@ -11748,9 +11397,7 @@ def main() -> int:
         # is still printed either way; only the exit status changes, so a
         # caller reading stdout is unaffected while `if !`/`&&`/`set -e` now
         # behave the way any shell author would assume.
-        if isinstance(output, dict) and args.fn in {cmd_verify, cmd_qa_run, cmd_config_validate, cmd_design_validate, cmd_contract_verify, cmd_contract_check, cmd_delivery_check, cmd_architecture_fitness, cmd_architecture_validate} and not output.get("passed"):
-            return 1
-        return 0
+        return exit_code_for_result(output, args.fn, {cmd_verify, cmd_qa_run, cmd_config_validate, cmd_design_validate, cmd_contract_verify, cmd_contract_check, cmd_delivery_check, cmd_architecture_fitness, cmd_architecture_validate})
     except EngineError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
