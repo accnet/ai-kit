@@ -393,7 +393,7 @@ hidden capability to build.
   before delivery.
 - **G4 - Hygiene:** never commit secrets, credentials, or transient
   `.ai-work/` state. Keep changes traceable to a task. `.ai-config/*.yaml`
-  (`runners.yaml`'s runner commands; `kit.yaml`'s `test_command`,
+  (`config.yaml`'s runner commands; `kit.yaml`'s `test_command`,
   `lint_command`, `typecheck_command`, `build_command`) are executed as
   shell strings by the engine (`dispatch`, `verify`) — treat write access to
   these files as equivalent to arbitrary shell execution, and review changes
@@ -430,7 +430,7 @@ retries or mark partial work complete.
 ## Runner Autonomy
 
 `ai-kit dispatch`, `dispatch-ready`, and `pipeline` hand a task off to a
-configured runner CLI (`.ai-config/runners.yaml`) with stdin closed — the
+configured runner CLI from `.ai-config/config.yaml` with stdin closed — the
 runner cannot pause to ask a human for per-action permission, so its command
 template necessarily includes a non-interactive/auto-approve flag
 (`--permission-mode acceptEdits`, `--auto-approve true`, `--allow-all-tools`,
@@ -442,7 +442,7 @@ confirmation during execution; it is the G2/G3 evidence and review gates
 above, which run after the runner finishes. Do not dispatch a task to a
 runner against a repository or task where unsupervised, full-tool-access
 execution is unacceptable before that review happens. Runner model names in
-`runners.yaml` are point-in-time examples tied to each provider's current
+`config.yaml` runner profiles are point-in-time examples tied to each provider's current
 CLI — verify them against the installed CLI before relying on a pinned name,
 since they will drift out of date.
 

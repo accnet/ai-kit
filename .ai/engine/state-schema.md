@@ -382,11 +382,12 @@ it is never an independent source of lifecycle truth.
 
 ## Runner registry
 
-`.ai-config/config.yaml` version 1 is the runtime authority for runner profiles,
-aliases/defaults, plan auto-execution, scheduler/isolation, quality, completion,
-and failure policy. `runners.yaml` plus `automation.yaml` are a legacy fallback
-only when project-owned runtime config is absent; they are never merged with it.
-Use `config migrate`, `config validate`, and `config show` for the transition.
+`.ai-config/config.yaml` version 1 is the sole runtime authority for runner
+profiles, aliases/defaults, plan auto-execution, scheduler/isolation, quality,
+completion, and failure policy. The split `runners.yaml` and `automation.yaml`
+files are not installed or used at runtime; existing legacy files are read only
+by an explicit `config migrate`. Use `config validate` and `config show` to
+inspect the active configuration.
 A canonical CLI/provider entry has a `command` template containing `{prompt}` and `{model}`, a
 `models` allowlist, and optional `provider`/`description`. Version-5 profiles
 also declare `capabilities`, `roles`, `task_kinds`, `priority`, and

@@ -2441,6 +2441,24 @@ class CentralRuntimeConfigTests(EngineTestCase):
         check = next(item for item in result["checks"] if item["name"] == "review-policy-consistency")
         self.assertFalse(check["passed"])
 
+    def test_legacy_disabled_reviewer_defaults_to_not_required(self) -> None:
+        (self.root / ".ai-config" / "runners.yaml").write_text(
+            "default_executor: worker\ndefault_model: model-a\nrunners:\n"
+            "  worker:\n    command: 'runner -m {model} {prompt}'\n    models: [model-a]\n",
+            encoding="utf-8",
+        )
+        (self.root / ".ai-config" / "automation.yaml").write_text(
+            "roles:\n  qa:\n    enabled: false\n  reviewer:\n    enabled: false\n"
+            "post_completion:\n  enabled: false\n",
+            encoding="utf-8",
+        )
+        config = ai_kit._legacy_effective_runtime_config()
+        self.assertEqual(config["automation"]["quality"]["review"]["mode"], "not-required")
+        self.assertTrue(config["automation"]["quality"]["completion"]["auto_resolve_review_when_not_required"])
+        roles = ai_kit._load_automation_roles()
+        self.assertEqual(roles["reviewer"]["mode"], "not-required")
+        self.assertEqual(roles["qa"]["mode"], "disabled")
+
     def test_plan_authorization_is_bound_to_the_exact_digest(self) -> None:
         draft = {
             "schema_version": 3, "id": "P1", "revision": 3, "title": "Plan", "workflow": "feature",
@@ -2457,6 +2475,7 @@ class CentralRuntimeConfigTests(EngineTestCase):
         self.assertIn("stale", detail)
 
     def test_config_migrate_promotes_legacy_files_without_merging(self) -> None:
+        (self.root / ".ai-config" / "rules.yaml").write_text("review_required: false\n", encoding="utf-8")
         (self.root / ".ai-config" / "runners.yaml").write_text(
             "default_executor: worker\ndefault_model: model-a\nrunners:\n"
             "  worker:\n    command: 'runner -m {model} {prompt}'\n    models: [model-a]\n"

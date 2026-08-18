@@ -274,10 +274,9 @@ def _runtime_config_path() -> Path | None:
     project = _project_runtime_config_path()
     if project.is_file():
         return project
-    # A project that explicitly owns either legacy file remains on the legacy
-    # authority until `config migrate` creates config.yaml.
-    if (ROOT / ".ai-config" / "runners.yaml").exists() or (ROOT / ".ai-config" / "automation.yaml").exists():
-        return None
+    # The bundled seed is authoritative even when an older project still has
+    # split files. Legacy files are imported only by the explicit
+    # `config migrate` command; they never silently override config.yaml.
     template = ROOT / ".ai" / "install" / "config" / "config.yaml"
     return template if template.is_file() else None
 
@@ -727,6 +726,13 @@ def _load_automation_roles() -> dict:
                 f"or 'roles.{name}.enabled: false' to verify it manually instead"
             )
         roles[name]["enabled"] = _parse_role_enabled(roles[name].get("enabled"))
+        # Legacy automation.yaml only had an enabled flag.  Normalize it to
+        # the central runtime vocabulary so a disabled reviewer is an explicit
+        # policy waiver instead of silently parking tasks for manual review.
+        if name == "qa":
+            roles[name].setdefault("mode", "local" if roles[name]["enabled"] else "disabled")
+        else:
+            roles[name].setdefault("mode", "independent" if roles[name]["enabled"] else "not-required")
         if roles[name]["enabled"] and not roles[name].get("runner"):
             raise EngineError(
                 f".ai-config/automation.yaml role '{name}' is enabled but has no 'runner'; add one, "
@@ -6091,7 +6097,10 @@ def _legacy_effective_runtime_config() -> dict:
     reviewer = roles.get("reviewer") or {}
     reviewer_enabled = _parse_role_enabled(reviewer.get("enabled")) if reviewer else False
     review_config = {
-        "mode": "independent" if reviewer_enabled else "manual",
+        # A disabled legacy reviewer maps to the explicit policy-waiver mode;
+        # it must not silently park every task waiting for a reviewer that the
+        # operator deliberately disabled.
+        "mode": "independent" if reviewer_enabled else "not-required",
     }
     for key in ("runner", "model", "backup_runner", "backup_model"):
         if reviewer.get(key):
@@ -6123,7 +6132,7 @@ def _legacy_effective_runtime_config() -> dict:
                 "qa": {"mode": "local" if qa_enabled else "disabled", "max_parallel": 1},
                 "review": review_config,
                 "completion": {
-                    "auto_resolve_review_when_not_required": False,
+                    "auto_resolve_review_when_not_required": True,
                     "auto_close_delivery_not_applicable": True,
                 },
             },
@@ -6214,8 +6223,16 @@ def cmd_config_migrate(args: argparse.Namespace) -> dict:
         config = _validate_runtime_config(_load_strict_runtime_yaml(path))
         source = display_path(path)
     else:
-        config = _legacy_effective_runtime_config()
-        source = "legacy:runners.yaml+automation.yaml"
+        legacy_paths = (ROOT / ".ai-config" / "runners.yaml", ROOT / ".ai-config" / "automation.yaml")
+        if any(item.exists() for item in legacy_paths):
+            config = _legacy_effective_runtime_config()
+            source = "legacy:runners.yaml+automation.yaml"
+        else:
+            template = ROOT / ".ai" / "install" / "config" / "config.yaml"
+            if not template.is_file():
+                raise EngineError("config.yaml is missing and no legacy configuration is available to migrate")
+            config = _validate_runtime_config(_load_strict_runtime_yaml(template))
+            source = display_path(template)
     written = _write_runtime_config(config)
     checks = _runtime_config_cross_checks(config)
     return {"migrated_from": source, "config": display_path(written), "valid": all(item["passed"] for item in checks), "checks": checks}

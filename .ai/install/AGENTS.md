@@ -213,11 +213,11 @@ misreading a renamed or retyped field:
 - `.ai-work/results/<task-id>.json` is the schema-version-1 bounded completion
   projection. `.ai-work/recovery/<task-id>.json` is the schema-version-1
   deterministic QA failure/recovery recommendation. Neither is lifecycle authority.
-- `.ai-config/config.yaml` version 1 is the project runtime authority for
+- `.ai-config/config.yaml` version 1 is the sole project runtime authority for
   runner profiles, plan authorization/auto-execution, scheduler isolation and
-  concurrency, quality/completion policy, and bounded failure strategy.
-  `runners.yaml`/`automation.yaml` are legacy fallback inputs only when this
-  file is absent; never merge both authorities.
+  concurrency, quality/completion policy, and bounded failure strategy. Do not
+  create or consume split `runners.yaml` or `automation.yaml` files; existing
+  legacy files are read only by an explicit `config migrate`.
 - `.ai-work/artifacts/project/manifest.json` is the atomic commit marker for
   one 12-payload project projection. Every payload has a schema-version-1
   envelope and the same `generation_id`; the manifest records its SHA-256,
@@ -457,7 +457,7 @@ retries or mark partial work complete.
 ## Runner Autonomy
 
 `ai-kit dispatch`, `dispatch-ready`, and `pipeline` hand a task off to a
-configured runner CLI (`.ai-config/config.yaml`, or legacy `runners.yaml`) with stdin closed — the
+configured runner CLI from `.ai-config/config.yaml` with stdin closed — the
 runner cannot pause to ask a human for per-action permission, so its command
 template necessarily includes a non-interactive/auto-approve flag
 (`--permission-mode acceptEdits`, `--auto-approve true`, `--allow-all-tools`,

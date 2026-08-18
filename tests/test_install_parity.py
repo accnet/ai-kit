@@ -25,8 +25,8 @@ TEMPLATE_VISUALIZER = REPO_ROOT / ".ai" / "install" / "templates" / ".visualizer
 
 PROJECT_OWNED_CONFIGS = ("contexts.yaml", "epics.yaml")
 EXPECTED_CONFIGS = {
-    "config.yaml", "automation.yaml", "contexts.yaml", "epics.yaml", "kit.yaml",
-    "registry.yaml", "rules.yaml", "runners.yaml", "design-policy.json", "contracts.json", "delivery.json",
+    "config.yaml", "contexts.yaml", "epics.yaml", "kit.yaml",
+    "registry.yaml", "rules.yaml", "design-policy.json", "contracts.json", "delivery.json",
     "architecture.json", "architecture-fitness.json", "truth.yaml",
 }
 
@@ -58,6 +58,8 @@ class InstallConfigTests(unittest.TestCase):
 
     def test_templates_are_the_complete_canonical_seed_set(self) -> None:
         self.assertEqual({p.name for p in TEMPLATE_CONFIG.iterdir() if p.is_file()}, EXPECTED_CONFIGS)
+        self.assertFalse((TEMPLATE_CONFIG / "runners.yaml").exists())
+        self.assertFalse((TEMPLATE_CONFIG / "automation.yaml").exists())
 
     def test_installer_materializes_project_config_from_templates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
